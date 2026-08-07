@@ -4712,6 +4712,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _profit_period_label = app.CardPipelineApp._profit_period_label
             _profit_graph_label = app.CardPipelineApp._profit_graph_label
             _profit_plot_label = app.CardPipelineApp._profit_plot_label
+            _profit_breakdown_label = app.CardPipelineApp._profit_breakdown_label
+            _profit_monthly_breakdown = app.CardPipelineApp._profit_monthly_breakdown
             _profit_chart_title = app.CardPipelineApp._profit_chart_title
             _profit_sport_label = app.CardPipelineApp._profit_sport_label
             _profit_chart_bucket_label = app.CardPipelineApp._profit_chart_bucket_label
@@ -7595,6 +7597,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _profit_period_label = app.CardPipelineApp._profit_period_label
             _profit_graph_label = app.CardPipelineApp._profit_graph_label
             _profit_plot_label = app.CardPipelineApp._profit_plot_label
+            _profit_breakdown_label = app.CardPipelineApp._profit_breakdown_label
+            _profit_monthly_breakdown = app.CardPipelineApp._profit_monthly_breakdown
             _profit_chart_title = app.CardPipelineApp._profit_chart_title
             _profit_sport_label = app.CardPipelineApp._profit_sport_label
             _profit_chart_bucket_label = app.CardPipelineApp._profit_chart_bucket_label
@@ -7619,6 +7623,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(dummy._profit_period_label(), "Calendar Month")
         self.assertEqual(dummy._profit_graph_label(), "Overall Profit")
         self.assertEqual(dummy._profit_plot_label(), "Overall")
+        self.assertEqual(dummy._profit_breakdown_label(), "Month")
         self.assertEqual(dummy._profit_chart_title(), "Overall Profit (Calendar Month)")
         self.assertEqual(dummy._profit_chart_tooltip_value(123.45, False), "$123.45")
         self.assertEqual(dummy._profit_chart_tooltip_value(0.1234, True), "12.34%")
@@ -7653,6 +7658,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             {"assigned_person": "Lucas", "date_added": "2026-03-01", "profit": 30, "sale_price": 300},
         ]
         dummy.profit_period_var = types.SimpleNamespace(get=lambda: "Year")
+        dummy.profit_breakdown_var = types.SimpleNamespace(get=lambda: "Month")
         year_ratio_labels, year_ratio_values = dummy._profit_chart_series(year_ratio_rows)
         self.assertEqual(year_ratio_labels, [f"2026-{month:02d}" for month in range(1, 13)])
         self.assertAlmostEqual(year_ratio_values[0], 0.375)
@@ -7697,6 +7703,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         ]
         dummy.profit_period_var = types.SimpleNamespace(get=lambda: "YTD")
         dummy.profit_graph_var = types.SimpleNamespace(get=lambda: "Daily Trend")
+        dummy.profit_breakdown_var = types.SimpleNamespace(get=lambda: "Day")
         ytd_filtered = dummy._filtered_profit_records(ytd_rows)
         ytd_days, ytd_values = dummy._profit_chart_series(ytd_filtered)
 
@@ -7705,6 +7712,24 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(len(ytd_days), 168)
         self.assertEqual(ytd_values[ytd_days.index("2026-01-05")], 40)
         self.assertEqual(ytd_values[ytd_days.index("2026-06-17")], 30)
+
+        dummy.profit_period_var = types.SimpleNamespace(get=lambda: "Year")
+        dummy.profit_graph_var = types.SimpleNamespace(get=lambda: "Daily Trend")
+        dummy.profit_plot_var = types.SimpleNamespace(get=lambda: "Overall")
+        dummy.profit_breakdown_var = types.SimpleNamespace(get=lambda: "Month")
+        month_labels, month_values = dummy._profit_chart_series(year_ratio_rows)
+        self.assertEqual(month_labels, [f"2026-{month:02d}" for month in range(1, 13)])
+        self.assertEqual(month_values[0], 75.0)
+        self.assertEqual(month_values[1], 0.0)
+        self.assertEqual(month_values[2], 30.0)
+        self.assertEqual(dummy._profit_chart_title(), "Daily Trend (Year by Month)")
+
+        dummy.profit_breakdown_var = types.SimpleNamespace(get=lambda: "Day")
+        day_labels, day_values = dummy._profit_chart_series(year_ratio_rows)
+        self.assertEqual(day_labels[0], "2026-01-01")
+        self.assertEqual(day_labels[-1], "2026-06-17")
+        self.assertEqual(day_values[day_labels.index("2026-01-05")], 50.0)
+        self.assertEqual(day_values[day_labels.index("2026-01-20")], 25.0)
 
     def test_profit_periods_include_calendar_month_and_last_thirty_days(self) -> None:
         class ProfitDummy:
