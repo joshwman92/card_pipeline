@@ -37,6 +37,7 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
 
 ## Latest Completed Work
 
+- Windows synced recent shared Mac desktop/general fixes: Profit supports right-click `Edit Expense`; sold-from-inventory profit rows with the same stable cert/item id can update stale sale/date/purchase data instead of being ignored; raw inventory keys include source-sheet namespace; received/incoming inventory sync de-dupes raw item/title duplicates while still generating missing raw IDs; Home right-click moves to Received sync inventory immediately; raw create/reload keeps blank graders instead of defaulting to PSA; Inventory metric text no longer clips. Covered by the full `tests.test_shared_workflows` suite.
 - Comp now exposes a green `Update Best Company/Payouts` button for the currently loaded incoming/working sheet rows, plus right-click `Update Best Company/Payout` for selected line items. These recalculate assignment fields only; users still click `Save Back to Source Sheet` to persist changes.
 - Raw item ID generation now looks at active inventory, live sheets, sold profit history, and activity-log add/sold history before choosing the next ID. This prevents quick Add Card -> Mark Sold loops from reusing the same raw ID and hiding later sales as duplicate profit rows.
 - Mark Sold dialogs now leave Sale Price blank on open instead of pre-filling the estimated payout/inventory value, so users can type the actual sale price without erasing a recommendation first.

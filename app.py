@@ -1863,7 +1863,7 @@ class CardPipelineApp(tk.Tk):
                 raw = record.get(field_map.get(column, column))
             if column == "date":
                 text = str(raw or "").strip()
-                return not bool(text), (text.casefold(), self._profit_added_sort_value(record))
+                return not bool(text), (text.casefold(), getattr(self, "_profit_added_sort_value", lambda _record: "")(record))
         if column in money_columns:
             value = self._money_value(raw)
             return value is None, value if value is not None else 0.0
@@ -1946,7 +1946,7 @@ class CardPipelineApp(tk.Tk):
         controls.pack(fill=tk.X, pady=(0, 10))
         controls.columnconfigure(9, weight=1)
         ttk.Label(controls, text="Inventory", style="Panel.TLabel", font=("Segoe UI Semibold", 13)).grid(row=0, column=0, sticky="w")
-        ttk.Label(controls, textvariable=self.inventory_metric_var, style="Panel.TLabel").grid(row=0, column=1, columnspan=8, sticky="e", padx=(18, 0))
+        ttk.Label(controls, textvariable=self.inventory_metric_var, style="Panel.TLabel").grid(row=0, column=1, columnspan=9, sticky="w", padx=(18, 0))
         inventory_person_label = ttk.Label(controls, text="Person", style="Muted.TLabel")
         if not self._is_personal_lucas():
             inventory_person_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
@@ -2499,6 +2499,9 @@ class CardPipelineApp(tk.Tk):
     def _inventory_record_key(self, record: dict[str, object]) -> str:
         item_id = str(record.get("item_id") or "").strip()
         if item_id:
+            source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
+            if source_sheet:
+                return f"{item_id.lower()}|{source_sheet}"
             return item_id.lower()
         return "|".join(
             str(record.get(field) or "").strip().lower()
@@ -2946,41 +2949,98 @@ class CardPipelineApp(tk.Tk):
                 keys.add((source_sheet, cert))
         return keys
 
+    def _received_inventory_title_identity(self, card_title: object) -> str:
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(card_title or "").lower())).strip()
+
+    def _received_inventory_accounted_source_cert_keys(self) -> set[tuple[str, str]]:
+        keys: set[tuple[str, str]] = set()
+        for record in [self._normalize_inventory_record(row) for row in self._load_inventory_ledger()]:
+            source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
+            cert = scan_to_cert(record.get("cert_number"))
+            if source_sheet and cert:
+                keys.add((source_sheet, cert))
+            if cert:
+                keys.add(("", cert))
+            item_id = str(record.get("item_id") or "").strip().lower()
+            if source_sheet and item_id:
+                keys.add((source_sheet, f"item:{item_id}"))
+            if item_id:
+                keys.add(("", f"item:{item_id}"))
+            title_identity = CardPipelineApp._received_inventory_title_identity(self, record.get("card_title"))
+            if source_sheet and not cert and title_identity:
+                keys.add((source_sheet, f"title:{title_identity}"))
+        for record in [self._normalize_profit_record(row) for row in self._load_profit_ledger()]:
+            cert = scan_to_cert(record.get("cert_number"))
+            for source_value in (record.get("source_sheet"), record.get("original_source_sheet")):
+                source_sheet = Path(str(source_value or "")).name.strip().lower()
+                if source_sheet and cert:
+                    keys.add((source_sheet, cert))
+                if cert:
+                    keys.add(("", cert))
+                item_id = str(record.get("item_id") or "").strip().lower()
+                if source_sheet and item_id:
+                    keys.add((source_sheet, f"item:{item_id}"))
+                if item_id:
+                    keys.add(("", f"item:{item_id}"))
+                title_identity = CardPipelineApp._received_inventory_title_identity(self, record.get("card_title"))
+                if source_sheet and not cert and title_identity:
+                    keys.add((source_sheet, f"title:{title_identity}"))
+        return keys
+
     def _received_inventory_candidate_records_for_sheet(
         self,
         stage: str,
         path: Path,
         person: str,
         company_keys: set[tuple[str, str]] | None = None,
+        accounted_keys: set[tuple[str, str]] | None = None,
     ) -> list[dict[str, object]]:
         assigned_person = str(person or "").strip()
         if not assigned_person or not path.exists():
             return []
         received_certs = None if stage == "Received" else self._received_certs_in_workbook(path)
-        if received_certs == set():
-            return []
         try:
             rows = read_simple_spreadsheet(path)
         except Exception:
             return []
         company_keys = company_keys if company_keys is not None else self._company_sheet_source_cert_keys()
+        accounted_loader = getattr(self, "_received_inventory_accounted_source_cert_keys", None)
+        accounted_keys = accounted_keys if accounted_keys is not None else accounted_loader() if callable(accounted_loader) else set()
         candidates: list[dict[str, object]] = []
         for row in rows:
             cert = scan_to_cert(row.get("cert_number"))
-            if received_certs is not None and cert not in received_certs:
-                continue
-            if (path.name.lower(), cert) in company_keys:
-                continue
+            item_id = str(row.get("item_id") or "").strip()
             card_title = str(row.get("card_title") or "")
-            if not cert and not card_title:
+            title_identity = CardPipelineApp._received_inventory_title_identity(self, card_title)
+            if not cert and not item_id and not title_identity:
+                continue
+            if received_certs is not None:
+                if cert and cert not in received_certs:
+                    continue
+                if not cert and not bool(row.get("received")):
+                    continue
+            if cert:
+                row_identity = cert
+            elif item_id:
+                row_identity = f"item:{item_id.lower()}"
+            else:
+                row_identity = f"title:{title_identity}"
+            if cert and (path.name.lower(), cert) in company_keys:
+                continue
+            if (path.name.lower(), row_identity) in accounted_keys:
+                continue
+            if ("", row_identity) in accounted_keys:
+                continue
+            if not cert and title_identity and (path.name.lower(), f"title:{title_identity}") in accounted_keys:
                 continue
             sport = CardPipelineApp._inventory_sport_from_value(self, row.get("sport") or row.get("category"), card_title)
+            item_type = "Graded" if cert else "Raw"
             candidates.append(
                 self._normalize_inventory_record(
                     {
                         "date_added": datetime.now().strftime("%Y-%m-%d"),
-                        "item_type": "Graded" if cert else "Raw",
-                        "item_id": "" if cert else str(row.get("item_id") or "").strip(),
+                        "item_type": item_type,
+                        "item_id": "" if cert else item_id,
                         "assigned_person": assigned_person,
                         "sport": sport,
                         "cert_number": cert,
@@ -3005,6 +3065,7 @@ class CardPipelineApp(tk.Tk):
 
     def _received_inventory_candidate_records(self) -> list[dict[str, object]]:
         company_keys = self._company_sheet_source_cert_keys()
+        accounted_keys = self._received_inventory_accounted_source_cert_keys()
         candidates: list[dict[str, object]] = []
         default_person = self._personal_default_person() if self._is_personal_lucas() else "Unassigned"
         for stage, directory in (("Received", RECEIVED_SHEETS_DIR), ("Incoming", INCOMING_SHEETS_DIR), ("Working", WORKING_SHEETS_DIR)):
@@ -3015,7 +3076,7 @@ class CardPipelineApp(tk.Tk):
                 person = str(marker.get("assigned_person") or "").strip() or default_person
                 if not person:
                     continue
-                candidates.extend(self._received_inventory_candidate_records_for_sheet(stage, path, person, company_keys))
+                candidates.extend(self._received_inventory_candidate_records_for_sheet(stage, path, person, company_keys, accounted_keys))
         return candidates
 
     def _sync_received_inventory_to_ledger(self, filtered_only: bool = False) -> tuple[int, int]:
@@ -4306,17 +4367,17 @@ class CardPipelineApp(tk.Tk):
             self.clipboard_clear()
             try:
                 self.update()
-            except tk.TclError:
+            except (tk.TclError, AttributeError):
                 pass
             self.clipboard_append(clipboard_text)
             try:
                 self.update()
-            except tk.TclError:
+            except (tk.TclError, AttributeError):
                 pass
             try:
                 if self.clipboard_get() == clipboard_text:
                     break
-            except tk.TclError:
+            except (tk.TclError, AttributeError):
                 break
         if hasattr(self, "status_var"):
             self.status_var.set(f"Copied {label}.")
@@ -4883,10 +4944,11 @@ class CardPipelineApp(tk.Tk):
                 "photos": str(len(record.get("photo_paths") or [])),
                 "notes": inventory_display_notes(record),
             }
+            tree_columns = self.inventory_tree["columns"] if hasattr(self.inventory_tree, "__getitem__") else INVENTORY_TABLE_COLUMNS
             iid = self.inventory_tree.insert(
                 "",
                 tk.END,
-                values=tuple(values_by_column.get(column, "") for column in self.inventory_tree["columns"]),
+                values=tuple(values_by_column.get(column, "") for column in tree_columns),
             )
             self.inventory_tree_records[iid] = record
         self.inventory_metric_var.set(f"Cards: {len(self.filtered_inventory_rows)}   Purchase Total: {format_money(total_purchase)}   Source Value: {format_money(total_value)}")
@@ -5920,24 +5982,78 @@ class CardPipelineApp(tk.Tk):
             result.append(group)
         return sorted(result, key=lambda item: (str(item.get("last_sale") or ""), str(item.get("person") or ""), str(item.get("sheet") or "")), reverse=True)
 
+    def _update_duplicate_inventory_sale_profit_record(
+        self,
+        ledger: list[dict[str, object]],
+        existing_index: int,
+        incoming: dict[str, object],
+    ) -> bool:
+        if existing_index < 0 or existing_index >= len(ledger):
+            return False
+        existing = self._normalize_profit_record(ledger[existing_index])
+        if str(existing.get("record_type") or "").strip().lower() == "expense":
+            return False
+        if str(incoming.get("record_type") or "").strip().lower() == "expense":
+            return False
+        if str(existing.get("status") or "") != "Sold from inventory" or str(incoming.get("status") or "") != "Sold from inventory":
+            return False
+        existing_stable_id = scan_to_cert(existing.get("cert_number")) or str(existing.get("item_id") or "").strip().lower()
+        incoming_stable_id = scan_to_cert(incoming.get("cert_number")) or str(incoming.get("item_id") or "").strip().lower()
+        if not existing_stable_id or existing_stable_id != incoming_stable_id:
+            return False
+        existing_sale = self._money_value(existing.get("sale_price"))
+        incoming_sale = self._money_value(incoming.get("sale_price"))
+        existing_purchase = self._money_value(existing.get("purchase_price"))
+        incoming_purchase = self._money_value(incoming.get("purchase_price"))
+        existing_date = str(existing.get("date_added") or "")[:10]
+        incoming_date = str(incoming.get("date_added") or "")[:10]
+        has_sale_change = incoming_sale is not None and existing_sale != incoming_sale
+        has_purchase_change = incoming_purchase is not None and existing_purchase != incoming_purchase
+        has_date_change = bool(incoming_date and incoming_date != existing_date)
+        if not (has_sale_change or has_purchase_change or has_date_change):
+            return False
+        updated = dict(existing)
+        updated.update(incoming)
+        updated["ledger_added_at"] = datetime.now().isoformat(timespec="microseconds")
+        updated["recorded_by"] = self.lucas_identity.get("display_name", "")
+        updated["recorded_machine"] = self.lucas_identity.get("machine", "")
+        ledger[existing_index] = self._normalize_profit_record(updated)
+        return True
+
     def record_profit_sales(self, records: list[dict[str, object]]) -> int:
         if not records:
             return 0
         with shared_lock(CARD_PIPELINE_DIR, "profit-ledger", self.lucas_identity):
             ledger = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
-            existing_keys = set().union(*(CardPipelineApp._profit_record_identity_keys(self, record) for record in ledger)) if ledger else set()
+            existing_key_map: dict[str, int] = {}
+            for index, record in enumerate(ledger):
+                for key in CardPipelineApp._profit_record_identity_keys(self, record):
+                    existing_key_map.setdefault(key, index)
+            existing_keys = set(existing_key_map)
             added = 0
             for record in records:
                 normalized = self._normalize_profit_record(record)
                 keys = CardPipelineApp._profit_record_identity_keys(self, normalized)
-                if not keys or keys & existing_keys:
+                matching_keys = keys & existing_keys
+                if not keys:
+                    continue
+                if matching_keys:
+                    existing_index = existing_key_map[next(iter(matching_keys))]
+                    if self._update_duplicate_inventory_sale_profit_record(ledger, existing_index, normalized):
+                        for key in CardPipelineApp._profit_record_identity_keys(self, ledger[existing_index]):
+                            existing_key_map[key] = existing_index
+                        existing_keys = set(existing_key_map)
+                        added += 1
                     continue
                 if not str(normalized.get("ledger_added_at") or "").strip():
                     normalized["ledger_added_at"] = datetime.now().isoformat(timespec="microseconds")
                 normalized["recorded_by"] = self.lucas_identity.get("display_name", "")
                 normalized["recorded_machine"] = self.lucas_identity.get("machine", "")
                 ledger.append(normalized)
-                existing_keys.update(keys)
+                new_index = len(ledger) - 1
+                for key in keys:
+                    existing_key_map[key] = new_index
+                existing_keys = set(existing_key_map)
                 added += 1
             if added:
                 self._save_profit_ledger(ledger)
@@ -6130,6 +6246,177 @@ class CardPipelineApp(tk.Tk):
         else:
             messagebox.showinfo("Expense not added", "That expense already exists in the profit ledger.")
 
+    def _expense_edit_row_dialog(self, record: dict[str, object]) -> dict[str, object] | None:
+        normalized = self._normalize_profit_record(record)
+        if str(normalized.get("record_type") or "").strip().lower() != "expense":
+            return None
+        personal_inventory = self._is_personal_lucas()
+        fields = [
+            ("date_added", "Date"),
+            ("assigned_person", "Person"),
+            ("expense_type", "Type"),
+            ("expense_amount", "Amount"),
+            ("related_type", "Tie To"),
+            ("source_sheet", "Sheet"),
+            ("item_id", "Item ID"),
+            ("cert_number", "Cert"),
+            ("notes", "Notes"),
+        ]
+        popup = tk.Toplevel(self)
+        popup.title("Edit Expense")
+        popup.geometry("760x420")
+        popup.minsize(620, 340)
+        popup.transient(self)
+        popup.grab_set()
+        popup.configure(bg="#121212")
+        result: dict[str, object] = {}
+        vars_by_field: dict[str, tk.StringVar] = {}
+
+        frame = self._scrollable_popup_frame(popup, style_name="Panel.TFrame", bg="#121212", padding=(18, 16))
+        ttk.Label(frame, text="Edit Expense", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        ttk.Label(frame, text=str(normalized.get("ledger_added_at") or "Profit expense row"), style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 14))
+        for index, (field, label) in enumerate(fields):
+            row = 2 + index // 2
+            col = 0 if index % 2 == 0 else 2
+            value = normalized.get(field)
+            text = "" if value is None else f"{value:.2f}" if field == "expense_amount" and isinstance(value, (int, float)) else str(value)
+            var = tk.StringVar(value=text)
+            vars_by_field[field] = var
+            if personal_inventory and field == "assigned_person":
+                continue
+            ttk.Label(frame, text=label, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 8))
+            if field == "assigned_person":
+                person_combo = ttk.Combobox(frame, textvariable=var, width=24)
+                person_combo.grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+                self._bind_person_autocomplete(person_combo)
+            elif field == "expense_type":
+                ttk.Combobox(frame, textvariable=var, values=EXPENSE_CATEGORY_OPTIONS, width=22, state="readonly").grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+            elif field == "related_type":
+                ttk.Combobox(frame, textvariable=var, values=EXPENSE_LINK_OPTIONS, width=22, state="readonly").grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+            else:
+                width = 46 if field in {"source_sheet", "notes"} else 24
+                ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+        status_var = tk.StringVar(value="Edits replace this expense row in the profit ledger.")
+        status_row = 2 + (len(fields) + 1) // 2
+        ttk.Label(frame, textvariable=status_var, style="Muted.TLabel").grid(row=status_row, column=0, columnspan=4, sticky="w", pady=(4, 14))
+
+        def submit() -> None:
+            person = vars_by_field["assigned_person"].get().strip()
+            if personal_inventory:
+                person = self._personal_default_person()
+            person_choice = self._canonical_person_choice(person)
+            if person_choice is None:
+                status_var.set("Choose an existing person.")
+                return
+            expense_date = vars_by_field["date_added"].get().strip()
+            if self._profit_record_date(expense_date) is None:
+                status_var.set("Enter the expense date as YYYY-MM-DD.")
+                return
+            amount = self._money_value(vars_by_field["expense_amount"].get())
+            if amount is None or amount <= 0:
+                status_var.set("Enter an expense amount greater than zero.")
+                return
+            expense_type = vars_by_field["expense_type"].get().strip()
+            if expense_type not in EXPENSE_CATEGORY_OPTIONS:
+                expense_type = "Fees"
+            related_type = vars_by_field["related_type"].get().strip()
+            if related_type not in EXPENSE_LINK_OPTIONS:
+                related_type = "General"
+            source_sheet = vars_by_field["source_sheet"].get().strip()
+            item_id = vars_by_field["item_id"].get().strip()
+            cert_number = vars_by_field["cert_number"].get().strip()
+            if related_type == "Sheet" and not source_sheet:
+                status_var.set("Choose or enter the sold sheet this expense belongs to.")
+                return
+            if related_type == "Card" and not (source_sheet or item_id or cert_number):
+                status_var.set("Enter a sheet, item ID, or cert for the related card.")
+                return
+            result.update(
+                {
+                    "date_added": expense_date[:10],
+                    "assigned_person": person_choice,
+                    "expense_type": expense_type,
+                    "expense_amount": float(amount),
+                    "related_type": related_type,
+                    "source_sheet": source_sheet,
+                    "item_id": item_id,
+                    "cert_number": cert_number,
+                    "notes": vars_by_field["notes"].get().strip(),
+                }
+            )
+            popup.destroy()
+
+        buttons = ttk.Frame(frame, style="Panel.TFrame")
+        buttons.grid(row=status_row + 1, column=0, columnspan=4, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=popup.destroy, style="Soft.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Save", command=submit, style="Primary.TButton").pack(side=tk.LEFT)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+        popup.bind("<Return>", lambda _event: submit())
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+        popup.update_idletasks()
+        x = self.winfo_rootx() + max(80, (self.winfo_width() - popup.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(80, (self.winfo_height() - popup.winfo_height()) // 2)
+        popup.geometry(f"+{x}+{y}")
+        self.wait_window(popup)
+        return result or None
+
+    def _update_profit_expense_record(self, original_record: dict[str, object], updates: dict[str, object]) -> dict[str, object] | None:
+        original = self._normalize_profit_record(original_record)
+        if str(original.get("record_type") or "").strip().lower() != "expense":
+            return None
+        original_key = str(original.get("ledger_key") or self._profit_record_key(original) or "").strip().lower()
+        original_expense_id = str(original.get("expense_id") or "").strip()
+        with shared_lock(CARD_PIPELINE_DIR, "profit-expense-edit", self.lucas_identity):
+            ledger = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
+            for index, record in enumerate(ledger):
+                if str(record.get("record_type") or "").strip().lower() != "expense":
+                    continue
+                record_key = str(record.get("ledger_key") or self._profit_record_key(record) or "").strip().lower()
+                record_expense_id = str(record.get("expense_id") or "").strip()
+                id_matches = bool(original_expense_id and record_expense_id == original_expense_id)
+                key_matches = bool(original_key and record_key == original_key)
+                if not (id_matches or key_matches):
+                    continue
+                merged = dict(record)
+                merged.update(updates)
+                merged["record_type"] = "expense"
+                merged["expense_id"] = record_expense_id or original_expense_id or datetime.now().strftime("%Y%m%d%H%M%S%f")
+                merged["ledger_added_at"] = str(record.get("ledger_added_at") or original.get("ledger_added_at") or "").strip()
+                if not merged["ledger_added_at"]:
+                    merged["ledger_added_at"] = datetime.now().isoformat(timespec="microseconds")
+                merged["recorded_by"] = self.lucas_identity.get("display_name", "")
+                merged["recorded_machine"] = self.lucas_identity.get("machine", "")
+                normalized = self._normalize_profit_record(merged)
+                ledger[index] = normalized
+                self._save_profit_ledger(ledger)
+                return normalized
+        return None
+
+    def edit_selected_profit_expense(self) -> None:
+        if not hasattr(self, "profit_tree"):
+            return
+        selected = list(self.profit_tree.selection())
+        records = [self.profit_tree_records.get(iid) for iid in selected if self.profit_tree_records.get(iid)]
+        if len(records) != 1:
+            messagebox.showinfo("Choose one expense", "Select one expense row to edit.")
+            return
+        record = self._normalize_profit_record(records[0])
+        if str(record.get("record_type") or "").strip().lower() != "expense":
+            messagebox.showinfo("Expense required", "Only expense rows can be edited here.")
+            return
+        updates = self._expense_edit_row_dialog(record)
+        if not updates:
+            return
+        updated = self._update_profit_expense_record(record, updates)
+        self.refresh_profit_tab()
+        if updated:
+            amount = self._money_value(updated.get("expense_amount")) or 0.0
+            self.status_var.set(f"Edited {updated.get('expense_type') or 'expense'} expense: {format_money(amount)}.")
+            self._append_activity("Expense Edit", f"Edited {updated.get('expense_type') or 'expense'} expense: {format_money(amount)}.", {"expense_id": updated.get("expense_id"), "expense_type": updated.get("expense_type"), "amount": amount})
+        else:
+            messagebox.showinfo("Expense not found", "That expense row could not be found in the profit ledger.")
+
     def _delete_profit_expense_records(self, records: list[dict[str, object]]) -> int:
         expense_keys: set[str] = set()
         for record in records:
@@ -6259,6 +6546,8 @@ class CardPipelineApp(tk.Tk):
         if sold_cards and len(sold_cards) == len(records):
             menu.add_command(label="Refund to Inventory", command=self.refund_selected_profit_to_inventory)
         if expenses and len(expenses) == len(records):
+            if len(expenses) == 1:
+                menu.add_command(label="Edit Expense", command=self.edit_selected_profit_expense)
             menu.add_command(label="Delete Expense", command=self.delete_selected_profit_expenses)
         if menu.index("end") is None:
             return
@@ -6379,7 +6668,7 @@ class CardPipelineApp(tk.Tk):
         self.profit_rows.sort(
             key=lambda record: (
                 str(record.get("date_added") or ""),
-                self._profit_added_sort_value(record),
+                getattr(self, "_profit_added_sort_value", lambda _record: "")(record),
                 str(record.get("company") or ""),
                 str(record.get("card_title") or ""),
             ),
@@ -7661,7 +7950,7 @@ class CardPipelineApp(tk.Tk):
         rows: list[WorkbookRow] = []
         for offset, record in enumerate(records, start=2):
             cert = str(record.get("cert_number") or "")
-            grader = str(record.get("grader") or infer_grader(str(record.get("card_title") or "")) or "PSA").upper()
+            grader = str(record.get("grader") or infer_grader(str(record.get("card_title") or ""))).upper()
             card = str(record.get("card_title") or "").strip()
             rows.append(
                 WorkbookRow(
@@ -7669,6 +7958,7 @@ class CardPipelineApp(tk.Tk):
                     cert_number=cert,
                     card_title=card,
                     grader=grader,
+                    item_id=str(record.get("item_id") or ""),
                     category=str(record.get("sport") or record.get("category") or "").strip(),
                     existing_value=record.get("purchase_price"),
                     card_ladder_value=record.get("card_ladder_value"),
@@ -9184,6 +9474,8 @@ class CardPipelineApp(tk.Tk):
     def move_selected_home_sheet_to_stage(self, target_stage: str) -> None:
         move_started = time.perf_counter()
         move_phases: list[str] = []
+        inventory_rows_added = 0
+        inventory_candidate_rows = 0
         if not self.home_selected_sheet_key:
             messagebox.showinfo("Choose sheet", "Choose a sheet on Home before moving.")
             return
@@ -9218,6 +9510,18 @@ class CardPipelineApp(tk.Tk):
                 move_phases.append(f"move={time.perf_counter() - phase_started:.3f}s")
                 self.home_selected_sheet_key = moved_key
                 self.home_sheet_kind.set(target_stage)
+                if target_stage == "Received" and moved_key:
+                    received_stage, received_name = self._split_home_sheet_key(moved_key)
+                    marker = self.home_sheet_markers.get(moved_key, {})
+                    person = str(marker.get("assigned_person") or "").strip()
+                    if received_stage == "Received" and received_name and person:
+                        phase_started = time.perf_counter()
+                        inventory_rows_added, inventory_candidate_rows = self._sync_received_sheet_inventory_to_ledger(
+                            received_stage,
+                            self._sheet_path_for_stage(received_stage, received_name),
+                            person,
+                        )
+                        move_phases.append(f"inventory_sync={time.perf_counter() - phase_started:.3f}s")
                 phase_started = time.perf_counter()
                 self._save_sheet_markers()
                 move_phases.append(f"save_markers={time.perf_counter() - phase_started:.3f}s")
@@ -9236,9 +9540,25 @@ class CardPipelineApp(tk.Tk):
                 f"removed {cleanup.get('profit_rows_removed', 0)} profit ledger row(s), "
                 f"and removed {cleanup.get('inventory_rows_removed', 0)} inventory row(s)."
             )
-        self.status_var.set(f"Moved {name} from {source_stage} to {target_stage}.{cleanup_note}")
+        inventory_note = ""
+        if inventory_rows_added:
+            inventory_note = f" Added {inventory_rows_added} inventory row(s)."
+        elif inventory_candidate_rows:
+            inventory_note = " Inventory was already up to date."
+        self.status_var.set(f"Moved {name} from {source_stage} to {target_stage}.{cleanup_note}{inventory_note}")
         phase_started = time.perf_counter()
-        self._append_activity("Sheet Move", f"Moved {name} from {source_stage} to {target_stage}.", {"sheet": name, "from": source_stage, "to": target_stage, "cleanup": cleanup})
+        self._append_activity(
+            "Sheet Move",
+            f"Moved {name} from {source_stage} to {target_stage}.",
+            {
+                "sheet": name,
+                "from": source_stage,
+                "to": target_stage,
+                "cleanup": cleanup,
+                "inventory_rows_added": inventory_rows_added,
+                "inventory_candidate_rows": inventory_candidate_rows,
+            },
+        )
         move_phases.append(f"activity={time.perf_counter() - phase_started:.3f}s")
         record_performance_event(
             "home.stage_move.total",
@@ -9637,7 +9957,7 @@ class CardPipelineApp(tk.Tk):
 
         phase_started = time.perf_counter()
         old_marker = dict(self.home_sheet_markers.get(key, {}))
-        if self._is_personal_lucas():
+        if getattr(self, "_is_personal_lucas", lambda: False)():
             old_marker["assigned_person"] = self._personal_default_person()
         self._delete_sheet_marker(key)
         new_key = self._home_sheet_key(target_stage, destination.name)
@@ -11192,7 +11512,10 @@ class CardPipelineApp(tk.Tk):
                 row.status = "Received - no incoming match"
 
     def _ensure_receive_row_assignment(self, row: WorkbookRow) -> None:
-        recommendation = self.assignment_engine.recommend(row, person=getattr(self, "_assignment_person_for_row", lambda _row: "")(row))
+        engine = getattr(self, "assignment_engine", None)
+        if engine is None:
+            return
+        recommendation = engine.recommend(row, person=getattr(self, "_assignment_person_for_row", lambda _row: "")(row))
         if recommendation.payout is None:
             if not row.best_company:
                 row.best_company = NO_COMPANY_TAKES_LABEL
@@ -12030,7 +12353,7 @@ class CardPipelineApp(tk.Tk):
         sources: dict[int, str] = {}
         for offset, row in enumerate(rows, start=2):
             cert = str(row.get("cert_number") or "")
-            grader = str(row.get("grader") or infer_grader(str(row.get("card_title") or "")) or "PSA").upper()
+            grader = str(row.get("grader") or infer_grader(str(row.get("card_title") or ""))).upper()
             card = str(row.get("card_title") or "").strip()
             workbook_rows.append(
                 WorkbookRow(
@@ -12169,6 +12492,7 @@ class CardPipelineApp(tk.Tk):
                     cert_number=cert,
                     card_title=card,
                     grader=grader,
+                    item_id=str(row.get("item_id") or ""),
                     category=str(row.get("sport") or row.get("category") or "").strip(),
                     existing_value=row.get("purchase_price"),
                     card_ladder_value=row.get("card_ladder_value"),
