@@ -7256,6 +7256,32 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 app.INVENTORY_PHOTOS_DIR = old_photo_dir
                 app.INVENTORY_PHOTO_STATE_PATH = old_photo_state
 
+    def test_inventory_photo_paths_resolve_windows_safe_mac_names(self) -> None:
+        class PhotoPathDummy:
+            _inventory_photo_source_folder = app.CardPipelineApp._inventory_photo_source_folder
+            _inventory_photo_shared_folder = app.CardPipelineApp._inventory_photo_shared_folder
+            _inventory_photo_relative_path = app.CardPipelineApp._inventory_photo_relative_path
+            _inventory_photo_windows_safe_relative = app.CardPipelineApp._inventory_photo_windows_safe_relative
+            _inventory_photo_path_candidates = app.CardPipelineApp._inventory_photo_path_candidates
+            _resolve_inventory_photo_path = app.CardPipelineApp._resolve_inventory_photo_path
+            _inventory_photo_paths_for_record = app.CardPipelineApp._inventory_photo_paths_for_record
+
+        with TemporaryDirectory() as tmp:
+            old_photo_dir = app.INVENTORY_PHOTOS_DIR
+            app.INVENTORY_PHOTOS_DIR = Path(tmp) / "INVENTORY PHOTOS"
+            app.INVENTORY_PHOTOS_DIR.mkdir(parents=True)
+            safe_photo = app.INVENTORY_PHOTOS_DIR / "[20260708]-Card[1]-[auto  8].jpg"
+            safe_photo.write_bytes(b"fake image")
+            dummy = PhotoPathDummy()
+            dummy.app_settings = {"inventory_photo_folder": str(app.INVENTORY_PHOTOS_DIR)}
+            stored_path = "[20260708]-Card[1]-[auto :8].jpg"
+            try:
+                self.assertIn(safe_photo, dummy._inventory_photo_path_candidates(stored_path))
+                self.assertEqual(dummy._resolve_inventory_photo_path(stored_path), safe_photo)
+                self.assertEqual(dummy._inventory_photo_paths_for_record({"photo_paths": [stored_path]}), [safe_photo])
+            finally:
+                app.INVENTORY_PHOTOS_DIR = old_photo_dir
+
     def test_inventory_photo_export_copies_to_desktop(self) -> None:
         class PhotoExportDummy:
             _desktop_photo_export_destination = app.CardPipelineApp._desktop_photo_export_destination
