@@ -346,18 +346,18 @@ When Network Mode is off:
 
 When Network Mode is on:
 
-- Create exposes Seller and Sheet Type.
+- Create exposes Person and Sheet Type.
 - Seller terms can auto-fill purchase prices.
 - Seller terms are edited from **Company Rules -> People Rules**.
 - Seller terms are stored in `ASSIGNMENT RULES/seller_terms.csv` for the shared pipeline.
 
-Seller terms columns:
+People Rules columns:
 
 ```text
-Seller, Sheet Type, Min Value, Max Value, Seller Rate, Deduction
+Person, Sheet Type, Min Value, Max Value, Seller Rate, Deduction, Balance Share
 ```
 
-The People Rules popup labels the percentage fields as **Seller Rate %** and **Deduction %**. Type numbers only, without a percent sign. Decimals are allowed.
+Legacy CSV files with a `Seller` header still load, but the app labels that field **Person**. The People Rules popup labels the percentage fields as **Seller Rate %**, **Deduction %**, and **Balance Share %**. Type numbers only, without a percent sign. Decimals are allowed.
 
 Examples:
 
@@ -382,12 +382,13 @@ How seller terms work:
 - The matching assignment company determines the value source and rules.
 - `Seller Rate %` pays the seller that percentage of the matching company source value. Example: source value `100` and Seller Rate `90` writes Purchase `90`.
 - `Deduction %` follows the Sheet Type company's payout logic, then subtracts that percentage of the company source value. Example: company payout `95` on source value `100` and Deduction `10` writes Purchase `85`.
-- Use either `Seller Rate %` or `Deduction %` on a row, not both.
-- `Min Value` and `Max Value` are optional card value cutoffs. Leave either side blank for no floor or no cap. Multiple rows for the same seller and sheet type are allowed when these ranges do not overlap.
-- If Seller or Sheet Type is blank, purchase prices stay normal.
+- Use either `Seller Rate %` or `Deduction %` on a seller row, not both.
+- `Min Value` and `Max Value` are optional card value cutoffs. Blank bounds default to `$0` and `$1,000,000,000`. Multiple rows for the same person and sheet type are allowed when these ranges do not overlap.
+- Leave `Sheet Type` blank and fill `Balance Share %` to define a normal team member profit share, such as `50`; this does not make that person a seller source.
+- If Person or Sheet Type is blank on a seller row, purchase prices stay normal.
 - If terms are invalid, save stops with a clear prompt.
 
-Use **People Rules Health** in Company Rules to find overlapping seller ranges, inactive companies, missing companies, bad rates, and parsed terms.
+Use **People Rules Health** in Company Rules to find overlapping person/sheet-type ranges, inactive companies, missing companies, bad rates, invalid balance shares, and parsed terms.
 
 ## Manual Company Rule Year Ranges
 

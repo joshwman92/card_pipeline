@@ -540,13 +540,13 @@ People Rules writes shared seller terms to:
 CARD_PIPELINE\ASSIGNMENT RULES\seller_terms.csv
 ```
 
-Each row needs:
+Each row uses:
 
 ```text
-Seller, Sheet Type, Min Value, Max Value, Seller Rate, Deduction
+Person, Sheet Type, Min Value, Max Value, Seller Rate, Deduction, Balance Share
 ```
 
-In the People Rules popup, the percentage fields are labeled **Seller Rate %** and **Deduction %**. Type numbers only, without `%`. Decimals are allowed.
+Legacy CSV files with a `Seller` header still load, but the app now labels that field **Person**. In the People Rules popup, the percentage fields are labeled **Seller Rate %**, **Deduction %**, and **Balance Share %**. Type numbers only, without `%`. Decimals are allowed.
 
 Examples:
 
@@ -557,7 +557,7 @@ Examples:
 10.5
 ```
 
-Use **Seller Rate %** for a flat percent of the Sheet Type company's source value. Use **Deduction %** to follow the Sheet Type company's payout logic and subtract that percentage from the company payout. Use one or the other on a row, not both. Add multiple rows for the same seller and sheet type only when their Min/Max Value ranges do not overlap.
+Use **Seller Rate %** for a flat percent of the Sheet Type company's source value. Use **Deduction %** to follow the Sheet Type company's payout logic and subtract that percentage from the company payout. Use one or the other on a seller row, not both. Add multiple rows for the same person and sheet type only when their Min/Max Value ranges do not overlap. Leave **Sheet Type** blank and fill **Balance Share %** to define a normal team profit-share payout, for example `50` for Kevin or James; that does not make the person a seller source.
 
 ## Step 14: Check The Full Workflow
 
