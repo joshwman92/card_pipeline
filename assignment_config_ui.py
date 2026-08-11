@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import subprocess
 import sys
+import time
 import tkinter as tk
 import urllib.parse
 import webbrowser
-import os
 from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable
@@ -60,12 +61,16 @@ VALUE_SOURCE_LABELS = {
 COMPANY_RESET_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 DEFAULT_COMPANY_RESET_WEEKDAY = "Monday"
 DEFAULT_COMPANY_RESET_TIME = "20:00"
-SELLER_TERMS_FIELDS = ("Seller", "Sheet Type", "Min Value", "Max Value", "Seller Rate", "Deduction")
+DEFAULT_SELLER_TERMS_MIN_VALUE = 0.0
+DEFAULT_SELLER_TERMS_MAX_VALUE = 1_000_000_000.0
+SELLER_TERMS_FIELDS = ("Person", "Sheet Type", "Min Value", "Max Value", "Seller Rate", "Deduction", "Balance Share")
+SELLER_TERMS_FIELD_COLUMNS = {field: index for index, field in enumerate(SELLER_TERMS_FIELDS)}
 SELLER_TERMS_FIELD_LABELS = {
     "Min Value": "Min Value",
     "Max Value": "Max Value",
     "Seller Rate": "Seller Rate %",
     "Deduction": "Deduction %",
+    "Balance Share": "Balance Share %",
 }
 
 
@@ -112,6 +117,41 @@ def build_scrollable_dialog_body(parent: tk.Misc, style_name: str, bg: str = "#1
     return body
 
 
+def bind_single_paste(widget: tk.Widget) -> tk.Widget:
+    def handle_paste(_event: tk.Event) -> str:
+        now = time.monotonic()
+        try:
+            text = widget.clipboard_get()
+        except tk.TclError:
+            return "break"
+        last = getattr(widget, "_lucas_last_paste", None)
+        if last and now - last[0] < 0.15 and text == last[1]:
+            return "break"
+        setattr(widget, "_lucas_last_paste", (now, text))
+        try:
+            state = str(widget.cget("state") or "")
+            if state == "disabled":
+                return "break"
+            if state == "readonly" and isinstance(widget, ttk.Combobox):
+                values = [str(value) for value in widget.cget("values")]
+                if text in values:
+                    widget.set(text)
+                return "break"
+            try:
+                widget.delete(tk.SEL_FIRST, tk.SEL_LAST)
+            except tk.TclError:
+                pass
+            widget.insert(tk.INSERT, text)
+        except tk.TclError:
+            pass
+        return "break"
+
+    widget.bind("<<Paste>>", handle_paste)
+    widget.bind("<Command-v>", handle_paste)
+    widget.bind("<Control-v>", handle_paste)
+    return widget
+
+
 def read_seller_terms_rows(seller_terms_path: Path) -> list[dict[str, str]]:
     if not seller_terms_path.exists():
         return []
@@ -121,12 +161,13 @@ def read_seller_terms_rows(seller_terms_path: Path) -> list[dict[str, str]]:
             normalized = {re.sub(r"[^a-z0-9]+", "", str(key or "").lower()): value for key, value in row.items()}
             rows.append(
                 {
-                    "Seller": str(normalized.get("seller") or normalized.get("person") or normalized.get("name") or "").strip(),
+                    "Person": str(normalized.get("person") or normalized.get("seller") or normalized.get("name") or "").strip(),
                     "Sheet Type": str(normalized.get("sheettype") or normalized.get("type") or normalized.get("company") or "").strip(),
                     "Min Value": str(normalized.get("minvalue") or normalized.get("min") or normalized.get("minimum") or normalized.get("floor") or "").strip(),
                     "Max Value": str(normalized.get("maxvalue") or normalized.get("max") or normalized.get("maximum") or normalized.get("ceiling") or "").strip(),
                     "Seller Rate": str(normalized.get("sellerrate") or normalized.get("rate") or normalized.get("payout") or normalized.get("percentage") or "").strip(),
                     "Deduction": str(normalized.get("deduction") or normalized.get("sellerdeduction") or normalized.get("deductionpercent") or normalized.get("deductionpercentage") or "").strip(),
+                    "Balance Share": str(normalized.get("balanceshare") or normalized.get("balancesharepercent") or normalized.get("teamshare") or normalized.get("profitshare") or normalized.get("payoutshare") or "").strip(),
                 }
             )
     return rows
@@ -189,14 +230,32 @@ def seller_terms_money_value(value: object) -> float | None:
     return numeric if numeric >= 0 else None
 
 
+def seller_terms_min_value(value: object) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return DEFAULT_SELLER_TERMS_MIN_VALUE
+    return seller_terms_money_value(value)
+
+
+def seller_terms_max_value(value: object) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return DEFAULT_SELLER_TERMS_MAX_VALUE
+    return seller_terms_money_value(value)
+
+
+def seller_terms_money_label(value: float) -> str:
+    return f"${value:,.0f}" if float(value).is_integer() else f"${value:,.2f}"
+
+
 def seller_terms_range_label(min_value: float | None, max_value: float | None) -> str:
     if min_value is None and max_value is None:
         return "all values"
     if min_value is None:
-        return f"up to ${max_value:g}"
+        return f"up to {seller_terms_money_label(max_value)}"
     if max_value is None:
-        return f"${min_value:g}+"
-    return f"${min_value:g} to ${max_value:g}"
+        return f"{seller_terms_money_label(min_value)}+"
+    return f"{seller_terms_money_label(min_value)} to {seller_terms_money_label(max_value)}"
 
 
 def seller_terms_ranges_overlap(a_min: float | None, a_max: float | None, b_min: float | None, b_max: float | None) -> bool:
@@ -257,21 +316,23 @@ def seller_terms_health_lines(seller_terms_path: Path, companies: list[dict[str,
     seen: dict[tuple[str, str], list[tuple[int, float | None, float | None]]] = {}
     valid_count = 0
     for index, row in enumerate(rows, start=2):
-        seller = str(row.get("Seller") or "").strip()
+        seller = str(row.get("Person") or row.get("Seller") or "").strip()
         sheet_type = str(row.get("Sheet Type") or "").strip()
         min_raw = row.get("Min Value")
         max_raw = row.get("Max Value")
         rate_raw = row.get("Seller Rate")
         deduction_raw = row.get("Deduction")
-        min_value = seller_terms_money_value(min_raw)
-        max_value = seller_terms_money_value(max_raw)
+        balance_share_raw = row.get("Balance Share")
+        min_value = seller_terms_min_value(min_raw)
+        max_value = seller_terms_max_value(max_raw)
         rate = seller_terms_rate(rate_raw)
         deduction = seller_terms_rate(deduction_raw)
+        balance_share = seller_terms_rate(balance_share_raw)
         row_errors: list[str] = []
         row_warnings: list[str] = []
         if not seller:
-            row_errors.append("missing Seller")
-        if not sheet_type:
+            row_errors.append("missing Person")
+        if not sheet_type and (rate is not None or deduction is not None):
             row_errors.append("missing Sheet Type")
         if str(min_raw or "").strip() and min_value is None:
             row_errors.append(f"invalid Min Value {min_raw!r}")
@@ -283,14 +344,18 @@ def seller_terms_health_lines(seller_terms_path: Path, companies: list[dict[str,
             row_errors.append(f"invalid Seller Rate {rate_raw!r}")
         if str(deduction_raw or "").strip() and deduction is None:
             row_errors.append(f"invalid Deduction {deduction_raw!r}")
-        if rate is None and deduction is None:
-            row_errors.append("missing Seller Rate or Deduction")
+        if str(balance_share_raw or "").strip() and balance_share is None:
+            row_errors.append(f"invalid Balance Share {balance_share_raw!r}")
+        if rate is None and deduction is None and balance_share is None:
+            row_errors.append("missing Seller Rate, Deduction, or Balance Share")
         if rate is not None and deduction is not None:
             row_errors.append("use Seller Rate or Deduction, not both")
         if rate is not None and rate > 1:
             row_errors.append(f"Seller Rate parses above 100% ({rate:.0%})")
         if deduction is not None and deduction > 1:
             row_errors.append(f"Deduction parses above 100% ({deduction:.0%})")
+        if balance_share is not None and balance_share > 1:
+            row_errors.append(f"Balance Share parses above 100% ({balance_share:.0%})")
         type_key = sheet_type.lower()
         if sheet_type and type_key not in active_companies:
             if type_key in inactive_companies:
@@ -316,8 +381,11 @@ def seller_terms_health_lines(seller_terms_path: Path, companies: list[dict[str,
             parts.append(f"rate {rate:.0%}")
         if deduction is not None:
             parts.append(f"deduction {deduction:.0%}")
-        parts.append(seller_terms_range_label(min_value, max_value))
-        parsed.append(f"{seller} / {sheet_type}: {', '.join(parts)}")
+        if balance_share is not None:
+            parts.append(f"balance share {balance_share:.0%}")
+        if sheet_type:
+            parts.append(seller_terms_range_label(min_value, max_value))
+        parsed.append(f"{seller} / {sheet_type or 'Team Balance'}: {', '.join(parts)}")
 
     errors = sum(1 for level, _message in issues if level == "ERROR")
     warnings = sum(1 for level, _message in issues if level == "WARN")
@@ -362,6 +430,8 @@ class AssignmentRulesDialog(tk.Toplevel):
         self.payout_rows: list[dict[str, tk.StringVar]] = []
 
         self.company_name = tk.StringVar()
+        self.company_filter_text = tk.StringVar()
+        self.company_filter_state = tk.StringVar(value="all")
         self.value_source = tk.StringVar(value="comps")
         self.rule_source_mode = tk.StringVar(value="manual")
         self.rule_source_path = tk.StringVar()
@@ -381,6 +451,7 @@ class AssignmentRulesDialog(tk.Toplevel):
 
         self._configure_styles()
         self._build_ui()
+        self.company_filter_text.trace_add("write", lambda *_args: self._refresh_company_list())
         self._refresh_company_list()
         if self.companies:
             self._select_company(0)
@@ -431,10 +502,23 @@ class AssignmentRulesDialog(tk.Toplevel):
         side = ttk.Frame(shell, style="AssignPanel.TFrame", padding=12)
         side.grid(row=1, column=0, sticky="ns", padx=(0, 12))
         ttk.Label(side, text="Companies", style="AssignTitle.TLabel").pack(anchor=tk.W)
+        filter_entry = bind_single_paste(ttk.Entry(side, textvariable=self.company_filter_text, style="Assign.TEntry"))
+        filter_entry.pack(fill=tk.X, pady=(8, 6))
+        filter_modes = ttk.Frame(side, style="AssignPanel.TFrame")
+        filter_modes.pack(fill=tk.X)
+        for value, label in (("all", "All"), ("active", "Active"), ("inactive", "Inactive")):
+            ttk.Radiobutton(
+                filter_modes,
+                text=label,
+                value=value,
+                variable=self.company_filter_state,
+                command=self._refresh_company_list,
+                style="Assign.TRadiobutton",
+            ).pack(side=tk.LEFT, padx=(0, 8))
         self.company_list = tk.Frame(
             side,
             width=280,
-            height=620,
+            height=560,
             bg="#1f1f1f",
             highlightthickness=1,
             highlightbackground="#333333",
@@ -455,7 +539,7 @@ class AssignmentRulesDialog(tk.Toplevel):
         details.grid(row=0, column=0, sticky="ew")
         details.columnconfigure(1, weight=1)
         ttk.Label(details, text="Company Name", style="Assign.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 10))
-        ttk.Entry(details, textvariable=self.company_name, style="Assign.TEntry").grid(row=0, column=1, sticky="ew")
+        bind_single_paste(ttk.Entry(details, textvariable=self.company_name, style="Assign.TEntry")).grid(row=0, column=1, sticky="ew")
         ttk.Label(details, text="Assignment Value", style="Assign.TLabel").grid(row=1, column=0, sticky=tk.W, padx=(0, 10), pady=(8, 0))
         value_source_frame = ttk.Frame(details, style="AssignPanel.TFrame")
         value_source_frame.grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
@@ -470,15 +554,15 @@ class AssignmentRulesDialog(tk.Toplevel):
         ttk.Label(details, text="Company Sheet Reset", style="Assign.TLabel").grid(row=2, column=0, sticky=tk.W, padx=(0, 10), pady=(8, 0))
         reset_frame = ttk.Frame(details, style="AssignPanel.TFrame")
         reset_frame.grid(row=2, column=1, sticky=tk.W, pady=(8, 0))
-        ttk.Combobox(
+        bind_single_paste(ttk.Combobox(
             reset_frame,
             textvariable=self.reset_weekday,
             values=COMPANY_RESET_WEEKDAYS,
             width=14,
             state="readonly",
             style="Assign.TCombobox",
-        ).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
-        ttk.Entry(reset_frame, textvariable=self.reset_time, width=12, style="Assign.TEntry").grid(row=0, column=1, sticky=tk.W)
+        )).grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
+        bind_single_paste(ttk.Entry(reset_frame, textvariable=self.reset_time, width=12, style="Assign.TEntry")).grid(row=0, column=1, sticky=tk.W)
         ttk.Label(
             reset_frame,
             text="Starts the next weekly company sheet at this weekday/time.",
@@ -517,9 +601,9 @@ class AssignmentRulesDialog(tk.Toplevel):
         year_frame.grid(row=2, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(year_frame, text="Company Card Year Range", style="Assign.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8))
         ttk.Label(year_frame, text="Min Year", style="AssignMuted.TLabel").grid(row=0, column=1, sticky=tk.W, padx=(0, 6))
-        ttk.Entry(year_frame, textvariable=self.manual_min_year, width=10, style="Assign.TEntry").grid(row=0, column=2, sticky=tk.W)
+        bind_single_paste(ttk.Entry(year_frame, textvariable=self.manual_min_year, width=10, style="Assign.TEntry")).grid(row=0, column=2, sticky=tk.W)
         ttk.Label(year_frame, text="Max Year", style="AssignMuted.TLabel").grid(row=0, column=3, sticky=tk.W, padx=(14, 6))
-        ttk.Entry(year_frame, textvariable=self.manual_max_year, width=10, style="Assign.TEntry").grid(row=0, column=4, sticky=tk.W)
+        bind_single_paste(ttk.Entry(year_frame, textvariable=self.manual_max_year, width=10, style="Assign.TEntry")).grid(row=0, column=4, sticky=tk.W)
         ttk.Label(year_frame, text="Example: Fanatics min year 1990.", style="AssignMuted.TLabel").grid(row=0, column=5, sticky=tk.W, padx=(14, 0))
         rules_view = ttk.Frame(self.manual_rule_panel, style="AssignPanel.TFrame")
         rules_view.grid(row=3, column=0, sticky="nsew")
@@ -561,7 +645,7 @@ class AssignmentRulesDialog(tk.Toplevel):
         path_row = ttk.Frame(frame, style="AssignPanel.TFrame")
         path_row.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         path_row.columnconfigure(0, weight=1)
-        self.rule_path_entry = ttk.Entry(path_row, textvariable=self.rule_source_path, style="Assign.TEntry")
+        self.rule_path_entry = bind_single_paste(ttk.Entry(path_row, textvariable=self.rule_source_path, style="Assign.TEntry"))
         self.rule_path_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(path_row, text="Browse", command=self._browse_rule_source, style="AssignSoft.TButton").grid(row=0, column=1)
         actions = ttk.Frame(frame, style="AssignPanel.TFrame")
@@ -612,7 +696,7 @@ class AssignmentRulesDialog(tk.Toplevel):
         path_row = ttk.Frame(frame, style="AssignPanel.TFrame")
         path_row.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         path_row.columnconfigure(0, weight=1)
-        self.payout_path_entry = ttk.Entry(path_row, textvariable=self.payout_source_path, style="Assign.TEntry")
+        self.payout_path_entry = bind_single_paste(ttk.Entry(path_row, textvariable=self.payout_source_path, style="Assign.TEntry"))
         self.payout_path_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(path_row, text="Browse", command=self._browse_payout_source, style="AssignSoft.TButton").grid(row=0, column=1)
         return frame
@@ -689,15 +773,42 @@ class AssignmentRulesDialog(tk.Toplevel):
         for child in self.company_list.winfo_children():
             child.destroy()
         self.company_rows = []
+        visible_count = 0
         for index, company in enumerate(self.companies):
+            if not self._company_matches_filter(company):
+                continue
             self._add_company_row(index, company)
+            visible_count += 1
+        if not visible_count:
+            empty_label = tk.Label(
+                self.company_list,
+                text="No matching companies",
+                bg="#1f1f1f",
+                fg="#b3b3b3",
+                anchor=tk.W,
+                padx=10,
+                pady=10,
+            )
+            empty_label.pack(fill=tk.X)
+
+    def _company_matches_filter(self, company: dict[str, Any]) -> bool:
+        needle = self.company_filter_text.get().strip().lower()
+        if needle and needle not in str(company.get("name") or "Untitled").lower():
+            return False
+        state = self.company_filter_state.get()
+        active = company.get("active") is not False
+        if state == "active" and not active:
+            return False
+        if state == "inactive" and active:
+            return False
+        return True
 
     def _add_company_row(self, index: int, company: dict[str, Any]) -> None:
         active = company.get("active") is not False
         selected = index == self.selected_index
         bg = "#242424" if selected else "#1f1f1f"
         row = tk.Frame(self.company_list, bg=bg, padx=5, pady=4)
-        row.pack(fill=tk.X, padx=4, pady=(4 if index == 0 else 0, 0))
+        row.pack(fill=tk.X, padx=4, pady=(4 if not self.company_rows else 0, 0))
         active_button = tk.Button(
             row,
             text="Active" if active else "Inactive",
@@ -764,7 +875,11 @@ class AssignmentRulesDialog(tk.Toplevel):
             self.payout_source_mode.set("file")
             self.link_payouts_to_rule_source.set(True)
         else:
-            self.payout_source_mode.set(str(payout_kind or ("file" if company.get("payout") and not is_generated_payout_path(company.get("payout")) else "manual")))
+            payout_source = company.get("payout")
+            if is_generated_payout_path(payout_source):
+                self.payout_source_mode.set("manual")
+            else:
+                self.payout_source_mode.set(str(payout_kind or ("file" if payout_source else "manual")))
         self.payout_source_path.set(display_source_path(company.get("payout")))
         self.payout_materialized_source = company.get("payout") if isinstance(company.get("payout"), dict) else None
         rules_payload = self._load_json_source(company.get("rules") or company.get("rules_source") or company.get("rulesSource"))
@@ -928,11 +1043,11 @@ class AssignmentRulesDialog(tk.Toplevel):
         payout_var = tk.StringVar(value=str(payout_value))
         ttk.Label(price_frame, text="Price Range & Payout Percentage", style="Assign.TLabel").grid(row=0, column=0, columnspan=6, sticky=tk.W, pady=(0, 6))
         ttk.Label(price_frame, text="Min", style="Assign.TLabel").grid(row=1, column=0, sticky=tk.W, padx=(0, 6))
-        ttk.Entry(price_frame, textvariable=min_var, width=12, style="Assign.TEntry").grid(row=1, column=1, sticky=tk.W)
+        bind_single_paste(ttk.Entry(price_frame, textvariable=min_var, width=12, style="Assign.TEntry")).grid(row=1, column=1, sticky=tk.W)
         ttk.Label(price_frame, text="Max", style="Assign.TLabel").grid(row=1, column=2, sticky=tk.W, padx=(14, 6))
-        ttk.Entry(price_frame, textvariable=max_var, width=12, style="Assign.TEntry").grid(row=1, column=3, sticky=tk.W)
+        bind_single_paste(ttk.Entry(price_frame, textvariable=max_var, width=12, style="Assign.TEntry")).grid(row=1, column=3, sticky=tk.W)
         ttk.Label(price_frame, text="Payout Percentage", style="Assign.TLabel").grid(row=1, column=4, sticky=tk.W, padx=(14, 6))
-        ttk.Entry(price_frame, textvariable=payout_var, width=12, style="Assign.TEntry").grid(row=1, column=5, sticky=tk.W)
+        bind_single_paste(ttk.Entry(price_frame, textvariable=payout_var, width=12, style="Assign.TEntry")).grid(row=1, column=5, sticky=tk.W)
 
         grades_frame = ttk.Frame(frame, style="AssignPanel.TFrame")
         grades_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
@@ -954,8 +1069,8 @@ class AssignmentRulesDialog(tk.Toplevel):
             max_grade = tk.StringVar(value=str((payload or {}).get("max") or ""))
             ttk.Label(grades_frame, text=company.upper(), style="Assign.TLabel").grid(row=grade_index, column=0, sticky=tk.W, pady=3)
             ttk.Checkbutton(grades_frame, text="", variable=allowed, style="Assign.TCheckbutton").grid(row=grade_index, column=1, sticky=tk.W, pady=3)
-            ttk.Entry(grades_frame, textvariable=min_grade, width=8, style="Assign.TEntry").grid(row=grade_index, column=2, sticky=tk.W, pady=3)
-            ttk.Entry(grades_frame, textvariable=max_grade, width=8, style="Assign.TEntry").grid(row=grade_index, column=3, sticky=tk.W, pady=3)
+            bind_single_paste(ttk.Entry(grades_frame, textvariable=min_grade, width=8, style="Assign.TEntry")).grid(row=grade_index, column=2, sticky=tk.W, pady=3)
+            bind_single_paste(ttk.Entry(grades_frame, textvariable=max_grade, width=8, style="Assign.TEntry")).grid(row=grade_index, column=3, sticky=tk.W, pady=3)
             grade_vars[company] = {"allowed": allowed, "min": min_grade, "max": max_grade}
 
         self.rule_rows.append({"frame": frame, "sports": sport_vars, "min": min_var, "max": max_var, "payout": payout_var, "grades": grade_vars})
@@ -1012,11 +1127,11 @@ class AssignmentRulesDialog(tk.Toplevel):
         max_var = tk.StringVar(value=str((data or {}).get("max") or ""))
         rate_var = tk.StringVar(value=str((data or {}).get("rate") or ""))
         ttk.Label(self.payout_frame, text="Min", style="Assign.TLabel").grid(row=row_index, column=0, sticky=tk.W, padx=(0, 6), pady=4)
-        ttk.Entry(self.payout_frame, textvariable=min_var, width=9, style="Assign.TEntry").grid(row=row_index, column=1, sticky=tk.W, pady=4)
+        bind_single_paste(ttk.Entry(self.payout_frame, textvariable=min_var, width=9, style="Assign.TEntry")).grid(row=row_index, column=1, sticky=tk.W, pady=4)
         ttk.Label(self.payout_frame, text="Max", style="Assign.TLabel").grid(row=row_index, column=2, sticky=tk.W, padx=(10, 6), pady=4)
-        ttk.Entry(self.payout_frame, textvariable=max_var, width=9, style="Assign.TEntry").grid(row=row_index, column=3, sticky=tk.W, pady=4)
+        bind_single_paste(ttk.Entry(self.payout_frame, textvariable=max_var, width=9, style="Assign.TEntry")).grid(row=row_index, column=3, sticky=tk.W, pady=4)
         ttk.Label(self.payout_frame, text="Rate", style="Assign.TLabel").grid(row=row_index, column=4, sticky=tk.W, padx=(10, 6), pady=4)
-        ttk.Entry(self.payout_frame, textvariable=rate_var, width=9, style="Assign.TEntry").grid(row=row_index, column=5, sticky=tk.W, pady=4)
+        bind_single_paste(ttk.Entry(self.payout_frame, textvariable=rate_var, width=9, style="Assign.TEntry")).grid(row=row_index, column=5, sticky=tk.W, pady=4)
         self.payout_rows.append({"min": min_var, "max": max_var, "rate": rate_var})
 
     def _save_company(self) -> bool:
@@ -1470,8 +1585,8 @@ class PeopleRulesDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, pipeline_root: Path, companies: list[dict[str, Any]], on_saved: Callable[[], None] | None = None) -> None:
         super().__init__(parent)
         self.title("People Rules")
-        self.geometry("1180x650")
-        self.minsize(920, 460)
+        self.geometry("1320x650")
+        self.minsize(1120, 460)
         self.transient(parent)
         self.configure(bg="#121212")
         self.pipeline_root = Path(pipeline_root)
@@ -1493,13 +1608,16 @@ class PeopleRulesDialog(tk.Toplevel):
         ]
         return sorted(set(names), key=str.lower)
 
+    def _sheet_type_choices(self) -> list[str]:
+        return [""] + self._active_sheet_types()
+
     def _build_ui(self) -> None:
         shell = build_scrollable_dialog_body(self, "Assign.TFrame", padding=16)
         shell.columnconfigure(0, weight=1)
         ttk.Label(shell, text="People Rules", style="AssignHeader.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
         ttk.Label(
             shell,
-            text="Add seller payout terms here. Sheet Type must match an active company rule. Optional Min/Max Value ranges let one seller use different rates or deductions by card value.",
+            text="Add people payout terms here. Blank Sheet Type with Balance Share % creates a team member profit-share rule. Sheet Type plus Seller Rate or Deduction creates a Network Mode pass-through payout row.",
             style="AssignBgMuted.TLabel",
         ).grid(row=1, column=0, sticky="w", pady=(0, 12))
         table = ttk.Frame(shell, style="AssignPanel.TFrame", padding=12)
@@ -1507,7 +1625,7 @@ class PeopleRulesDialog(tk.Toplevel):
         shell.rowconfigure(2, weight=1)
         self.rows_frame = table
         headings = tuple(SELLER_TERMS_FIELD_LABELS.get(field, field) for field in SELLER_TERMS_FIELDS) + ("",)
-        widths = (24, 22, 12, 12, 12, 12, 10)
+        widths = (24, 22, 12, 12, 12, 12, 12, 10)
         for column, (heading, width) in enumerate(zip(headings, widths)):
             ttk.Label(table, text=heading, style="AssignTitle.TLabel").grid(row=0, column=column, sticky="w", padx=(0, 8), pady=(0, 8))
             table.columnconfigure(column, weight=1 if column in {0, 1} else 0, minsize=width * 8)
@@ -1532,7 +1650,9 @@ class PeopleRulesDialog(tk.Toplevel):
 
     def _add_row(self, row: dict[str, str] | None = None) -> None:
         values = {field: str((row or {}).get(field) or "") for field in SELLER_TERMS_FIELDS}
-        for field in ("Seller Rate", "Deduction"):
+        if not values["Person"] and row:
+            values["Person"] = str(row.get("Seller") or "").strip()
+        for field in ("Seller Rate", "Deduction", "Balance Share"):
             values[field] = seller_terms_percent_display(values[field])
         vars_by_field = {field: tk.StringVar(value=values[field]) for field in SELLER_TERMS_FIELDS}
         self.row_vars.append(vars_by_field)
@@ -1546,9 +1666,11 @@ class PeopleRulesDialog(tk.Toplevel):
             return
         self._render_rows()
 
-    def _bind_rate_deduction_exclusivity(self, vars_by_field: dict[str, tk.StringVar]) -> None:
+    def _bind_people_rule_exclusivity(self, vars_by_field: dict[str, tk.StringVar]) -> None:
         rate_var = vars_by_field["Seller Rate"]
         deduction_var = vars_by_field["Deduction"]
+        sheet_type_var = vars_by_field["Sheet Type"]
+        balance_share_var = vars_by_field["Balance Share"]
         if getattr(rate_var, "_lucas_exclusive_bound", False):
             return
         updating = {"active": False}
@@ -1569,30 +1691,54 @@ class PeopleRulesDialog(tk.Toplevel):
 
         rate_var.trace_add("write", clear_deduction)
         deduction_var.trace_add("write", clear_rate)
+
+        def clear_balance_share(*_args) -> None:
+            if updating["active"] or not sheet_type_var.get().strip() or not balance_share_var.get().strip():
+                return
+            updating["active"] = True
+            balance_share_var.set("")
+            updating["active"] = False
+
+        sheet_type_var.trace_add("write", clear_balance_share)
         setattr(rate_var, "_lucas_exclusive_bound", True)
         setattr(deduction_var, "_lucas_exclusive_bound", True)
+        setattr(sheet_type_var, "_lucas_exclusive_bound", True)
+
+    def _balance_share_entry_state(self, sheet_type: object) -> str:
+        return tk.DISABLED if str(sheet_type or "").strip() else tk.NORMAL
 
     def _render_rows(self) -> None:
         for child in self.rows_frame.grid_slaves():
             row = int(child.grid_info().get("row") or 0)
             if row > 0:
                 child.destroy()
-        sheet_types = self._active_sheet_types()
+        sheet_types = self._sheet_type_choices()
         for index, vars_by_field in enumerate(self.row_vars, start=1):
-            self._bind_rate_deduction_exclusivity(vars_by_field)
-            ttk.Entry(self.rows_frame, textvariable=vars_by_field["Seller"], style="Assign.TEntry", width=26).grid(row=index, column=0, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Combobox(
+            self._bind_people_rule_exclusivity(vars_by_field)
+            bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Person"], style="Assign.TEntry", width=26)).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Person"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            bind_single_paste(ttk.Combobox(
                 self.rows_frame,
                 textvariable=vars_by_field["Sheet Type"],
                 values=sheet_types,
                 style="Assign.TCombobox",
                 width=24,
-            ).grid(row=index, column=1, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Entry(self.rows_frame, textvariable=vars_by_field["Min Value"], style="Assign.TEntry", width=12).grid(row=index, column=2, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Entry(self.rows_frame, textvariable=vars_by_field["Max Value"], style="Assign.TEntry", width=12).grid(row=index, column=3, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Entry(self.rows_frame, textvariable=vars_by_field["Seller Rate"], style="Assign.TEntry", width=12).grid(row=index, column=4, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Entry(self.rows_frame, textvariable=vars_by_field["Deduction"], style="Assign.TEntry", width=12).grid(row=index, column=5, sticky="ew", padx=(0, 8), pady=(0, 8))
-            ttk.Button(self.rows_frame, text="Delete", command=lambda row_index=index - 1: self._delete_row(row_index), style="AssignSoft.TButton").grid(row=index, column=6, sticky="ew", pady=(0, 8))
+            )).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Sheet Type"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Min Value"], style="Assign.TEntry", width=14)).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Min Value"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Max Value"], style="Assign.TEntry", width=14)).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Max Value"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Seller Rate"], style="Assign.TEntry", width=14)).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Seller Rate"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Deduction"], style="Assign.TEntry", width=14)).grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Deduction"], sticky="ew", padx=(0, 8), pady=(0, 8))
+            balance_entry = bind_single_paste(ttk.Entry(self.rows_frame, textvariable=vars_by_field["Balance Share"], style="Assign.TEntry", width=14))
+            balance_entry.grid(row=index, column=SELLER_TERMS_FIELD_COLUMNS["Balance Share"], sticky="ew", padx=(0, 8), pady=(0, 8))
+
+            def sync_balance_share_state(*_args, entry=balance_entry, row_vars=vars_by_field) -> None:
+                try:
+                    entry.configure(state=self._balance_share_entry_state(row_vars["Sheet Type"].get()))
+                except tk.TclError:
+                    pass
+
+            vars_by_field["Sheet Type"].trace_add("write", sync_balance_share_state)
+            sync_balance_share_state()
+            ttk.Button(self.rows_frame, text="Delete", command=lambda row_index=index - 1: self._delete_row(row_index), style="AssignSoft.TButton").grid(row=index, column=len(SELLER_TERMS_FIELDS), sticky="ew", pady=(0, 8))
 
     def _validated_rows(self) -> list[dict[str, str]] | None:
         active_types = {name.lower(): name for name in self._active_sheet_types()}
@@ -1602,17 +1748,23 @@ class PeopleRulesDialog(tk.Toplevel):
             row = {field: var.get().strip() for field, var in vars_by_field.items()}
             if not any(row.values()):
                 continue
-            if not row["Seller"]:
-                self.status.set(f"Row {index}: Seller is required.")
+            if row["Sheet Type"] and row["Balance Share"]:
+                row["Balance Share"] = ""
+                balance_share = None
+            if not row["Person"]:
+                self.status.set(f"Row {index}: Person is required.")
                 return None
-            if not row["Sheet Type"]:
+            rate = seller_terms_rate(row["Seller Rate"]) if row["Seller Rate"] else None
+            deduction = seller_terms_rate(row["Deduction"]) if row["Deduction"] else None
+            balance_share = seller_terms_rate(row["Balance Share"]) if row["Balance Share"] else None
+            if not row["Sheet Type"] and (rate is not None or deduction is not None):
                 self.status.set(f"Row {index}: Sheet Type is required.")
                 return None
-            if row["Sheet Type"].lower() not in active_types:
+            if row["Sheet Type"] and row["Sheet Type"].lower() not in active_types:
                 self.status.set(f"Row {index}: Sheet Type must match an active Company Rule.")
                 return None
-            min_value = seller_terms_money_value(row.get("Min Value"))
-            max_value = seller_terms_money_value(row.get("Max Value"))
+            min_value = seller_terms_min_value(row.get("Min Value"))
+            max_value = seller_terms_max_value(row.get("Max Value"))
             if row["Min Value"] and min_value is None:
                 self.status.set(f"Row {index}: Min Value must be a number only.")
                 return None
@@ -1622,8 +1774,8 @@ class PeopleRulesDialog(tk.Toplevel):
             if min_value is not None and max_value is not None and min_value > max_value:
                 self.status.set(f"Row {index}: Min Value cannot be above Max Value.")
                 return None
-            if not row["Seller Rate"] and not row["Deduction"]:
-                self.status.set(f"Row {index}: enter Seller Rate or Deduction.")
+            if not row["Seller Rate"] and not row["Deduction"] and not row["Balance Share"]:
+                self.status.set(f"Row {index}: enter Seller Rate, Deduction, or Balance Share.")
                 return None
             if row["Seller Rate"] and row["Deduction"]:
                 self.status.set(f"Row {index}: use Seller Rate or Deduction, not both.")
@@ -1634,11 +1786,17 @@ class PeopleRulesDialog(tk.Toplevel):
             if row["Deduction"] and not seller_terms_percent_input_is_number(row["Deduction"]):
                 self.status.set(f"Row {index}: Deduction % must be a number only.")
                 return None
+            if row["Balance Share"] and not seller_terms_percent_input_is_number(row["Balance Share"]):
+                self.status.set(f"Row {index}: Balance Share % must be a number only.")
+                return None
             if row["Seller Rate"] and seller_terms_rate(row["Seller Rate"]) is None:
                 self.status.set(f"Row {index}: Seller Rate % is invalid.")
                 return None
             if row["Deduction"] and seller_terms_rate(row["Deduction"]) is None:
                 self.status.set(f"Row {index}: Deduction % is invalid.")
+                return None
+            if row["Balance Share"] and seller_terms_rate(row["Balance Share"]) is None:
+                self.status.set(f"Row {index}: Balance Share % is invalid.")
                 return None
             if row["Seller Rate"] and (seller_terms_rate(row["Seller Rate"]) or 0) > 1:
                 self.status.set(f"Row {index}: Seller Rate % cannot be above 100.")
@@ -1646,13 +1804,17 @@ class PeopleRulesDialog(tk.Toplevel):
             if row["Deduction"] and (seller_terms_rate(row["Deduction"]) or 0) > 1:
                 self.status.set(f"Row {index}: Deduction % cannot be above 100.")
                 return None
-            key = (row["Seller"].lower(), row["Sheet Type"].lower())
-            for previous_index, previous_min, previous_max in seen.get(key, []):
-                if seller_terms_ranges_overlap(min_value, max_value, previous_min, previous_max):
-                    self.status.set(f"Row {index}: value range overlaps row {previous_index} for this Seller and Sheet Type.")
-                    return None
-            seen.setdefault(key, []).append((index, min_value, max_value))
-            row["Sheet Type"] = active_types[row["Sheet Type"].lower()]
+            if row["Balance Share"] and (seller_terms_rate(row["Balance Share"]) or 0) > 1:
+                self.status.set(f"Row {index}: Balance Share % cannot be above 100.")
+                return None
+            if row["Sheet Type"]:
+                key = (row["Person"].lower(), row["Sheet Type"].lower())
+                for previous_index, previous_min, previous_max in seen.get(key, []):
+                    if seller_terms_ranges_overlap(min_value, max_value, previous_min, previous_max):
+                        self.status.set(f"Row {index}: value range overlaps row {previous_index} for this Person and Sheet Type.")
+                        return None
+                seen.setdefault(key, []).append((index, min_value, max_value))
+                row["Sheet Type"] = active_types[row["Sheet Type"].lower()]
             rows.append(row)
         return rows
 

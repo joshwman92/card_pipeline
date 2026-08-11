@@ -3583,14 +3583,54 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
     def test_active_payout_balance_uses_seller_or_team_member_rule(self) -> None:
         class PayoutDummy:
             _active_payout_balance = app.CardPipelineApp._active_payout_balance
+            _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
+            _team_balance_share_for_person = app.CardPipelineApp._team_balance_share_for_person
+            _seller_terms_seller_names = app.CardPipelineApp._seller_terms_seller_names
+
+            def _load_seller_terms(self):
+                return [{"seller": "Kevin Hambone", "balance_share": 0.5}]
 
         dummy = PayoutDummy()
-        sellers = {"john seller"}
+        sellers = {"john seller"} | dummy._seller_terms_seller_names()
 
         self.assertEqual(dummy._active_payout_balance("John Seller", 80.0, 150.0, sellers), (80.0, "Seller purchase total"))
-        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 80.0, 150.0, sellers), (0.0, "Team half sold profit"))
-        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 80.0, 150.0, sellers, realized_profit_total=70.0), (35.0, "Team half sold profit"))
-        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 100.0, 80.0, sellers, realized_profit_total=-20.0), (-10.0, "Team half sold profit"))
+        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 80.0, 150.0, sellers), (0.0, "Team balance share 50%"))
+        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 80.0, 150.0, sellers, realized_profit_total=70.0), (35.0, "Team balance share 50%"))
+        self.assertEqual(dummy._active_payout_balance("Kevin Hambone", 100.0, 80.0, sellers, realized_profit_total=-20.0), (-10.0, "Team balance share 50%"))
+        self.assertEqual(dummy._active_payout_balance("James Copeland", 80.0, 150.0, sellers, realized_profit_total=70.0), (35.0, "Team balance share 50%"))
+
+    def test_balance_share_only_people_rule_does_not_make_person_seller_source(self) -> None:
+        class PayoutDummy:
+            _home_sheet_key = app.CardPipelineApp._home_sheet_key
+            _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
+            _load_seller_terms = app.CardPipelineApp._load_seller_terms
+            _seller_terms_seller_names = app.CardPipelineApp._seller_terms_seller_names
+            _sheet_marker_is_seller_payout = app.CardPipelineApp._sheet_marker_is_seller_payout
+            _source_sheet_is_seller_payout = app.CardPipelineApp._source_sheet_is_seller_payout
+            _money_value = app.CardPipelineApp._money_value
+
+        with TemporaryDirectory() as tmp:
+            old_terms = app.SELLER_TERMS_PATH
+            app.SELLER_TERMS_PATH = Path(tmp) / "seller_terms.csv"
+            app.SELLER_TERMS_PATH.write_text(
+                "Seller,Sheet Type,Min Value,Max Value,Seller Rate,Deduction,Balance Share\n"
+                "Kevin Hambone,,,,,,50%\n"
+                "John Seller,Arena Club,,,90%,,\n",
+                encoding="utf-8",
+            )
+            try:
+                dummy = PayoutDummy()
+                dummy.home_sheet_markers = {}
+                terms = dummy._load_seller_terms()
+                sellers = dummy._seller_terms_seller_names()
+                self.assertEqual(next(term for term in terms if term["seller"] == "Kevin Hambone")["balance_share"], 0.5)
+                self.assertEqual(sellers, {"john seller"})
+                self.assertFalse(dummy._source_sheet_is_seller_payout("Team Lot.xlsx", "Kevin Hambone", sellers))
+                self.assertTrue(dummy._source_sheet_is_seller_payout("Seller Lot.xlsx", "John Seller", sellers))
+            finally:
+                app.SELLER_TERMS_PATH = old_terms
 
     def test_sheet_marker_controls_seller_payout_classification(self) -> None:
         class PayoutDummy:
@@ -3673,6 +3713,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
     def test_seller_terms_deduction_uses_matching_value_range_per_card(self) -> None:
         class SellerRangeDummy:
             _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
             _seller_terms_value_in_range = app.CardPipelineApp._seller_terms_value_in_range
             _seller_terms_match = app.CardPipelineApp._seller_terms_match
             _seller_terms_company_decision = app.CardPipelineApp._seller_terms_company_decision
@@ -3711,12 +3753,46 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(dummy._seller_terms_company_price(low, "Arena Club", term=low_term), 360.0)
         self.assertEqual(dummy._seller_terms_company_price(high, "Arena Club", term=high_term), 850.0)
 
+    def test_seller_terms_blank_bounds_default_to_full_value_range(self) -> None:
+        class SellerRangeDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
+            _seller_terms_value_in_range = app.CardPipelineApp._seller_terms_value_in_range
+            _seller_terms_range_label = app.CardPipelineApp._seller_terms_range_label
+            _load_seller_terms = app.CardPipelineApp._load_seller_terms
+
+        with TemporaryDirectory() as tmp:
+            old_terms = app.SELLER_TERMS_PATH
+            app.SELLER_TERMS_PATH = Path(tmp) / "seller_terms.csv"
+            app.SELLER_TERMS_PATH.write_text(
+                "Seller,Sheet Type,Min Value,Max Value,Seller Rate,Deduction\n"
+                "John,Arena Club,,,80%,\n",
+                encoding="utf-8",
+            )
+            try:
+                dummy = SellerRangeDummy()
+                term = dummy._load_seller_terms()[0]
+            finally:
+                app.SELLER_TERMS_PATH = old_terms
+
+        self.assertEqual(term["min_value"], 0.0)
+        self.assertEqual(term["max_value"], 1_000_000_000.0)
+        self.assertTrue(dummy._seller_terms_value_in_range(0, term))
+        self.assertTrue(dummy._seller_terms_value_in_range(1_000_000_000, term))
+        self.assertFalse(dummy._seller_terms_value_in_range(1_000_000_000.01, term))
+        self.assertEqual(dummy._seller_terms_range_label(term), "$0.00 to $1,000,000,000.00")
+
     def test_seller_terms_pending_until_required_values_exist(self) -> None:
         class SellerSummaryDummy:
             _money_value = app.CardPipelineApp._money_value
             _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
-            _seller_terms_match = lambda self, seller, sheet_type: {"seller": seller, "sheet_type": sheet_type, "deduction": 0.1}
-            _seller_terms_match_for_row = lambda self, seller, sheet_type, row: ({"seller": seller, "sheet_type": sheet_type, "deduction": 0.1}, None)
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
+            _seller_terms_value_in_range = app.CardPipelineApp._seller_terms_value_in_range
+            _seller_terms_match = lambda self, seller, sheet_type, source_value=None: {"seller": seller, "sheet_type": sheet_type, "deduction": 0.1}
+            _seller_terms_match_for_row = app.CardPipelineApp._seller_terms_match_for_row
             _sheet_marker_is_seller_payout = app.CardPipelineApp._sheet_marker_is_seller_payout
             _seller_term_for_marker = app.CardPipelineApp._seller_term_for_marker
             _seller_terms_value_label = app.CardPipelineApp._seller_terms_value_label
@@ -3892,6 +3968,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _seller_terms_company_decision = app.CardPipelineApp._seller_terms_company_decision
             _seller_terms_company_price = app.CardPipelineApp._seller_terms_company_price
             _seller_terms_value_in_range = app.CardPipelineApp._seller_terms_value_in_range
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
             _marker_for_sheet_name = app.CardPipelineApp._marker_for_sheet_name
             _apply_seller_terms_to_rows_for_marker = app.CardPipelineApp._apply_seller_terms_to_rows_for_marker
             _comp_sheet_info = app.CardPipelineApp._comp_sheet_info
@@ -4051,6 +4129,112 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertFalse(assignment_config_ui.seller_terms_percent_input_is_number("10%"))
         self.assertFalse(assignment_config_ui.seller_terms_percent_input_is_number("ten"))
 
+    def test_people_rules_column_map_keeps_rate_and_deduction_after_min_max(self) -> None:
+        self.assertEqual(
+            assignment_config_ui.SELLER_TERMS_FIELDS,
+            ("Person", "Sheet Type", "Min Value", "Max Value", "Seller Rate", "Deduction", "Balance Share"),
+        )
+        self.assertEqual(assignment_config_ui.SELLER_TERMS_FIELD_COLUMNS["Min Value"], 2)
+        self.assertEqual(assignment_config_ui.SELLER_TERMS_FIELD_COLUMNS["Max Value"], 3)
+        self.assertEqual(assignment_config_ui.SELLER_TERMS_FIELD_COLUMNS["Seller Rate"], 4)
+        self.assertEqual(assignment_config_ui.SELLER_TERMS_FIELD_COLUMNS["Deduction"], 5)
+        self.assertEqual(assignment_config_ui.SELLER_TERMS_FIELD_COLUMNS["Balance Share"], 6)
+
+    def test_people_rules_blank_bounds_default_to_zero_and_large_max(self) -> None:
+        self.assertEqual(assignment_config_ui.seller_terms_min_value(""), 0.0)
+        self.assertEqual(assignment_config_ui.seller_terms_max_value(""), 1_000_000_000.0)
+        self.assertTrue(assignment_config_ui.seller_terms_ranges_overlap(None, None, 0.0, 1_000_000_000.0))
+        self.assertEqual(
+            assignment_config_ui.seller_terms_range_label(
+                assignment_config_ui.seller_terms_min_value(""),
+                assignment_config_ui.seller_terms_max_value(""),
+            ),
+            "$0 to $1,000,000,000",
+        )
+
+    def test_people_rules_balance_share_row_does_not_need_sheet_type(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seller_terms.csv"
+            path.write_text(
+                "Person,Sheet Type,Min Value,Max Value,Seller Rate,Deduction,Balance Share\n"
+                "Kevin Hambone,,,,,,50%\n",
+                encoding="utf-8",
+            )
+            rows = assignment_config_ui.read_seller_terms_rows(path)
+            lines = assignment_config_ui.seller_terms_health_lines(path, [{"name": "Arena Club", "active": True}])
+
+        self.assertEqual(rows[0]["Balance Share"], "50%")
+        text = "\n".join(lines)
+        self.assertIn("1 valid row(s)", text)
+        self.assertIn("Kevin Hambone / Team Balance: balance share 50%", text)
+        self.assertNotIn("missing Sheet Type", text)
+
+    def test_people_rules_still_read_legacy_seller_header(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "seller_terms.csv"
+            path.write_text(
+                "Seller,Sheet Type,Min Value,Max Value,Seller Rate,Deduction,Balance Share\n"
+                "Kevin Hambone,,,,,,50%\n",
+                encoding="utf-8",
+            )
+
+            rows = assignment_config_ui.read_seller_terms_rows(path)
+
+        self.assertEqual(rows[0]["Person"], "Kevin Hambone")
+        self.assertEqual(rows[0]["Balance Share"], "50%")
+
+    def test_people_rules_sheet_type_clears_balance_share_on_save(self) -> None:
+        class Var:
+            def __init__(self, value: str):
+                self.value = value
+            def get(self) -> str:
+                return self.value
+
+        class Status:
+            def __init__(self):
+                self.value = ""
+            def set(self, value: str) -> None:
+                self.value = value
+
+        dialog = assignment_config_ui.PeopleRulesDialog.__new__(assignment_config_ui.PeopleRulesDialog)
+        dialog.status = Status()
+        dialog._active_sheet_types = lambda: ["Arena Club"]
+        dialog.row_vars = [
+            {
+                "Person": Var("John Seller"),
+                "Sheet Type": Var("Arena Club"),
+                "Min Value": Var(""),
+                "Max Value": Var(""),
+                "Seller Rate": Var("90"),
+                "Deduction": Var(""),
+                "Balance Share": Var("50"),
+            }
+        ]
+
+        rows = dialog._validated_rows()
+
+        self.assertIsNotNone(rows)
+        self.assertEqual(rows[0]["Balance Share"], "")
+        self.assertEqual(rows[0]["Sheet Type"], "Arena Club")
+
+    def test_people_rules_sheet_type_disables_balance_share_entry(self) -> None:
+        dialog = assignment_config_ui.PeopleRulesDialog.__new__(assignment_config_ui.PeopleRulesDialog)
+
+        self.assertEqual(dialog._balance_share_entry_state(""), assignment_config_ui.tk.NORMAL)
+        self.assertEqual(dialog._balance_share_entry_state("  "), assignment_config_ui.tk.NORMAL)
+        self.assertEqual(dialog._balance_share_entry_state("Arena Club"), assignment_config_ui.tk.DISABLED)
+
+    def test_people_rules_sheet_type_choices_include_blank_reset_option(self) -> None:
+        dialog = assignment_config_ui.PeopleRulesDialog.__new__(assignment_config_ui.PeopleRulesDialog)
+        dialog.companies = [
+            {"name": "Fanatics", "active": True},
+            {"name": "Arena Club", "active": True},
+            {"name": "Inactive", "active": False},
+            {"name": "Arena Club", "active": True},
+        ]
+
+        self.assertEqual(dialog._sheet_type_choices(), ["", "Arena Club", "Fanatics"])
+
     def test_team_payout_uses_sold_profit_not_unsold_estimated_profit(self) -> None:
         class PayoutDummy:
             _home_sheet_key = app.CardPipelineApp._home_sheet_key
@@ -4073,6 +4257,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _empty_realized_profit_group = app.CardPipelineApp._empty_realized_profit_group
             _add_profit_record_to_realized_group = app.CardPipelineApp._add_profit_record_to_realized_group
             _payout_realized_groups_for_marker = app.CardPipelineApp._payout_realized_groups_for_marker
+            _team_balance_share_for_person = app.CardPipelineApp._team_balance_share_for_person
 
             def __init__(self):
                 self.home_sheet_paths = {"Incoming": {"Lot A.xlsx": Path("Lot A.xlsx")}, "Received": {}}
@@ -4089,6 +4274,9 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
 
             def _seller_terms_seller_names(self):
                 return set()
+
+            def _load_seller_terms(self):
+                return []
 
             def _load_profit_ledger(self):
                 return self.ledger
@@ -4157,6 +4345,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _empty_realized_profit_group = app.CardPipelineApp._empty_realized_profit_group
             _add_profit_record_to_realized_group = app.CardPipelineApp._add_profit_record_to_realized_group
             _payout_realized_groups_for_marker = app.CardPipelineApp._payout_realized_groups_for_marker
+            _team_balance_share_for_person = app.CardPipelineApp._team_balance_share_for_person
 
             def __init__(self):
                 key = self._sold_payout_key("Kevin Hambone", "Lot A.xlsx")
@@ -4188,6 +4377,9 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
 
             def _seller_terms_seller_names(self):
                 return set()
+
+            def _load_seller_terms(self):
+                return []
 
             def _load_profit_ledger(self):
                 return self.ledger
@@ -6934,6 +7126,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         class SellerTermsDummy:
             _money_value = app.CardPipelineApp._money_value
             _seller_terms_rate = app.CardPipelineApp._seller_terms_rate
+            _seller_terms_min_value = app.CardPipelineApp._seller_terms_min_value
+            _seller_terms_max_value = app.CardPipelineApp._seller_terms_max_value
             _seller_terms_value_in_range = app.CardPipelineApp._seller_terms_value_in_range
             _seller_terms_range_label = app.CardPipelineApp._seller_terms_range_label
             _load_seller_terms = app.CardPipelineApp._load_seller_terms

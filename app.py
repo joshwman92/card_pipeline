@@ -143,6 +143,9 @@ NO_COMPANY_TAKES_LABEL = "NOBODY TAKES"
 COMPANY_RESET_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 DEFAULT_COMPANY_RESET_WEEKDAY = "Monday"
 DEFAULT_COMPANY_RESET_TIME = "20:00"
+DEFAULT_SELLER_TERMS_MIN_VALUE = 0.0
+DEFAULT_SELLER_TERMS_MAX_VALUE = 1_000_000_000.0
+DEFAULT_TEAM_BALANCE_SHARE = 0.5
 PROFIT_PERIOD_OPTIONS = ("5 Days", "Week", "Last 30 Days", "Calendar Month", "Year", "YTD", "Total")
 PROFIT_GRAPH_OPTIONS = ("Overall Profit", "Profit to Sales Ratio", "Daily Trend", "Profit by Company")
 PROFIT_PLOT_OPTIONS = ("Overall", "By Sport")
@@ -1337,7 +1340,7 @@ class CardPipelineApp(tk.Tk):
             style="Panel.TCheckbutton",
         ).grid(row=0, column=3, sticky="e", padx=(16, 0))
         intake_controls.columnconfigure(3, weight=1)
-        self.network_seller_label = ttk.Label(intake_controls, text="Seller", style="Muted.TLabel")
+        self.network_seller_label = ttk.Label(intake_controls, text="Person", style="Muted.TLabel")
         self.network_seller_label.grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.seller_terms_seller_combo = ttk.Combobox(intake_controls, textvariable=self.seller_terms_seller_var, width=24)
         self.seller_terms_seller_combo.grid(row=1, column=1, sticky="w", padx=(8, 16), pady=(10, 0))
@@ -8274,7 +8277,8 @@ class CardPipelineApp(tk.Tk):
                 net_profit_total = float(payout_group.get("profit") or 0.0)
                 if net_profit_total == 0:
                     continue
-                payout_balance = min(0.0, round(net_profit_total / 2.0, 2))
+                balance_share = self._team_balance_share_for_person(person)
+                payout_balance = min(0.0, round(net_profit_total * balance_share, 2))
                 items.append(
                     {
                         "key": key,
@@ -8292,7 +8296,7 @@ class CardPipelineApp(tk.Tk):
                         "expense_total": round(float(payout_group.get("expense_total") or 0.0), 2),
                         "net_profit_total": round(net_profit_total, 2),
                         "payout_balance": payout_balance,
-                        "payout_basis": "Expense adjustment to team net profit",
+                        "payout_basis": f"Expense adjustment to team net profit at {balance_share:.0%}",
                         "status": "Paid" if paid else "Expenses",
                     }
                 )
@@ -8455,7 +8459,21 @@ class CardPipelineApp(tk.Tk):
             str(term.get("seller") or "").strip().lower()
             for term in self._load_seller_terms()
             if str(term.get("seller") or "").strip()
+            and str(term.get("sheet_type") or "").strip()
+            and (term.get("rate") is not None or term.get("deduction") is not None)
         }
+
+    def _team_balance_share_for_person(self, person: str) -> float:
+        person_key = str(person or "").strip().lower()
+        if not person_key:
+            return DEFAULT_TEAM_BALANCE_SHARE
+        for term in self._load_seller_terms():
+            if str(term.get("seller") or "").strip().lower() != person_key:
+                continue
+            share = self._seller_terms_rate(term.get("balance_share"))
+            if share is not None:
+                return share
+        return DEFAULT_TEAM_BALANCE_SHARE
 
     def _sheet_marker_is_seller_payout(self, marker: dict[str, object]) -> bool:
         return bool(marker.get("seller_terms_applied") or marker.get("seller_sheet_type"))
@@ -8493,7 +8511,8 @@ class CardPipelineApp(tk.Tk):
         if seller_payout is True or (seller_payout is None and normalized_person and normalized_person in seller_names):
             return round(float(purchase_total or 0.0), 2), "Seller purchase total"
         realized_profit = float(realized_profit_total or 0.0)
-        return round(realized_profit / 2.0, 2), "Team half sold profit"
+        share = self._team_balance_share_for_person(person)
+        return round(realized_profit * share, 2), f"Team balance share {share:.0%}"
 
     def _payout_sheet_status(self, stage: str, marker: dict[str, object], summary: dict[str, object]) -> str:
         received_count = int(summary.get("received_count") or 0)
@@ -8535,7 +8554,7 @@ class CardPipelineApp(tk.Tk):
                 self._refresh_table()
             self.status_var.set("Network Mode off. Seller terms hidden.")
         else:
-            self.status_var.set("Network Mode on. Seller and Sheet Type are available in Create.")
+            self.status_var.set("Network Mode on. Person and Sheet Type are available in Create.")
             self.apply_create_seller_terms(show_status=False)
 
     def _load_seller_terms(self) -> list[dict[str, object]]:
@@ -8554,10 +8573,13 @@ class CardPipelineApp(tk.Tk):
             value_source = str(normalized.get("valuesource") or normalized.get("source") or "").strip()
             rate = self._seller_terms_rate(normalized.get("sellerrate") or normalized.get("rate") or normalized.get("payout") or normalized.get("percentage"))
             deduction = self._seller_terms_rate(normalized.get("deduction") or normalized.get("sellerdeduction") or normalized.get("deductionpercent") or normalized.get("deductionpercentage"))
-            min_value = self._money_value(normalized.get("minvalue") or normalized.get("min") or normalized.get("minimum") or normalized.get("floor"))
-            max_value = self._money_value(normalized.get("maxvalue") or normalized.get("max") or normalized.get("maximum") or normalized.get("ceiling"))
-            if seller and sheet_type and (rate is not None or deduction is not None):
-                terms.append({"seller": seller, "sheet_type": sheet_type, "value_source": value_source, "min_value": min_value, "max_value": max_value, "rate": rate, "deduction": deduction})
+            balance_share = self._seller_terms_rate(normalized.get("balanceshare") or normalized.get("balancesharepercent") or normalized.get("teamshare") or normalized.get("profitshare") or normalized.get("payoutshare"))
+            min_raw = normalized.get("minvalue") or normalized.get("min") or normalized.get("minimum") or normalized.get("floor")
+            max_raw = normalized.get("maxvalue") or normalized.get("max") or normalized.get("maximum") or normalized.get("ceiling")
+            min_value = self._seller_terms_min_value(min_raw)
+            max_value = self._seller_terms_max_value(max_raw)
+            if seller and ((sheet_type and (rate is not None or deduction is not None)) or balance_share is not None):
+                terms.append({"seller": seller, "sheet_type": sheet_type, "value_source": value_source, "min_value": min_value, "max_value": max_value, "rate": rate, "deduction": deduction, "balance_share": balance_share})
         return terms
 
     def _refresh_seller_terms_dropdowns(self) -> None:
@@ -8577,11 +8599,21 @@ class CardPipelineApp(tk.Tk):
         rate = numeric / 100 if "%" in raw or numeric > 1 else numeric
         return rate if rate >= 0 else None
 
+    def _seller_terms_min_value(self, value: object) -> float | None:
+        if not str(value or "").strip():
+            return DEFAULT_SELLER_TERMS_MIN_VALUE
+        return self._money_value(value)
+
+    def _seller_terms_max_value(self, value: object) -> float | None:
+        if not str(value or "").strip():
+            return DEFAULT_SELLER_TERMS_MAX_VALUE
+        return self._money_value(value)
+
     def _seller_terms_value_in_range(self, source_value: float | None, term: dict[str, object]) -> bool:
-        min_value = self._money_value(term.get("min_value"))
-        max_value = self._money_value(term.get("max_value"))
+        min_value = self._seller_terms_min_value(term.get("min_value"))
+        max_value = self._seller_terms_max_value(term.get("max_value"))
         if source_value is None:
-            return min_value is None and max_value is None
+            return False
         if min_value is not None and source_value < min_value:
             return False
         if max_value is not None and source_value > max_value:
@@ -8589,8 +8621,8 @@ class CardPipelineApp(tk.Tk):
         return True
 
     def _seller_terms_range_label(self, term: dict[str, object]) -> str:
-        min_value = self._money_value(term.get("min_value"))
-        max_value = self._money_value(term.get("max_value"))
+        min_value = self._seller_terms_min_value(term.get("min_value"))
+        max_value = self._seller_terms_max_value(term.get("max_value"))
         if min_value is None and max_value is None:
             return "all values"
         if min_value is None:
@@ -8713,7 +8745,7 @@ class CardPipelineApp(tk.Tk):
             if restored:
                 self._refresh_table()
             if show_status and (seller or sheet_type):
-                self.status_var.set("Seller terms need both Seller and Sheet Type.")
+                self.status_var.set("Seller terms need both Person and Sheet Type.")
             return 0
         term = self._seller_terms_match(seller, sheet_type)
         if not term:
@@ -12217,7 +12249,7 @@ class CardPipelineApp(tk.Tk):
                 if not seller or not seller_sheet_type:
                     messagebox.showinfo(
                         "Seller terms required",
-                        "Network Mode seller buys need both Seller and Sheet Type. Leave both blank for a normal Open Team sheet.",
+                        "Network Mode person buys need both Person and Sheet Type. Leave both blank for a normal Open Team sheet.",
                     )
                     return
                 seller_term = self._seller_terms_match(seller, seller_sheet_type)
