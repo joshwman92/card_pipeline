@@ -69,6 +69,68 @@ import multi_card_extraction
 
 
 class SharedStateTests(unittest.TestCase):
+    def _trade_dummy(self):
+        class TradeDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _load_inventory_ledger = app.CardPipelineApp._load_inventory_ledger
+            _save_inventory_ledger = app.CardPipelineApp._save_inventory_ledger
+            _next_raw_item_id = app.CardPipelineApp._next_raw_item_id
+            _raw_item_id_namespace = app.CardPipelineApp._raw_item_id_namespace
+            _inventory_sport_from_value = app.CardPipelineApp._inventory_sport_from_value
+            _owner_for_profile = app.CardPipelineApp._owner_for_profile
+            _personal_default_person = app.CardPipelineApp._personal_default_person
+            _normalize_profit_record = app.CardPipelineApp._normalize_profit_record
+            _profit_record_date = app.CardPipelineApp._profit_record_date
+            _profit_record_key = app.CardPipelineApp._profit_record_key
+            _profit_record_identity_keys = app.CardPipelineApp._profit_record_identity_keys
+            _person_for_profit_record = app.CardPipelineApp._person_for_profit_record
+            _update_duplicate_inventory_sale_profit_record = app.CardPipelineApp._update_duplicate_inventory_sale_profit_record
+            _load_profit_ledger = app.CardPipelineApp._load_profit_ledger
+            _save_profit_ledger = app.CardPipelineApp._save_profit_ledger
+            record_profit_sales = app.CardPipelineApp.record_profit_sales
+            _general_sold_sheet_name = app.CardPipelineApp._general_sold_sheet_name
+            _inventory_sale_profit_record = app.CardPipelineApp._inventory_sale_profit_record
+            _mobile_trade_basis = app.CardPipelineApp._mobile_trade_basis
+            _trade_value_text = app.CardPipelineApp._trade_value_text
+            _mobile_trade_allocations = app.CardPipelineApp._mobile_trade_allocations
+            _mobile_inventory_title_key = app.CardPipelineApp._mobile_inventory_title_key
+            _mobile_inventory_sale_match = app.CardPipelineApp._mobile_inventory_sale_match
+            _mobile_inventory_payload_record = app.CardPipelineApp._mobile_inventory_payload_record
+            _mobile_inventory_json_record = app.CardPipelineApp._mobile_inventory_json_record
+            mobile_inventory_search = app.CardPipelineApp.mobile_inventory_search
+            mobile_inventory_trade = app.CardPipelineApp.mobile_inventory_trade
+            _desktop_trade_payload = app.CardPipelineApp._desktop_trade_payload
+
+            lucas_identity = {"display_name": "Test", "machine": "unit"}
+
+            def _is_personal_lucas(self):
+                return False
+
+            def _known_people(self):
+                return ["Mikey", "Kevin Hambone"]
+
+            def _raw_item_id_existing_records(self):
+                return []
+
+            def _live_sheet_raw_item_records(self):
+                return []
+
+            def _load_activity_log(self):
+                return []
+
+            def _enrich_inventory_record_assignment(self, record, force=False):
+                return self._normalize_inventory_record(record)
+
+            def _append_activity(self, *args, **kwargs):
+                return None
+
+            def refresh_profit_tab(self):
+                return None
+
+        return TradeDummy()
+
     def test_card_ladder_money_parsers_understand_k_suffix(self) -> None:
         class MoneyDummy:
             _money_value = app.CardPipelineApp._money_value
@@ -78,6 +140,82 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(MoneyDummy()._money_value("$20.27k"), 20270.0)
         self.assertEqual(intake_parse_money("$20.27k"), 20270.0)
         self.assertEqual(MoneyDummy()._money_value("$20.27"), 20.27)
+
+    def test_desktop_trade_payload_matches_trade_shape(self) -> None:
+        dummy = self._trade_dummy()
+        payload = dummy._desktop_trade_payload(
+            [{"inventory_key": "abc", "cert_number": "123", "item_id": "", "card_title": "Card A"}],
+            [{"card_title": "Card B", "trade_value": "100"}],
+            assigned_person="Mikey",
+            trade_date="2026-08-12",
+            cash_paid="10",
+            cash_received="5",
+            notes="desk",
+        )
+        self.assertEqual(payload["assigned_person"], "Mikey")
+        self.assertEqual(payload["outgoing"][0]["inventory_key"], "abc")
+        self.assertEqual(payload["incoming"][0]["trade_value"], "100")
+        self.assertEqual(payload["cash_paid"], "10")
+        self.assertEqual(payload["cash_received"], "5")
+
+    def test_inventory_trade_requires_incoming_trade_values(self) -> None:
+        dummy = self._trade_dummy()
+        result = dummy.mobile_inventory_trade(
+            {
+                "assigned_person": "Mikey",
+                "outgoing": [],
+                "incoming": [{"card_title": "Incoming Raw", "trade_value": ""}],
+            }
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("trade value", result["error"])
+
+    def test_inventory_trade_marks_outgoing_sold_and_adds_incoming(self) -> None:
+        dummy = self._trade_dummy()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inventory_path = root / "inventory_ledger.json"
+            profit_path = root / "profit_ledger.json"
+            outgoing = dummy._normalize_inventory_record(
+                {
+                    "date_added": "2026-08-01",
+                    "assigned_person": "Mikey",
+                    "sport": "football",
+                    "cert_number": "12345678",
+                    "grader": "PSA",
+                    "card_title": "Outgoing Card PSA 10",
+                    "purchase_price": 100,
+                    "inventory_value": 120,
+                    "source_sheet": "Inventory",
+                    "source": "Unit",
+                    "status": "Active",
+                }
+            )
+            atomic_write_json(inventory_path, [outgoing])
+            atomic_write_json(profit_path, [])
+            with patch.object(app, "CARD_PIPELINE_DIR", root), patch.object(app, "INVENTORY_LEDGER_PATH", inventory_path), patch.object(app, "PROFIT_LEDGER_PATH", profit_path):
+                result = dummy.mobile_inventory_trade(
+                    {
+                        "assigned_person": "Mikey",
+                        "trade_date": "2026-08-12",
+                        "cash_paid": "20",
+                        "cash_received": "0",
+                        "outgoing": [{"inventory_key": outgoing["inventory_key"]}],
+                        "incoming": [{"card_title": "Incoming Card", "trade_value": "120"}],
+                    }
+                )
+                self.assertTrue(result["ok"], result)
+                inventory_rows = dummy._load_inventory_ledger()
+                profit_rows = dummy._load_profit_ledger()
+        self.assertEqual(len(inventory_rows), 1)
+        self.assertEqual(inventory_rows[0]["card_title"], "Incoming Card")
+        self.assertEqual(float(inventory_rows[0]["purchase_price"]), 120.0)
+        self.assertTrue(str(inventory_rows[0]["item_id"]).startswith("RAW-TEAM-"))
+        self.assertEqual(len(profit_rows), 1)
+        self.assertEqual(profit_rows[0]["company"], "Trade")
+        self.assertEqual(float(profit_rows[0]["sale_price"]), 100.0)
+        self.assertEqual(float(profit_rows[0]["profit"]), 0.0)
+        self.assertEqual(profit_rows[0].get("sale_method"), "Trade")
 
     def test_scan_to_cert_preserves_long_psa_cert_numbers(self) -> None:
         self.assertEqual(scan_to_cert("1401017991290"), "1401017991290")
@@ -8400,6 +8538,13 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(overall_days, days)
         self.assertEqual(overall_values, [20, 20.0, 20.0, 20.0, 50.0])
 
+        dummy.profit_graph_var = types.SimpleNamespace(get=lambda: "Generated Profit")
+        self.assertEqual(dummy._profit_graph_label(), "Generated Profit")
+        self.assertEqual(dummy._profit_chart_title(), "Generated Profit (5 Days)")
+        generated_days, generated_values = dummy._profit_chart_series(filtered)
+        self.assertEqual(generated_days, days)
+        self.assertEqual(generated_values, daily_values)
+
         dummy.profit_graph_var = types.SimpleNamespace(get=lambda: "Profit to Sales Ratio")
         ratio_days, ratio_values = dummy._profit_chart_series(filtered)
         self.assertEqual(ratio_days, days)
@@ -8477,6 +8622,13 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(month_values[1], 0.0)
         self.assertEqual(month_values[2], 30.0)
         self.assertEqual(dummy._profit_chart_title(), "Daily Trend (Year by Month)")
+
+        dummy.profit_graph_var = types.SimpleNamespace(get=lambda: "Generated Profit")
+        generated_month_labels, generated_month_values = dummy._profit_chart_series(year_ratio_rows)
+        self.assertEqual(generated_month_labels, month_labels)
+        self.assertEqual(generated_month_values[0], 75.0)
+        self.assertEqual(generated_month_values[2], 30.0)
+        self.assertEqual(dummy._profit_chart_title(), "Generated Profit (Year by Month)")
 
         dummy.profit_breakdown_var = types.SimpleNamespace(get=lambda: "Day")
         day_labels, day_values = dummy._profit_chart_series(year_ratio_rows)
