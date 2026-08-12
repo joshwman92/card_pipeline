@@ -69,6 +69,32 @@ import multi_card_extraction
 
 
 class SharedStateTests(unittest.TestCase):
+    def test_comp_explanation_details_saved_average_calculation(self) -> None:
+        row = WorkbookRow(
+            excel_row=2,
+            cert_number="12345678",
+            card_title="Test Card PSA 10",
+            grader="PSA",
+            card_ladder_value=150.0,
+            card_ladder_comps_average=125.0,
+            card_ladder_comps=(
+                "Comp method: Average last 5 -> $125.00\n"
+                "1. Jul 1, 2026 | $100.00 | Auction | eBay | Test Card PSA 10\n"
+                "2. Jul 2, 2026 | $150.00 | Buy Now | eBay | Test Card PSA 10"
+            ),
+        )
+
+        explanation = app.format_comp_explanation(row)
+
+        self.assertIn("Method: Average last 5", explanation)
+        self.assertIn("Sales used (2):", explanation)
+        self.assertIn("($100.00 + $150.00) / 2 = $125.00", explanation)
+
+    def test_comp_explanation_handles_rows_without_saved_sales(self) -> None:
+        row = WorkbookRow(excel_row=2, cert_number="12345678", card_title="Test Card PSA 10", grader="PSA")
+
+        self.assertIn("No saved Card Ladder sale details", app.format_comp_explanation(row))
+
     def test_card_ladder_money_parsers_understand_k_suffix(self) -> None:
         class MoneyDummy:
             _money_value = app.CardPipelineApp._money_value
