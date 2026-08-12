@@ -34,6 +34,7 @@ if str(ENGINE_DIR) not in sys.path:
 from bridge_server import (  # noqa: E402
     COMP_STRATEGY_AVERAGE,
     COMP_STRATEGY_HIGH,
+    COMP_STRATEGY_LABELS,
     COMP_STRATEGY_LOW,
     COMP_STRATEGY_STALE_NEWEST,
     EXPECTED_CARDLADDER_EXTENSION_VERSION,
@@ -42,6 +43,7 @@ from bridge_server import (  # noqa: E402
     BridgeState,
     comp_price,
     format_comps,
+    parse_value,
     parse_formatted_comps,
     row_has_comp_data,
 )
@@ -649,6 +651,61 @@ def inventory_grader_filter_values(raw: object) -> set[str]:
         if text:
             values.add(text)
     return values
+
+
+def format_comp_explanation(row: WorkbookRow) -> str:
+    """Return a human-readable explanation of the saved Card Ladder comp result."""
+    saved_comps = str(row.card_ladder_comps or "").strip()
+    comps = parse_formatted_comps(saved_comps)
+    method_match = re.search(r"^\s*Comp method:\s*(.*?)\s*->\s*(\$[^\r\n]+)", saved_comps, flags=re.I | re.M)
+    method_label = method_match.group(1).strip() if method_match else ""
+    saved_result = parse_value(method_match.group(2)) if method_match else row.card_ladder_comps_average
+    strategy = next((key for key, label in COMP_STRATEGY_LABELS.items() if label.lower() == method_label.lower()), "")
+    numeric_values = [parse_value(comp.get("price")) for comp in comps]
+    numeric_values = [value for value in numeric_values if value is not None]
+    lines = [
+        row.card_title or row.cert_number or row.item_id or "Comp row",
+        "",
+        f"Cert/Item ID: {row.cert_number or row.item_id or 'blank'}",
+        f"Card Ladder value: {format_money(row.card_ladder_value) if row.card_ladder_value is not None else 'blank'}",
+        f"Saved comp result: {format_money(saved_result) if saved_result is not None else 'blank'}",
+    ]
+    if not comps:
+        lines.extend(["", "No saved Card Ladder sale details are available for this row."])
+        return "\n".join(lines)
+
+    lines.extend(["", f"Method: {method_label or 'not recorded'}"])
+    filter_line = next((line.strip() for line in saved_comps.splitlines() if line.strip().lower().startswith("low comp filter:")), "")
+    if filter_line:
+        lines.append(filter_line)
+    lines.extend(["", f"Sales used ({len(comps)}):"])
+    for index, comp in enumerate(comps, start=1):
+        sale_bits = [
+            str(comp.get("date_sold") or "undated").strip(),
+            str(comp.get("price") or "no price").strip(),
+            str(comp.get("sale_type") or "sale type not recorded").strip(),
+            str(comp.get("source") or "source not recorded").strip(),
+        ]
+        title = str(comp.get("title") or "").strip()
+        lines.append(f"{index}. {' | '.join(sale_bits)}" + (f" | {title}" if title else ""))
+
+    if numeric_values:
+        lines.extend(["", "Calculation:"])
+        formatted_values = ", ".join(format_money(value) for value in numeric_values)
+        calculated = comp_price(comps, strategy) if strategy else None
+        if strategy == COMP_STRATEGY_AVERAGE:
+            value_list = " + ".join(format_money(value) for value in numeric_values)
+            lines.append(f"Average last {len(numeric_values)}: ({value_list}) / {len(numeric_values)} = {format_money(calculated)}")
+        elif strategy == COMP_STRATEGY_HIGH:
+            lines.append(f"Highest sale: max({formatted_values}) = {format_money(calculated)}")
+        elif strategy == COMP_STRATEGY_LOW:
+            lines.append(f"Lowest sale: min({formatted_values}) = {format_money(calculated)}")
+        elif strategy == COMP_STRATEGY_STALE_NEWEST:
+            lines.append("Date weighted: averages dated sales unless the newest sale is stale or separated from the next newest sale by more than 7 days; in that case it uses the highest-quality sale on the newest sale date.")
+            lines.append(f"Calculated result: {format_money(calculated)}")
+        else:
+            lines.append("The saved method label could not be matched to a current calculation rule.")
+    return "\n".join(lines)
 
 
 class CardPipelineApp(tk.Tk):
@@ -4480,6 +4537,33 @@ class CardPipelineApp(tk.Tk):
         ttk.Button(actions, text="Copy Details", command=lambda: self._copy_inventory_text(explanation, "assignment explanation"), style="Soft.TButton").pack(side=tk.LEFT)
         ttk.Button(actions, text="Close", command=popup.destroy, style="Primary.TButton").pack(side=tk.RIGHT)
 
+    def explain_selected_comp(self) -> None:
+        selected = self.comp_tree.selection() if hasattr(self, "comp_tree") else ()
+        if not selected:
+            messagebox.showinfo("Explain Comp", "Select one comp row first.")
+            return
+        row = self._workbook_row_for_tree_iid(self.comp_tree, selected[0])
+        if not row:
+            messagebox.showinfo("Explain Comp", "Could not find that comp row.")
+            return
+        explanation = format_comp_explanation(row)
+        popup = tk.Toplevel(self)
+        popup.title("Comp Explanation")
+        popup.configure(bg=self.colors["bg"])
+        popup.transient(self)
+        popup.geometry("860x620")
+        frame = ttk.Frame(popup, style="App.TFrame", padding=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Comp Explanation", style="Panel.TLabel", font=("Segoe UI Semibold", 13)).pack(anchor=tk.W, pady=(0, 10))
+        text = tk.Text(frame, bg="#111111", fg="#f5f5f5", insertbackground="#ffffff", relief=tk.FLAT, wrap=tk.WORD, height=26)
+        text.pack(fill=tk.BOTH, expand=True)
+        text.insert("1.0", explanation)
+        text.configure(state=tk.DISABLED)
+        actions = ttk.Frame(frame, style="App.TFrame")
+        actions.pack(fill=tk.X, pady=(12, 0))
+        ttk.Button(actions, text="Copy Details", command=lambda: self._copy_inventory_text(explanation, "comp explanation"), style="Soft.TButton").pack(side=tk.LEFT)
+        ttk.Button(actions, text="Close", command=popup.destroy, style="Primary.TButton").pack(side=tk.RIGHT)
+
     def _workbook_row_for_tree_iid(self, tree: ttk.Treeview, row_id: str) -> WorkbookRow | None:
         try:
             excel_row = int(row_id)
@@ -4551,6 +4635,7 @@ class CardPipelineApp(tk.Tk):
         menu.add_command(label="Copy Cell", command=lambda row=row_id, column=column_id: self.copy_tree_cell_value(self.comp_tree, row, column, "comp cell"))
         menu.add_command(label="Copy Row", command=lambda row=row_id: self.copy_tree_row_values(self.comp_tree, row, "comp row"))
         menu.add_separator()
+        menu.add_command(label="Explain Comp", command=self.explain_selected_comp)
         menu.add_command(label="Explain Assignment", command=lambda target=self.comp_tree: self.explain_selected_workflow_assignment(target))
         menu.add_command(label="Update Best Company/Payout", command=self.update_selected_comp_assignments)
         menu.add_command(label="Delete Selected", command=self.delete_selected_comp_rows)
