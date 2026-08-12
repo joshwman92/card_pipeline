@@ -67,6 +67,7 @@ Use the `Create` tab for all card entry.
 - `Barcode Scanner`: enter scanning station mode, then scan certs continuously.
 - `Photo OCR`: add photos or a folder, scan them inside this app, and append detected card rows.
 - `Existing Spreadsheet`: load a simple workbook where column 1 is cert number, column 2 is card description, and column 3 is purchase price.
+- `Google Sheet`: paste a Google Sheets URL, load its tabs, select one tab, and import only that tab's card rows. This uses the same Google connection configured for company rules.
 
 Enter a title, then click `Save as Working Sheet`. Working sheets are saved to the configured `WORKING SHEETS` folder.
 

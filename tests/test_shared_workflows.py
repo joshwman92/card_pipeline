@@ -30,7 +30,7 @@ import lucas_diagnostics
 import cardladder_ocr
 from bridge_server import BridgeState, cert_match_key as bridge_cert_match_key, clean_profile_title as bridge_clean_profile_title, generic_profile_review_reason, keep_urls_match, normalize_result_cert as bridge_normalize_result_cert, parse_value as bridge_parse_value
 from comp_engine.workbook_io import WorkbookRow
-from intake_io import append_company_sheet_rows, company_weekly_sheet_name, ensure_company_weekly_sheets, mark_received_in_workbooks, normalize_cert, parse_money as intake_parse_money, scan_to_cert, read_company_profit_records, read_simple_spreadsheet, write_working_sheet
+from intake_io import append_company_sheet_rows, company_weekly_sheet_name, ensure_company_weekly_sheets, mark_received_in_workbooks, normalize_cert, parse_money as intake_parse_money, scan_to_cert, read_company_profit_records, read_google_sheet_values, read_simple_spreadsheet, write_working_sheet
 from shared_state import atomic_write_json, local_identity, read_json, shared_lock
 
 
@@ -69,6 +69,23 @@ import multi_card_extraction
 
 
 class SharedStateTests(unittest.TestCase):
+    def test_google_sheet_values_import_selected_tab_with_simple_headers(self) -> None:
+        rows = read_google_sheet_values(
+            [
+                ["Cert #", "Card Description", "Purchase Price", "Sport", "Card Ladder", "Comps"],
+                ["12345678", "2024 Test Player Rookie PSA 10", "$25.00", "baseball", "$80.00", "$75.00"],
+            ],
+            "Incoming Lot",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["cert_number"], "12345678")
+        self.assertEqual(rows[0]["card_title"], "2024 Test Player Rookie PSA 10")
+        self.assertEqual(rows[0]["purchase_price"], 25.0)
+        self.assertEqual(rows[0]["card_ladder_value"], 80.0)
+        self.assertEqual(rows[0]["card_ladder_comps_average"], 75.0)
+        self.assertEqual(rows[0]["workbook_sheet"], "Incoming Lot")
+
     def test_comp_explanation_details_saved_average_calculation(self) -> None:
         row = WorkbookRow(
             excel_row=2,

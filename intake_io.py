@@ -225,6 +225,75 @@ def read_simple_spreadsheet(path: Path, sheet_name: str | None = None) -> list[d
         workbook.close()
 
 
+def read_google_sheet_values(values: list[list[Any]], sheet_name: str, source_name: str = "Google Sheet") -> list[dict[str, Any]]:
+    """Convert one Google Sheets tab into the same Create-import row shape as XLSX."""
+    header_index = None
+    headers: dict[str, int] = {}
+    for index, raw_row in enumerate(values[:10]):
+        candidate = {_normalize_header(value): column + 1 for column, value in enumerate(raw_row) if _normalize_header(value)}
+        score = _simple_header_score(candidate)
+        joined = " ".join(clean_part(value).lower() for value in raw_row[:8])
+        if score >= 2 or (score >= 1 and any(token in joined for token in ("cert", "card", "description", "purchase", "price", "estimate", "confidence", "comp", "ladder", "date"))):
+            header_index = index
+            headers = candidate
+            break
+    has_header = header_index is not None
+    start_index = (header_index + 1) if has_header else 0
+
+    def cell(row: list[Any], aliases: tuple[str, ...], fallback_column: int | None = None) -> Any:
+        column = next((headers[alias] for alias in aliases if alias in headers), fallback_column)
+        return row[column - 1] if column and column <= len(row) else None
+
+    rows: list[dict[str, Any]] = []
+    for row_index, raw_row in enumerate(values[start_index:], start=start_index + 1):
+        date_added = clean_part(cell(raw_row, DATE_HEADERS))
+        item_id = clean_part(cell(raw_row, ITEM_ID_HEADERS))
+        cert = normalize_cert(cell(raw_row, CERT_HEADERS, None if has_header else 1))
+        grader = normalize_grader(cell(raw_row, GRADER_HEADERS))
+        card = clean_part(cell(raw_row, CARD_HEADERS, None if has_header else 2))
+        sport = clean_part(cell(raw_row, SPORT_HEADERS))
+        purchase_price = parse_money(cell(raw_row, PURCHASE_PRICE_HEADERS, None if has_header else 3))
+        card_ladder_value = parse_money(cell(raw_row, CARD_LADDER_VALUE_HEADERS))
+        comps_average = parse_money(cell(raw_row, COMPS_AVERAGE_HEADERS))
+        cy_value = parse_money(cell(raw_row, CY_ESTIMATE_HEADERS))
+        cy_confidence = cell(raw_row, CY_CONFIDENCE_HEADERS)
+        comp_details = clean_part(cell(raw_row, COMP_DETAILS_HEADERS))
+        best_company = clean_part(cell(raw_row, BEST_COMPANY_HEADERS))
+        estimated_payout = parse_money(cell(raw_row, ESTIMATED_PAYOUT_HEADERS))
+        status = clean_part(cell(raw_row, STATUS_HEADERS))
+        notes = clean_part(cell(raw_row, NOTES_HEADERS))
+        source = clean_part(cell(raw_row, SOURCE_HEADERS, None if has_header else 4))
+        received = _is_received_value(cell(raw_row, (_normalize_header(RECEIVED_HEADER),)))
+        if not cert and not card and purchase_price is None:
+            continue
+        grader = grader or infer_grader(card)
+        rows.append(
+            {
+                "item_id": item_id,
+                "cert_number": cert,
+                "card_title": card,
+                "sport": sport,
+                "grader": grader,
+                "purchase_price": purchase_price,
+                "card_ladder_value": card_ladder_value,
+                "card_ladder_comps_average": comps_average,
+                "cy_value": cy_value,
+                "cy_confidence": cy_confidence,
+                "card_ladder_comps": comp_details,
+                "best_company": best_company,
+                "estimated_payout": estimated_payout,
+                "source": source or f"{source_name}:{sheet_name}:{row_index}",
+                "workbook_sheet": sheet_name,
+                "workbook_row": row_index,
+                "date_added": date_added,
+                "received": received,
+                "status": status,
+                "notes": notes or _setup_notes(cert, card, grader),
+            }
+        )
+    return rows
+
+
 def read_photo_export(path: Path, sheet_name: str | None = None) -> list[dict[str, Any]]:
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:

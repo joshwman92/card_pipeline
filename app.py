@@ -53,7 +53,7 @@ from assignment_engine import AssignmentEngine  # noqa: E402
 from assignment_engine import CONFIG_PATH as ASSIGNMENT_CONFIG_PATH  # noqa: E402
 from assignment_engine import gsheet_shortcut_url, is_google_keep_url, keep_note_cache_path, load_gsheet_shortcut, normalize_source_value, path_from_source_value, safe_filename  # noqa: E402
 from assignment_config_ui import open_assignment_rules_dialog, open_people_rules_dialog, seller_terms_health_lines  # noqa: E402
-from google_sheets_import import export_google_sheet_to_xlsx  # noqa: E402
+from google_sheets_import import export_google_sheet_to_xlsx, read_google_sheet_tabs  # noqa: E402
 from lucas_diagnostics import diagnostic_json, lucas_version_label, setup_doctor_results  # noqa: E402
 from shared_state import atomic_write_json, local_identity, shared_lock  # noqa: E402
 
@@ -71,6 +71,7 @@ from intake_io import (  # noqa: E402
     normalize_grader,
     read_company_profit_records,
     read_photo_export,
+    read_google_sheet_values,
     read_simple_spreadsheet,
     remove_company_sheet_rows_for_source,
     scan_to_cert,
@@ -780,6 +781,8 @@ class CardPipelineApp(tk.Tk):
 
         self.file_path = tk.StringVar()
         self.sheet_name = tk.StringVar()
+        self.google_sheet_url = tk.StringVar()
+        self.google_sheet_tabs: dict[str, list[list[object]]] = {}
         self.photo_paths: list[Path] = []
         self.photo_status = tk.StringVar(value="No photos selected.")
         self.photo_worker: threading.Thread | None = None
@@ -1383,7 +1386,7 @@ class CardPipelineApp(tk.Tk):
             intake_controls,
             textvariable=self.input_mode,
             state="readonly",
-            values=["Barcode Scanner", "Manual Entry", "Photo OCR", "Existing Spreadsheet"],
+            values=["Barcode Scanner", "Manual Entry", "Photo OCR", "Existing Spreadsheet", "Google Sheet"],
             width=22,
         )
         mode.grid(row=0, column=1, sticky="w", padx=(8, 16))
@@ -10342,6 +10345,8 @@ class CardPipelineApp(tk.Tk):
             self._build_manual_intake_mode()
         elif mode == "Photo OCR":
             self._build_file_mode(photo=True)
+        elif mode == "Google Sheet":
+            self._build_google_sheet_mode()
         else:
             self._build_file_mode(photo=False)
         if hasattr(self, "intake_tree"):
@@ -10435,6 +10440,17 @@ class CardPipelineApp(tk.Tk):
         self.sheet_combo.grid(row=0, column=4, sticky="w")
         ttk.Button(self.mode_host, text="Load Rows", command=self.load_file_rows, style="Primary.TButton").grid(row=0, column=5, sticky="e", padx=(14, 0))
 
+    def _build_google_sheet_mode(self) -> None:
+        self.mode_host.columnconfigure(1, weight=1)
+        ttk.Label(self.mode_host, text="Google Sheet URL", style="Panel.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(self.mode_host, textvariable=self.google_sheet_url).grid(row=0, column=1, sticky="ew", padx=(0, 8))
+        ttk.Button(self.mode_host, text="Load Tabs", command=self.load_google_sheet_tabs, style="Soft.TButton").grid(row=0, column=2, sticky="e")
+        ttk.Label(self.mode_host, text="Tab", style="Panel.TLabel").grid(row=0, column=3, sticky="w", padx=(14, 8))
+        self.sheet_combo = ttk.Combobox(self.mode_host, textvariable=self.sheet_name, state="readonly", width=18)
+        self.sheet_combo.grid(row=0, column=4, sticky="w")
+        ttk.Button(self.mode_host, text="Load Rows", command=self.load_google_sheet_rows, style="Primary.TButton").grid(row=0, column=5, sticky="e", padx=(14, 0))
+        ttk.Label(self.mode_host, text="Paste a Google Sheets link, load its tabs, then select one tab to import.", style="Muted.TLabel").grid(row=1, column=0, columnspan=6, sticky="w", pady=(10, 0))
+
     def _build_photo_mode(self) -> None:
         self.mode_host.columnconfigure(4, weight=1)
         ttk.Button(self.mode_host, text="Add Photos", command=self.add_photos, style="Soft.TButton").grid(row=0, column=0, sticky="w", padx=(0, 8))
@@ -10504,6 +10520,45 @@ class CardPipelineApp(tk.Tk):
                 self.sheet_name.set(names[0])
         except Exception as error:
             messagebox.showerror("Workbook error", str(error))
+
+    def load_google_sheet_tabs(self) -> None:
+        url = self.google_sheet_url.get().strip()
+        if not url:
+            messagebox.showinfo("Google Sheet URL", "Paste a Google Sheets URL first.")
+            return
+        try:
+            tabs = read_google_sheet_tabs(url, interactive=True)
+        except Exception as error:
+            messagebox.showerror("Google Sheet error", str(error))
+            return
+        self.google_sheet_tabs = {str(title): values for title, values in tabs}
+        names = list(self.google_sheet_tabs)
+        self.sheet_combo["values"] = names
+        self.sheet_name.set(names[0] if names else "")
+        if not names:
+            messagebox.showinfo("No tabs", "This Google Sheet does not contain any readable tabs.")
+            return
+        self.status_var.set(f"Loaded {len(names)} tab(s) from Google Sheet. Select one tab, then load its rows.")
+
+    def load_google_sheet_rows(self) -> None:
+        selected_tab = self.sheet_name.get().strip()
+        if not self.google_sheet_tabs:
+            messagebox.showinfo("Load tabs first", "Load the Google Sheet tabs, then select the one to import.")
+            return
+        if selected_tab not in self.google_sheet_tabs:
+            messagebox.showinfo("Select a tab", "Choose one Google Sheet tab to import.")
+            return
+        try:
+            rows = read_google_sheet_values(self.google_sheet_tabs[selected_tab], selected_tab)
+        except Exception as error:
+            messagebox.showerror("Load failed", self._create_sheet_load_error(error))
+            return
+        if not rows:
+            messagebox.showinfo("No usable rows", self._create_sheet_no_rows_message(Path(selected_tab)))
+            self.status_var.set(f"No usable rows found in Google Sheet tab {selected_tab}.")
+            return
+        self._append_rows(rows)
+        self.status_var.set(f"Loaded {len(rows)} row(s) from Google Sheet tab {selected_tab}.")
 
     def load_file_rows(self) -> None:
         path = Path(self.file_path.get())
