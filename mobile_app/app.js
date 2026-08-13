@@ -1,0 +1,1516 @@
+const state = {
+  pin: localStorage.getItem("lucasMobilePin") || "",
+  clientId: localStorage.getItem("lucasMobileClientId") || "",
+  queue: [],
+  lastDuplicate: null,
+  sellRecord: null,
+  people: [],
+  connected: navigator.onLine !== false,
+  viewerRecord: null,
+  viewerPhoto: null,
+  searchRequestSeq: 0,
+  tradeSearchRequestSeq: 0,
+  tradeOutgoing: [],
+  tradeIncomingSeq: 0,
+  profitItems: [],
+  lastFailedQueueIds: new Set(),
+};
+const profileMatch = window.location.pathname.match(/^\/mobile\/(team|personal)(?:\/|$)/);
+const IS_PERSONAL_PROFILE = Boolean(profileMatch && profileMatch[1] === "personal");
+const PERSONAL_DEFAULT_PERSON = "Mikey";
+const APP_BASE = profileMatch ? `/mobile/${profileMatch[1]}` : "/mobile";
+const API_BASE = `${APP_BASE}/api`;
+if (!state.clientId) {
+  state.clientId = `mobile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  localStorage.setItem("lucasMobileClientId", state.clientId);
+}
+
+const $ = (id) => document.getElementById(id);
+const QUEUE_KEY = "lucasMobileQueue";
+const CACHE_PREFIX = `${profileMatch ? profileMatch[1] : "default"}:`;
+const CACHE_KEYS = {
+  search: `${CACHE_PREFIX}lucasMobileLastSearch`,
+  inventory: `${CACHE_PREFIX}lucasMobileInventorySnapshot`,
+  profit: `${CACHE_PREFIX}lucasMobileLastProfit`,
+  payouts: `${CACHE_PREFIX}lucasMobileLastPayouts`,
+};
+const INVENTORY_SNAPSHOT_LIMIT = 1000;
+const INVENTORY_SNAPSHOT_REFRESH_MS = 5 * 60 * 1000;
+
+function setConnectionStatus(connected, message = "") {
+  state.connected = Boolean(connected);
+  const banner = $("connectionBanner");
+  if (!banner) return;
+  banner.classList.toggle("hidden", connected && !message);
+  banner.classList.toggle("online", connected);
+  if (connected) {
+    banner.textContent = message || "Connected to desktop LUCAS.";
+  } else {
+    banner.textContent = message || "Offline mode: desktop LUCAS is not reachable. Adds, expenses, and cached-card sales can be queued and synced later.";
+  }
+}
+
+function cacheSet(key, payload) {
+  try {
+    localStorage.setItem(key, JSON.stringify({ saved_at: new Date().toISOString(), payload }));
+  } catch (_error) {
+    // Local storage can be full or disabled; offline queue still handles writes separately.
+  }
+}
+
+function cacheGet(key) {
+  try {
+    const wrapper = JSON.parse(localStorage.getItem(key) || "null");
+    return wrapper && wrapper.payload ? wrapper : null;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function cacheAgeText(savedAt) {
+  if (!savedAt) return "cached";
+  const ageMs = Date.now() - new Date(savedAt).getTime();
+  if (!Number.isFinite(ageMs) || ageMs < 0) return "cached";
+  const minutes = Math.max(1, Math.round(ageMs / 60000));
+  if (minutes < 60) return `${minutes} min old`;
+  const hours = Math.round(minutes / 60);
+  return `${hours} hr old`;
+}
+
+function cacheIsFresh(wrapper, maxAgeMs) {
+  if (!wrapper || !wrapper.saved_at) return false;
+  const ageMs = Date.now() - new Date(wrapper.saved_at).getTime();
+  return Number.isFinite(ageMs) && ageMs >= 0 && ageMs < maxAgeMs;
+}
+
+function setUnlocked(unlocked) {
+  $("authPanel").classList.toggle("hidden", unlocked);
+  $("appPanel").classList.toggle("hidden", !unlocked);
+}
+
+async function api(path, body, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), options.timeoutMs || 9000);
+  try {
+    const response = await fetch(`${API_BASE}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, pin: state.pin }),
+      signal: controller.signal,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(result.error || `Request failed with ${response.status}`);
+    }
+    setConnectionStatus(true);
+    return result;
+  } catch (error) {
+    setConnectionStatus(false);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function loadQueue() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+    state.queue = Array.isArray(raw) ? raw.filter((item) => item && item.id && item.type) : [];
+  } catch (_error) {
+    state.queue = [];
+  }
+}
+
+function saveQueue() {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(state.queue));
+  renderQueue();
+}
+
+function newActionId() {
+  return `${state.clientId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function queueAction(type, payload, options = {}) {
+  const id = options.id || newActionId();
+  const action = {
+    id,
+    type,
+    client_id: state.clientId,
+    created_at: options.createdAt || new Date().toISOString(),
+    payload: { ...payload },
+  };
+  delete action.payload.pin;
+  state.queue = state.queue.filter((item) => item.id !== id);
+  state.queue.push(action);
+  saveQueue();
+  return action;
+}
+
+async function mutationApi(type, path, body) {
+  const actionId = newActionId();
+  const createdAt = new Date().toISOString();
+  const payload = { ...body, action_id: actionId, client_id: state.clientId };
+  try {
+    return await api(path, payload, { timeoutMs: 60000 });
+  } catch (error) {
+    const message = String(error && error.message ? error.message : error || "");
+    if (/pin/i.test(message)) {
+      return { ok: false, error: message || "Invalid mobile PIN." };
+    }
+    const action = queueAction(type, payload, { id: actionId, createdAt });
+    return {
+      ok: true,
+      queued: true,
+      action_id: action.id,
+      error: message,
+    };
+  }
+}
+
+function money(value, fallback = "") {
+  if (value === null || value === undefined || value === "") return fallback;
+  const number = Number(value);
+  if (!Number.isFinite(number)) return String(value);
+  return number.toLocaleString(undefined, { style: "currency", currency: "USD" });
+}
+
+function localDateString(date = new Date()) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function fillSelect(select, values, options = {}) {
+  const current = select.value;
+  const allLabel = options.allLabel || "All people";
+  const includeAll = options.includeAll !== false;
+  const choices = includeAll ? [`<option value="">${escapeHtml(allLabel)}</option>`] : [];
+  values.forEach((value) => choices.push(`<option value="${escapeHtml(value)}">${escapeHtml(value)}</option>`));
+  select.innerHTML = choices.join("");
+  if ([...select.options].some((option) => option.value === current)) {
+    select.value = current;
+  }
+}
+
+function updatePeople(people) {
+  if (Array.isArray(people)) {
+    state.people = people.filter(Boolean);
+  }
+  ["personFilter", "profitPerson", "payoutPerson"].forEach((id) => fillSelect($(id), state.people));
+  ["assignedPerson", "expensePerson", "tradePerson"].forEach((id) => fillSelect($(id), state.people, { allLabel: "Choose person" }));
+}
+
+function cachedInventoryWrapper() {
+  return cacheGet(CACHE_KEYS.inventory) || cacheGet(CACHE_KEYS.search);
+}
+
+function inventoryAddedSortValue(item, index = 0) {
+  return [
+    String(item?.date_added || "").slice(0, 10),
+    String(item?.ledger_added_at || item?.created_at || item?.timestamp || ""),
+    String(item?.item_id || item?.inventory_key || item?.cert_number || ""),
+    String(index).padStart(8, "0"),
+  ].join("|");
+}
+
+function sortInventoryNewestFirst(items) {
+  return (Array.isArray(items) ? items.slice() : [])
+    .map((item, index) => ({ item, sort: inventoryAddedSortValue(item, index) }))
+    .sort((a, b) => b.sort.localeCompare(a.sort))
+    .map((entry) => entry.item);
+}
+
+function renderCachedInventory(wrapper, note) {
+  if (!wrapper || !wrapper.payload) return false;
+  const result = filterCachedInventory(wrapper.payload);
+  updatePeople(result.people || state.people);
+  renderResults(sortInventoryNewestFirst(result.items || []));
+  if (note) $("scanSearchStatus").textContent = note;
+  return true;
+}
+
+function normalizePendingInventoryRecord(action) {
+  const payload = action.payload || {};
+  const price = payload.purchase_price || "";
+  const value = payload.inventory_value || "";
+  return {
+    inventory_key: `pending:${action.id}`,
+    item_type: payload.cert_number ? "Slab" : "Raw",
+    item_id: "",
+    date_added: String(payload.date_added || action.created_at || localDateString()).slice(0, 10),
+    created_at: action.created_at || new Date().toISOString(),
+    cert_number: payload.cert_number || "",
+    grader: payload.grader || "",
+    card_title: payload.card_title || payload.cert_number || "Queued inventory add",
+    assigned_person: payload.assigned_person || "Unassigned",
+    source: payload.source || "Mobile Offline",
+    sport: "",
+    best_company: "",
+    notes: payload.notes || "Pending mobile sync",
+    status: "Active",
+    purchase_price: price,
+    purchase_price_display: price ? money(price) : "",
+    inventory_value: value,
+    inventory_value_display: value ? money(value) : "",
+    photos: [],
+    pending_sync: true,
+  };
+}
+
+function upsertCachedInventoryRecord(record) {
+  const wrapper = cacheGet(CACHE_KEYS.inventory) || {
+    saved_at: new Date().toISOString(),
+    payload: { ok: true, count: 0, items: [], people: state.people },
+  };
+  const payload = wrapper.payload || {};
+  const items = Array.isArray(payload.items) ? payload.items.slice() : [];
+  const key = String(record.inventory_key || "");
+  const cert = String(record.cert_number || "").toLowerCase();
+  const index = items.findIndex((item) => (
+    key && item.inventory_key === key
+  ) || (
+    cert && String(item.cert_number || "").toLowerCase() === cert && item.pending_sync
+  ));
+  if (index >= 0) {
+    items[index] = { ...items[index], ...record };
+  } else {
+    items.unshift(record);
+  }
+  const people = new Set([...(payload.people || state.people || []), record.assigned_person].filter(Boolean));
+  cacheSet(CACHE_KEYS.inventory, {
+    ...payload,
+    ok: true,
+    count: items.length,
+    items: sortInventoryNewestFirst(items),
+    people: Array.from(people).sort((a, b) => a.localeCompare(b)),
+  });
+}
+
+function hydratePendingInventoryFromQueue() {
+  state.queue
+    .filter((action) => action.type === "inventory.add")
+    .forEach((action) => upsertCachedInventoryRecord(normalizePendingInventoryRecord(action)));
+}
+
+function queueTitle(action) {
+  const payload = action.payload || {};
+  if (action.type === "inventory.add") {
+    return payload.cert_number || payload.card_title || "Inventory add";
+  }
+  if (action.type === "inventory.sold") {
+    return payload.inventory_key || payload.company || "Inventory sale";
+  }
+  if (action.type === "inventory.trade") {
+    const incoming = Array.isArray(payload.incoming) ? payload.incoming.length : 0;
+    const outgoing = Array.isArray(payload.outgoing) ? payload.outgoing.length : 0;
+    return `Trade ${outgoing} out / ${incoming} in`;
+  }
+  if (action.type === "expense.add") {
+    return `${payload.person || payload.assigned_person || "Expense"} ${money(payload.amount || payload.expense_amount, "")}`.trim();
+  }
+  if (action.type === "profit.refund") {
+    return payload.card_title || payload.cert_number || payload.item_id || "Profit refund";
+  }
+  return action.type || "Queued action";
+}
+
+function renderQueue() {
+  const badge = $("queueBadge");
+  if (badge) badge.textContent = String(state.queue.length);
+  const host = $("queueList");
+  if (!host) return;
+  if (!state.queue.length) {
+    host.innerHTML = '<div class="hint">No queued mobile actions.</div>';
+    return;
+  }
+  host.innerHTML = state.queue.map((action) => `
+    <article class="result">
+      <div class="queueType">${escapeHtml(action.type)}</div>
+      <h2>${escapeHtml(queueTitle(action))}</h2>
+      <div class="meta">
+        <div><strong>Created</strong>${escapeHtml(String(action.created_at || "").replace("T", " ").slice(0, 19))}</div>
+        <div><strong>Action ID</strong>${escapeHtml(action.id)}</div>
+      </div>
+    </article>
+  `).join("");
+}
+
+async function syncQueuedActions() {
+  if (!state.queue.length) {
+    $("syncStatus").textContent = "No queued actions to sync.";
+    renderQueue();
+    return;
+  }
+  $("syncStatus").textContent = "Syncing queued actions...";
+  try {
+    const result = await api("/sync/queue", {
+      client_id: state.clientId,
+      actions: state.queue,
+    }, { timeoutMs: 60000 });
+    const completed = new Set(
+      (result.results || [])
+        .filter((item) => item && item.ok && ["applied", "already_applied"].includes(item.status))
+        .map((item) => item.id)
+    );
+    state.lastFailedQueueIds = new Set(
+      (result.results || [])
+        .filter((item) => item && !item.ok && item.id)
+        .map((item) => item.id)
+    );
+    state.queue = state.queue.filter((action) => !completed.has(action.id));
+    saveQueue();
+    $("syncStatus").textContent = `Applied ${result.applied || 0}, skipped ${result.skipped || 0}, failed ${result.failed || 0}.`;
+    if (completed.size) {
+      await refreshInventorySnapshot(true);
+      await searchInventory();
+      loadProfit();
+      loadPayouts();
+    }
+  } catch (error) {
+    setConnectionStatus(false);
+    $("syncStatus").textContent = `Desktop not reachable. Export the queue or try again later. ${error.message || error}`;
+    renderQueue();
+  }
+}
+
+function exportQueue() {
+  const payload = {
+    version: 1,
+    service: "lucas-mobile-offline-queue",
+    client_id: state.clientId,
+    exported_at: new Date().toISOString(),
+    actions: state.queue,
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `lucas-mobile-queue-${localDateString()}.json`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
+  $("syncStatus").textContent = `Exported ${state.queue.length} queued action(s).`;
+}
+
+function syncPersonInputs(person) {
+  if (IS_PERSONAL_PROFILE) {
+    $("assignedPerson").value = PERSONAL_DEFAULT_PERSON;
+    $("expensePerson").value = PERSONAL_DEFAULT_PERSON;
+    $("tradePerson").value = PERSONAL_DEFAULT_PERSON;
+    return;
+  }
+  const value = person || $("personFilter").value || $("profitPerson").value || $("payoutPerson").value || "";
+  if (value && !$("assignedPerson").value) $("assignedPerson").value = value;
+  if (value && !$("expensePerson").value) $("expensePerson").value = value;
+  if (value && !$("tradePerson").value) $("tradePerson").value = value;
+}
+
+function personalPersonValue(value = "") {
+  return IS_PERSONAL_PROFILE ? PERSONAL_DEFAULT_PERSON : value;
+}
+
+function photoFileName(photo, record) {
+  const fallback = `${record.cert_number || record.item_id || "lucas-card"}.jpg`;
+  return String(photo.name || fallback).replace(/[^\w.\-()[\] ]+/g, "-") || fallback;
+}
+
+async function shareInventoryPhoto(record, photo) {
+  const status = $("scanSearchStatus");
+  const url = photo && photo.url;
+  if (!url) {
+    status.textContent = "No attached photo is available for that card.";
+    return;
+  }
+  status.textContent = "Preparing photo...";
+  try {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Photo request failed with ${response.status}`);
+    const blob = await response.blob();
+    const file = new File([blob], photoFileName(photo, record), { type: blob.type || "image/jpeg" });
+    const title = record.card_title || record.cert_number || "LUCAS inventory photo";
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ title, text: title, files: [file] });
+      status.textContent = "Photo ready. Choose Save Image/Save to Photos from the iPhone share sheet.";
+      return;
+    }
+    const objectUrl = URL.createObjectURL(blob);
+    window.open(objectUrl, "_blank");
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 60000);
+    status.textContent = "Opened photo. Use Share from Safari if needed.";
+  } catch (error) {
+    if (error && error.name === "AbortError") {
+      status.textContent = "Share cancelled.";
+      return;
+    }
+    window.open(url, "_blank");
+    status.textContent = `Opened photo fallback. ${error.message || error}`;
+  }
+}
+
+function openInventoryPhoto(record, photo) {
+  const viewer = $("photoViewer");
+  const image = $("photoViewerImage");
+  const title = $("photoViewerTitle");
+  const url = photo && photo.url;
+  if (!viewer || !image || !url) return;
+  image.src = url;
+  image.alt = record.card_title || record.cert_number || "Inventory photo";
+  if (title) title.textContent = record.card_title || record.cert_number || photo.name || "Inventory photo";
+  state.viewerRecord = record;
+  state.viewerPhoto = photo;
+  viewer.classList.remove("hidden");
+  document.body.classList.add("photoViewerOpen");
+}
+
+function closeInventoryPhoto() {
+  const viewer = $("photoViewer");
+  const image = $("photoViewerImage");
+  if (!viewer || viewer.classList.contains("hidden")) return;
+  viewer.classList.add("hidden");
+  document.body.classList.remove("photoViewerOpen");
+  state.viewerRecord = null;
+  state.viewerPhoto = null;
+  if (image) image.removeAttribute("src");
+}
+
+function renderCachedSearch(wrapper, error) {
+  const snapshot = cacheGet(CACHE_KEYS.inventory);
+  const source = snapshot || wrapper;
+  if (!source || !source.payload) {
+    $("results").innerHTML = `<div class="hint">Desktop LUCAS is not reachable and no cached inventory search is saved on this phone yet. Add inventory and expenses can still be queued. ${escapeHtml(error?.message || error || "")}</div>`;
+    return;
+  }
+  renderCachedInventory(source);
+  const label = snapshot ? "inventory snapshot" : "inventory search";
+  const note = `Showing cached ${label} (${cacheAgeText(source.saved_at)}). Live search needs desktop LUCAS online.`;
+  $("scanSearchStatus").textContent = note;
+  setConnectionStatus(false, note);
+}
+
+function renderPhotoStrip(item, itemIndex) {
+  const photos = Array.isArray(item.photos) ? item.photos : [];
+  if (!photos.length) {
+    return '<div class="photoHint">No photo attached</div>';
+  }
+  return `
+    <div class="photoStrip" aria-label="Attached inventory photos">
+      ${photos.map((photo, photoIndex) => `
+        <div class="photoTile">
+          <button class="photoOpenButton" data-index="${itemIndex}" data-photo-index="${photoIndex}" type="button" aria-label="Open attached photo ${photoIndex + 1}">
+            <img src="${escapeHtml(photo.url || "")}" alt="${escapeHtml(item.card_title || item.cert_number || "Inventory photo")}" loading="lazy">
+          </button>
+          <button class="secondary sharePhotoButton" data-index="${itemIndex}" data-photo-index="${photoIndex}" type="button">Save Photo</button>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderResults(items) {
+  const host = $("results");
+  if (!items.length) {
+    host.innerHTML = '<div class="hint">No inventory matched.</div>';
+    return;
+  }
+  host.innerHTML = items.map((item, index) => `
+    <article class="result">
+      <h2>${escapeHtml(item.card_title || item.cert_number || "Untitled card")}</h2>
+      <div class="meta">
+        <div><strong>Cert</strong>${escapeHtml(item.cert_number || "")}</div>
+        <div><strong>Item ID</strong>${escapeHtml(item.item_id || "")}</div>
+        <div><strong>Grader</strong>${escapeHtml(item.grader || "")}</div>
+        <div><strong>Paid</strong>${escapeHtml(item.purchase_price_display || money(item.purchase_price, "-"))}</div>
+        <div><strong>Value</strong>${escapeHtml(item.inventory_value_display || money(item.inventory_value, "-"))}</div>
+        <div><strong>Company</strong>${escapeHtml(item.best_company || "-")}</div>
+        <div><strong>Payout</strong>${escapeHtml(item.estimated_payout_display || money(item.estimated_payout, "-"))}</div>
+        <div><strong>Person</strong>${escapeHtml(item.assigned_person || "-")}</div>
+        <div><strong>Source</strong>${escapeHtml(item.source || item.source_sheet || "-")}</div>
+      </div>
+      ${renderPhotoStrip(item, index)}
+      ${String(item.status || "").toLowerCase() === "active" ? `<div class="resultActions"><button class="secondary sellButton" data-index="${index}" type="button">Mark Sold</button></div>` : ""}
+    </article>
+  `).join("");
+  document.querySelectorAll(".sellButton").forEach((button) => {
+    button.addEventListener("click", () => startSell(items[Number(button.dataset.index)]));
+  });
+  document.querySelectorAll(".sharePhotoButton").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = items[Number(button.dataset.index)];
+      const photos = Array.isArray(item && item.photos) ? item.photos : [];
+      shareInventoryPhoto(item, photos[Number(button.dataset.photoIndex)]);
+    });
+  });
+  document.querySelectorAll(".photoOpenButton").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = items[Number(button.dataset.index)];
+      const photos = Array.isArray(item && item.photos) ? item.photos : [];
+      openInventoryPhoto(item, photos[Number(button.dataset.photoIndex)]);
+    });
+  });
+}
+
+function selectedCategories() {
+  return Array.from(document.querySelectorAll(".categoryFilter:checked"))
+    .map((input) => input.value)
+    .filter(Boolean);
+}
+
+function inventorySearchPayload(overrides = {}) {
+  return {
+    query: $("searchInput").value,
+    person: IS_PERSONAL_PROFILE ? "" : $("personFilter").value,
+    sport: selectedCategories(),
+    include_sold: $("includeSold").checked,
+    ...overrides,
+  };
+}
+
+function certDigits(value) {
+  return String(value || "").replace(/\D+/g, "");
+}
+
+function cachedInventoryMatches(item, payload) {
+  const query = String(payload.query || "").trim().toLowerCase();
+  const certQuery = certDigits(query);
+  const person = String(payload.person || "").trim().toLowerCase();
+  const sports = Array.isArray(payload.sport) ? payload.sport : [payload.sport].filter(Boolean);
+  const sportFilters = sports.map((value) => String(value || "").trim().toLowerCase()).filter(Boolean);
+  const status = String(item.status || "").toLowerCase();
+  if (status !== "active" && !payload.include_sold) return false;
+  if (person && !String(item.assigned_person || "Unassigned").toLowerCase().includes(person)) return false;
+  if (sportFilters.length) {
+    const sportText = String(item.sport || "").toLowerCase();
+    if (!sportFilters.some((sport) => sportText === sport || sportText.includes(sport))) return false;
+  }
+  if (query) {
+    const cert = String(item.cert_number || "").trim().toLowerCase();
+    const title = String(item.card_title || "").trim().toLowerCase();
+    const certMatches = (certQuery && certDigits(cert).includes(certQuery)) || cert.includes(query);
+    const titleMatches = title.includes(query);
+    if (!certMatches && !titleMatches) return false;
+  }
+  return true;
+}
+
+function filterCachedInventory(payload) {
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const search = inventorySearchPayload();
+  const filtered = items.filter((item) => cachedInventoryMatches(item, search)).slice(0, 75);
+  return {
+    ...payload,
+    count: filtered.length,
+    items: filtered,
+    people: payload.people || state.people,
+  };
+}
+
+async function refreshInventorySnapshot(force = false) {
+  if (state.snapshotRefreshInFlight) return;
+  if (!force && cacheIsFresh(cacheGet(CACHE_KEYS.inventory), INVENTORY_SNAPSHOT_REFRESH_MS)) return;
+  state.snapshotRefreshInFlight = true;
+  try {
+    const result = await api("/inventory/search", {
+      query: "",
+      person: "",
+      sport: [],
+      include_sold: true,
+      limit: INVENTORY_SNAPSHOT_LIMIT,
+    });
+    if (result && result.ok) cacheSet(CACHE_KEYS.inventory, { ...result, items: sortInventoryNewestFirst(result.items || []) });
+  } catch (_error) {
+    // The visible search path already handles offline messaging.
+  } finally {
+    state.snapshotRefreshInFlight = false;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+  }[char]));
+}
+
+async function searchInventory() {
+  let result;
+  const requestSeq = ++state.searchRequestSeq;
+  const cached = cachedInventoryWrapper();
+  const showedCached = renderCachedInventory(
+    cached,
+    cached ? `Showing last synced inventory (${cacheAgeText(cached.saved_at)}). Checking live LUCAS...` : ""
+  );
+  if (navigator.onLine === false) {
+    if (requestSeq !== state.searchRequestSeq) return;
+    renderCachedSearch(cacheGet(CACHE_KEYS.search), "Phone is offline.");
+    return;
+  }
+  try {
+    result = await api("/inventory/search", inventorySearchPayload());
+  } catch (error) {
+    if (requestSeq !== state.searchRequestSeq) return;
+    if (!showedCached) renderCachedSearch(cacheGet(CACHE_KEYS.search), error);
+    else setConnectionStatus(false, `Still showing last synced inventory. Live LUCAS is not reachable yet. ${error.message || error}`);
+    return;
+  }
+  if (requestSeq !== state.searchRequestSeq) return;
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("results").innerHTML = `<div class="hint">${escapeHtml(result.error || "Search failed.")}</div>`;
+    return;
+  }
+  updatePeople(result.people || []);
+  cacheSet(CACHE_KEYS.search, { ...result, items: sortInventoryNewestFirst(result.items || []) });
+  $("scanSearchStatus").textContent = "";
+  renderResults(sortInventoryNewestFirst(result.items || []));
+  refreshInventorySnapshot();
+}
+
+function clearCategoryFilters() {
+  document.querySelectorAll(".categoryFilter").forEach((input) => {
+    input.checked = false;
+  });
+  searchInventory();
+}
+
+function addPayload(updateExisting = false) {
+  return {
+    cert_number: $("certNumber").value,
+    grader: $("grader").value,
+    card_title: $("cardTitle").value,
+    purchase_price: $("purchasePrice").value,
+    assigned_person: personalPersonValue($("assignedPerson").value),
+    source: $("source").value,
+    inventory_value: $("inventoryValue").value,
+    notes: $("notes").value,
+    update_existing: updateExisting,
+  };
+}
+
+function clearAddForm() {
+  ["certNumber", "purchasePrice", "cardTitle", "source", "inventoryValue", "notes"].forEach((id) => {
+    $(id).value = "";
+  });
+  $("grader").value = "";
+  $("scanAddStatus").textContent = "";
+  $("updateDuplicate").classList.add("hidden");
+}
+
+async function addInventory(updateExisting = false) {
+  $("addStatus").textContent = "Saving...";
+  $("updateDuplicate").classList.add("hidden");
+  const result = await mutationApi("inventory.add", "/inventory/add", addPayload(updateExisting));
+  if (result.queued) {
+    const action = state.queue.find((item) => item.id === result.action_id);
+    if (action) {
+      upsertCachedInventoryRecord(normalizePendingInventoryRecord(action));
+      renderCachedInventory(cachedInventoryWrapper(), "Showing queued inventory add from this phone. Sync when desktop LUCAS is reachable.");
+    }
+    $("addStatus").textContent = `Desktop not reachable. Queued inventory add ${result.action_id}.`;
+    clearAddForm();
+    return;
+  }
+  if (result.duplicate) {
+    state.lastDuplicate = result.record;
+    $("addStatus").textContent = result.error || "Duplicate cert found.";
+    $("updateDuplicate").classList.remove("hidden");
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("addStatus").textContent = result.error || "Add failed.";
+    return;
+  }
+  $("addStatus").textContent = `${result.action === "updated" ? "Updated" : "Added"} ${result.record?.cert_number || result.record?.card_title || "card"}.`;
+  updatePeople(result.people || state.people);
+  if (result.record) upsertCachedInventoryRecord(result.record);
+  clearAddForm();
+  searchInventory();
+}
+
+function startSell(record) {
+  state.sellRecord = record || null;
+  if (!state.sellRecord) return;
+  $("sellTitle").textContent = `Mark Sold: ${state.sellRecord.cert_number || state.sellRecord.card_title || "card"}`;
+  $("sellPrice").value = "";
+  $("sellDate").value = localDateString();
+  $("sellCompany").value = "";
+  $("sellStatus").textContent = "";
+  $("sellPanel").classList.remove("hidden");
+  $("sellPrice").focus();
+}
+
+function cancelSell() {
+  state.sellRecord = null;
+  $("sellPanel").classList.add("hidden");
+  $("sellStatus").textContent = "";
+}
+
+async function confirmSell() {
+  if (!state.sellRecord) return;
+  $("sellStatus").textContent = "Saving sale...";
+  const result = await mutationApi("inventory.sold", "/inventory/sold", {
+    inventory_key: state.sellRecord.inventory_key,
+    cert_number: state.sellRecord.cert_number || "",
+    item_id: state.sellRecord.item_id || "",
+    card_title: state.sellRecord.card_title || "",
+    sale_price: $("sellPrice").value,
+    sale_date: $("sellDate").value,
+    sale_method: $("sellMethod").value,
+    company: $("sellCompany").value,
+  });
+  if (result.queued) {
+    $("sellStatus").textContent = `Desktop not reachable. Queued sale ${result.action_id}.`;
+    cancelSell();
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("sellStatus").textContent = result.error || "Could not mark sold.";
+    return;
+  }
+  $("sellStatus").textContent = `Sold for ${result.sale?.sale_price_display || money(result.sale?.sale_price, "")}.`;
+  cancelSell();
+  $("searchInput").value = "";
+  await searchInventory();
+  loadProfit();
+  loadPayouts();
+}
+
+function parseMoneyInput(value) {
+  const number = Number(String(value || "").replace(/[$,]/g, ""));
+  return Number.isFinite(number) ? number : 0;
+}
+
+function tradeRecordCost(record) {
+  return parseMoneyInput(record.purchase_price || record.inventory_value || record.estimated_payout || 0);
+}
+
+function tradeRecordKey(record) {
+  return String(record.inventory_key || record.cert_number || record.item_id || record.card_title || "").trim().toLowerCase();
+}
+
+function tradeIncomingRows() {
+  return Array.from(document.querySelectorAll(".tradeIncomingRow")).map((row) => ({
+    cert_number: row.querySelector(".tradeCert")?.value || "",
+    grader: row.querySelector(".tradeGrader")?.value || "",
+    card_title: row.querySelector(".tradeTitle")?.value || "",
+    trade_value: row.querySelector(".tradeValue")?.value || "",
+    notes: row.querySelector(".tradeRowNotes")?.value || "",
+  })).filter((item) => item.cert_number || item.card_title || item.trade_value || item.notes);
+}
+
+function tradeAllocationPreview() {
+  const incoming = tradeIncomingRows();
+  const outgoingBasis = state.tradeOutgoing.reduce((total, record) => total + tradeRecordCost(record), 0);
+  const cashPaid = parseMoneyInput($("tradeCashPaid").value);
+  const cashReceived = parseMoneyInput($("tradeCashReceived").value);
+  const totalCost = Math.max(0, outgoingBasis + cashPaid - cashReceived);
+  const incomingValue = incoming.reduce((total, item) => total + parseMoneyInput(item.trade_value), 0);
+  const outgoingSide = outgoingBasis + cashPaid;
+  const incomingSide = incomingValue + cashReceived;
+  const difference = Math.round((outgoingSide - incomingSide) * 100) / 100;
+  const remainingToCover = Math.max(0, difference);
+  const extraValue = Math.max(0, Math.round((incomingSide - outgoingSide) * 100) / 100);
+  let allocations = [];
+  if (incoming.length) {
+    if (incomingValue > 0) {
+      let remaining = totalCost;
+      allocations = incoming.map((item, index) => {
+        if (index === incoming.length - 1) return Math.max(0, remaining);
+        const amount = Math.round(totalCost * (parseMoneyInput(item.trade_value) / incomingValue) * 100) / 100;
+        remaining = Math.round((remaining - amount) * 100) / 100;
+        return Math.max(0, amount);
+      });
+    } else {
+      const split = Math.round((totalCost / incoming.length) * 100) / 100;
+      let remaining = totalCost;
+      allocations = incoming.map((_item, index) => {
+        if (index === incoming.length - 1) return Math.max(0, remaining);
+        remaining = Math.round((remaining - split) * 100) / 100;
+        return Math.max(0, split);
+      });
+    }
+  }
+  return {
+    outgoingBasis,
+    cashPaid,
+    cashReceived,
+    totalCost,
+    incomingValue,
+    outgoingSide,
+    incomingSide,
+    difference,
+    remainingToCover,
+    extraValue,
+    covered: remainingToCover <= 0.01,
+    balanced: remainingToCover <= 0.01,
+    allocations,
+  };
+}
+
+function updateTradeSummary() {
+  const preview = tradeAllocationPreview();
+  const incoming = tradeIncomingRows();
+  const allocationText = incoming.length
+    ? preview.allocations.map((amount, index) => `${incoming[index].card_title || incoming[index].cert_number || `Incoming ${index + 1}`}: ${money(amount)}`).join(" | ")
+    : "No incoming cards.";
+  const balanceText = preview.covered
+    ? (preview.extraValue > 0.01 ? `Covered, ${money(preview.extraValue)} in your favor.` : "Covered.")
+    : `${money(preview.remainingToCover)} left to fill to reach cost.`;
+  const banner = $("tradeBalanceBanner");
+  if (banner) {
+    banner.textContent = balanceText;
+    banner.classList.toggle("needsValue", !preview.covered);
+  }
+  $("tradeSummary").textContent = `Outgoing cost ${money(preview.outgoingSide)}. Incoming cost ${money(preview.incomingSide)}. Incoming basis ${money(preview.totalCost)}. ${allocationText}`;
+}
+
+function tradeIncomingRowSummary(wrapper) {
+  const title = wrapper.querySelector(".tradeTitle")?.value || "";
+  const cert = wrapper.querySelector(".tradeCert")?.value || "";
+  const cost = wrapper.querySelector(".tradeValue")?.value || "";
+  const label = title || cert || "Incoming card";
+  return `${label} - Cost ${money(parseMoneyInput(cost))}`;
+}
+
+function syncTradeIncomingRowSummary(wrapper) {
+  const summary = wrapper.querySelector(".tradeIncomingSummary");
+  if (summary) summary.textContent = tradeIncomingRowSummary(wrapper);
+}
+
+function maybeCollapseTradeIncomingRow(wrapper) {
+  const hasCard = Boolean((wrapper.querySelector(".tradeTitle")?.value || wrapper.querySelector(".tradeCert")?.value || "").trim());
+  const hasCostEntry = String(wrapper.querySelector(".tradeValue")?.value || "").trim() !== "";
+  if (hasCard && hasCostEntry) {
+    syncTradeIncomingRowSummary(wrapper);
+    wrapper.classList.add("collapsed");
+  }
+}
+
+function renderTradeOutgoing() {
+  const host = $("tradeOutgoingList");
+  if (!state.tradeOutgoing.length) {
+    host.innerHTML = '<div class="hint">No outgoing cards selected.</div>';
+    updateTradeSummary();
+    return;
+  }
+  host.innerHTML = state.tradeOutgoing.map((record, index) => `
+    <article class="result slim">
+      <h2>${escapeHtml(record.card_title || record.cert_number || "Untitled card")}</h2>
+      <div class="meta">
+        <div><strong>Cert</strong>${escapeHtml(record.cert_number || "")}</div>
+        <div><strong>Cost</strong>${escapeHtml(record.purchase_price_display || money(record.purchase_price, "-"))}</div>
+      </div>
+      <button class="secondary removeTradeOutgoing" data-index="${index}" type="button">Remove</button>
+    </article>
+  `).join("");
+  document.querySelectorAll(".removeTradeOutgoing").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.tradeOutgoing.splice(Number(button.dataset.index), 1);
+      renderTradeOutgoing();
+    });
+  });
+  updateTradeSummary();
+}
+
+function renderTradeSearchResults(items) {
+  const host = $("tradeSearchResults");
+  const selectedKeys = new Set(state.tradeOutgoing.map((record) => tradeRecordKey(record)).filter(Boolean));
+  const visibleItems = items.filter((item) => !selectedKeys.has(tradeRecordKey(item)));
+  if (!visibleItems.length) {
+    host.innerHTML = '<div class="hint">No active inventory matched.</div>';
+    return;
+  }
+  host.innerHTML = visibleItems.map((item, index) => `
+    <article class="result slim">
+      <h2>${escapeHtml(item.card_title || item.cert_number || "Untitled card")}</h2>
+      <div class="meta">
+        <div><strong>Cert</strong>${escapeHtml(item.cert_number || "")}</div>
+        <div><strong>Paid</strong>${escapeHtml(item.purchase_price_display || money(item.purchase_price, "-"))}</div>
+        <div><strong>Person</strong>${escapeHtml(item.assigned_person || "-")}</div>
+      </div>
+      <button class="secondary addTradeOutgoing" data-index="${index}" type="button">Add Outgoing</button>
+    </article>
+  `).join("");
+  document.querySelectorAll(".addTradeOutgoing").forEach((button) => {
+    button.addEventListener("click", () => {
+      const item = visibleItems[Number(button.dataset.index)];
+      const key = tradeRecordKey(item);
+      if (key && !state.tradeOutgoing.some((record) => tradeRecordKey(record) === key)) {
+        state.tradeOutgoing.push(item);
+        renderTradeOutgoing();
+      }
+      state.tradeSearchRequestSeq += 1;
+      $("tradeSearchInput").value = "";
+      $("tradeSearchResults").innerHTML = "";
+      $("tradeStatus").textContent = "";
+    });
+  });
+}
+
+async function searchTradeInventory() {
+  const requestSeq = ++state.tradeSearchRequestSeq;
+  const payload = {
+    query: $("tradeSearchInput").value,
+    person: IS_PERSONAL_PROFILE ? "" : $("tradePerson").value,
+    sport: [],
+    include_sold: false,
+    limit: 25,
+  };
+  try {
+    const result = await api("/inventory/search", payload);
+    if (requestSeq !== state.tradeSearchRequestSeq) return;
+    if (!result.ok) throw new Error(result.error || "Trade search failed.");
+    renderTradeSearchResults(result.items || []);
+    cacheSet(CACHE_KEYS.search, result);
+  } catch (error) {
+    if (requestSeq !== state.tradeSearchRequestSeq) return;
+    const cached = cachedInventoryWrapper();
+    const items = cached && cached.payload ? (cached.payload.items || []).filter((item) => cachedInventoryMatches(item, payload)).slice(0, 25) : [];
+    renderTradeSearchResults(items);
+    $("tradeStatus").textContent = `Showing cached trade search. ${error.message || error}`;
+  }
+}
+
+function addTradeIncomingRow(values = {}) {
+  const id = ++state.tradeIncomingSeq;
+  const host = $("tradeIncomingRows");
+  const wrapper = document.createElement("section");
+  wrapper.className = "panel tradeIncomingRow";
+  wrapper.dataset.rowId = String(id);
+  wrapper.innerHTML = `
+    <button class="tradeIncomingSummary" type="button"></button>
+    <div class="grid tradeIncomingFields">
+      <label>Cert<input class="tradeCert" inputmode="numeric" placeholder="Cert number" value="${escapeHtml(values.cert_number || "")}"></label>
+      <label>Grader<select class="tradeGrader">
+        <option value="">No grader</option>
+        <option value="PSA">PSA</option>
+        <option value="BGS">BGS</option>
+        <option value="CGC">CGC</option>
+        <option value="SGC">SGC</option>
+      </select></label>
+      <label>Card<input class="tradeTitle" placeholder="Year set player grade" value="${escapeHtml(values.card_title || "")}"></label>
+      <label>Cost<input class="tradeValue" inputmode="decimal" placeholder="Optional split cost" value="${escapeHtml(values.trade_value || "")}"></label>
+      <label>Notes<textarea class="tradeRowNotes" rows="2">${escapeHtml(values.notes || "")}</textarea></label>
+    </div>
+    <button class="secondary collapseTradeIncoming" type="button">Done</button>
+    <button class="secondary removeTradeIncoming" type="button">Remove Incoming Card</button>
+  `;
+  host.appendChild(wrapper);
+  wrapper.querySelector(".tradeGrader").value = values.grader || "";
+  wrapper.querySelectorAll("input, select, textarea").forEach((input) => {
+    input.addEventListener("input", () => {
+      syncTradeIncomingRowSummary(wrapper);
+      updateTradeSummary();
+    });
+    input.addEventListener("change", () => {
+      syncTradeIncomingRowSummary(wrapper);
+      updateTradeSummary();
+      maybeCollapseTradeIncomingRow(wrapper);
+    });
+  });
+  wrapper.querySelector(".tradeIncomingSummary").addEventListener("click", () => {
+    wrapper.classList.remove("collapsed");
+    wrapper.querySelector(".tradeTitle, .tradeCert, .tradeValue")?.focus();
+  });
+  wrapper.querySelector(".collapseTradeIncoming").addEventListener("click", () => {
+    syncTradeIncomingRowSummary(wrapper);
+    wrapper.classList.add("collapsed");
+  });
+  wrapper.querySelector(".removeTradeIncoming").addEventListener("click", () => {
+    wrapper.remove();
+    updateTradeSummary();
+  });
+  syncTradeIncomingRowSummary(wrapper);
+  maybeCollapseTradeIncomingRow(wrapper);
+  updateTradeSummary();
+}
+
+function clearTradeForm() {
+  state.tradeOutgoing = [];
+  $("tradeSearchInput").value = "";
+  $("tradeCashPaid").value = "";
+  $("tradeCashReceived").value = "";
+  $("tradeNotes").value = "";
+  $("tradeSearchResults").innerHTML = "";
+  $("tradeIncomingRows").innerHTML = "";
+  addTradeIncomingRow();
+  renderTradeOutgoing();
+}
+
+function tradePayload() {
+  return {
+    assigned_person: personalPersonValue($("tradePerson").value),
+    trade_date: $("tradeDate").value,
+    cash_paid: $("tradeCashPaid").value,
+    cash_received: $("tradeCashReceived").value,
+    notes: $("tradeNotes").value,
+    outgoing: state.tradeOutgoing.map((record) => ({
+      inventory_key: record.inventory_key,
+      cert_number: record.cert_number || "",
+      item_id: record.item_id || "",
+      card_title: record.card_title || "",
+    })),
+    incoming: tradeIncomingRows(),
+  };
+}
+
+async function saveTrade() {
+  const preview = tradeAllocationPreview();
+  if (!preview.covered) {
+    $("tradeStatus").textContent = `Add ${money(preview.remainingToCover)} more incoming cost or cash received before saving.`;
+    updateTradeSummary();
+    return;
+  }
+  $("tradeStatus").textContent = "Saving trade...";
+  const result = await mutationApi("inventory.trade", "/inventory/trade", tradePayload());
+  if (result.queued) {
+    $("tradeStatus").textContent = `Desktop not reachable. Queued trade ${result.action_id}.`;
+    clearTradeForm();
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("tradeStatus").textContent = result.error || "Trade failed.";
+    return;
+  }
+  $("tradeStatus").textContent = `Trade saved. Incoming basis ${result.trade?.total_cost_display || money(result.trade?.total_cost, "")}.`;
+  updatePeople(result.people || state.people);
+  clearTradeForm();
+  await refreshInventorySnapshot(true);
+  searchInventory();
+  loadProfit();
+  loadPayouts();
+}
+
+function expensePayload() {
+  return {
+    person: personalPersonValue($("expensePerson").value),
+    date: $("expenseDate").value,
+    expense_type: $("expenseType").value,
+    amount: $("expenseAmount").value,
+    related_type: $("expenseRelatedType").value,
+    source_sheet: $("expenseSheet").value,
+    notes: $("expenseNotes").value,
+  };
+}
+
+async function addExpense() {
+  $("expenseStatus").textContent = "Saving...";
+  const result = await mutationApi("expense.add", "/expenses/add", expensePayload());
+  if (result.queued) {
+    $("expenseStatus").textContent = `Desktop not reachable. Queued expense ${result.action_id}.`;
+    $("expenseAmount").value = "";
+    $("expenseSheet").value = "";
+    $("expenseNotes").value = "";
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("expenseStatus").textContent = result.error || "Expense add failed.";
+    return;
+  }
+  updatePeople(result.people || state.people);
+  $("expenseStatus").textContent = "Expense added.";
+  $("expenseAmount").value = "";
+  $("expenseSheet").value = "";
+  $("expenseNotes").value = "";
+  loadProfit();
+}
+
+function renderMetrics(host, items) {
+  host.innerHTML = items.map((item) => `
+    <div class="metric">
+      <strong>${escapeHtml(item.label)}</strong>
+      <span>${escapeHtml(item.value)}</span>
+    </div>
+  `).join("");
+}
+
+function drawChart(chart) {
+  const svg = $("profitChart");
+  const values = (chart && chart.values) || [];
+  if (!values.length) {
+    svg.innerHTML = '<text x="50%" y="50%" dominant-baseline="middle" text-anchor="middle" fill="#9eb1ba">No profit data</text>';
+    return;
+  }
+  const width = 700;
+  const height = 220;
+  const pad = 24;
+  const min = Math.min(...values, 0);
+  const max = Math.max(...values, 0);
+  const span = max - min || 1;
+  const point = (value, index) => {
+    const x = pad + (values.length === 1 ? 0 : (index / (values.length - 1)) * (width - pad * 2));
+    const y = height - pad - ((value - min) / span) * (height - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  };
+  const points = values.map(point).join(" ");
+  const zeroY = height - pad - ((0 - min) / span) * (height - pad * 2);
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.innerHTML = `
+    <line x1="${pad}" y1="${zeroY.toFixed(1)}" x2="${width - pad}" y2="${zeroY.toFixed(1)}" stroke="#304453" stroke-width="1" />
+    <polyline points="${points}" fill="none" stroke="#7ed8bd" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+    <circle cx="${point(values[values.length - 1], values.length - 1).split(",")[0]}" cy="${point(values[values.length - 1], values.length - 1).split(",")[1]}" r="5" fill="#eef5f6" />
+    <text x="${pad}" y="18" fill="#9eb1ba" font-size="13">${escapeHtml(money(max))}</text>
+    <text x="${pad}" y="${height - 7}" fill="#9eb1ba" font-size="13">${escapeHtml(money(min))}</text>
+  `;
+}
+
+async function loadProfit() {
+  let result;
+  try {
+    result = await api("/profit/summary", {
+      person: IS_PERSONAL_PROFILE ? "" : $("profitPerson").value,
+      period: $("profitPeriod").value,
+      graph: $("profitGraph").value,
+      query: $("profitSearch").value,
+    });
+  } catch (error) {
+    const cached = cacheGet(CACHE_KEYS.profit);
+    if (cached && cached.payload) {
+      renderProfit(cached.payload);
+      $("profitRecent").insertAdjacentHTML("afterbegin", `<div class="hint">Showing cached profit (${escapeHtml(cacheAgeText(cached.saved_at))}). Live profit needs desktop LUCAS online.</div>`);
+    } else {
+      $("profitRecent").innerHTML = `<div class="hint">Desktop LUCAS is not reachable and no cached profit is saved on this phone yet. ${escapeHtml(error.message || error)}</div>`;
+    }
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("profitRecent").innerHTML = `<div class="hint">${escapeHtml(result.error || "Profit load failed.")}</div>`;
+    return;
+  }
+  cacheSet(CACHE_KEYS.profit, result);
+  renderProfit(result);
+}
+
+function renderProfit(result) {
+  updatePeople(result.people || []);
+  fillSelect($("profitPeriod"), result.periods || ["Total", "Year", "Month", "Week", "5 Days"], { includeAll: false });
+  fillSelect($("profitGraph"), result.graphs || ["Daily Trend", "Overall Profit"], { includeAll: false });
+  const totals = result.totals || {};
+  renderMetrics($("profitCards"), [
+    { label: "Net Profit", value: money(totals.net_profit, "$0.00") },
+    { label: "Gross Profit", value: money(totals.gross_profit, "$0.00") },
+    { label: "Expenses", value: money(totals.expenses, "$0.00") },
+    { label: "Sales", value: money(totals.sale, "$0.00") },
+  ]);
+  drawChart(result.chart || {});
+  const recent = result.recent || [];
+  state.profitItems = recent;
+  $("profitRecent").innerHTML = recent.length ? recent.map((item, index) => `
+    <article class="result">
+      <h2>${escapeHtml(item.title || item.company || item.type)}</h2>
+      <div class="meta">
+        <div><strong>Date</strong>${escapeHtml(item.date || "")}</div>
+        <div><strong>Person</strong>${escapeHtml(item.person || "")}</div>
+        <div><strong>Type</strong>${escapeHtml(item.type || "")}</div>
+        <div><strong>Sale Price</strong>${escapeHtml(item.sale_price_display || money(item.sale_price, "-"))}</div>
+        <div><strong>Profit</strong>${escapeHtml(item.profit_display || money(item.profit, "-"))}</div>
+      </div>
+      ${item.type === "Sale" ? `<div class="resultActions"><button class="secondary refundProfitButton" data-index="${index}" type="button">Refund to Inventory</button></div>` : ""}
+    </article>
+  `).join("") : '<div class="hint">No profit rows matched.</div>';
+  document.querySelectorAll(".refundProfitButton").forEach((button) => {
+    button.addEventListener("click", () => refundProfitItem(state.profitItems[Number(button.dataset.index)]));
+  });
+}
+
+async function refundProfitItem(item) {
+  if (!item) return;
+  const confirmed = confirm(`Refund ${item.title || item.cert_number || "this sold card"} back to inventory?`);
+  if (!confirmed) return;
+  const result = await mutationApi("profit.refund", "/profit/refund", {
+    ledger_key: item.ledger_key,
+    cert_number: item.cert_number,
+    item_id: item.item_id,
+    card_title: item.title,
+    date: item.date,
+    sale_price: item.sale_price,
+  });
+  if (!result.ok) {
+    alert(result.error || "Refund failed.");
+    return;
+  }
+  if (result.queued) {
+    alert("Desktop LUCAS was not reachable, so the refund was queued for sync.");
+    renderQueue();
+    return;
+  }
+  await refreshInventorySnapshot(true);
+  loadProfit();
+}
+
+async function loadPayouts() {
+  let result;
+  try {
+    result = await api("/payouts", { person: IS_PERSONAL_PROFILE ? "" : $("payoutPerson").value });
+  } catch (error) {
+    const cached = cacheGet(CACHE_KEYS.payouts);
+    if (cached && cached.payload) {
+      renderPayouts(cached.payload);
+      $("payoutSummary").insertAdjacentHTML("afterbegin", `<div class="hint">Showing cached payouts (${escapeHtml(cacheAgeText(cached.saved_at))}). Live payouts need desktop LUCAS online.</div>`);
+    } else {
+      $("payoutSummary").innerHTML = `<div class="hint">Desktop LUCAS is not reachable and no cached payout data is saved on this phone yet. ${escapeHtml(error.message || error)}</div>`;
+    }
+    return;
+  }
+  if (!result.ok) {
+    if (/pin/i.test(result.error || "")) setUnlocked(false);
+    $("payoutSummary").innerHTML = `<div class="hint">${escapeHtml(result.error || "Payout load failed.")}</div>`;
+    return;
+  }
+  cacheSet(CACHE_KEYS.payouts, result);
+  renderPayouts(result);
+}
+
+function renderPayouts(result) {
+  updatePeople(result.people || []);
+  const totals = result.totals || {};
+  renderMetrics($("payoutCards"), [
+    { label: "Balance", value: totals.balance_display || money(totals.balance, "$0.00") },
+    { label: "Sheets", value: String(totals.sheets || 0) },
+    { label: "Cards", value: String(totals.cards || 0) },
+    { label: "Mode", value: "View only" },
+  ]);
+  const summary = result.summary || [];
+  $("payoutSummary").innerHTML = summary.length ? summary.map((item) => `
+    <article class="result">
+      <h2>${escapeHtml(item.person || "Unassigned")}</h2>
+      <div class="meta">
+        <div><strong>Sheets</strong>${escapeHtml(item.sheets || 0)}</div>
+        <div><strong>Cards</strong>${escapeHtml(item.cards || 0)}</div>
+        <div><strong>Balance</strong>${escapeHtml(item.balance_display || money(item.balance, "-"))}</div>
+      </div>
+    </article>
+  `).join("") : '<div class="hint">No active payout balances matched.</div>';
+  const details = result.details || [];
+  $("payoutDetails").innerHTML = details.length ? details.slice(0, 30).map((item) => `
+    <article class="result">
+      <h2>${escapeHtml(item.name || "Sheet")}</h2>
+      <div class="meta">
+        <div><strong>Person</strong>${escapeHtml(item.person || "")}</div>
+        <div><strong>Status</strong>${escapeHtml(item.status || "")}</div>
+        <div><strong>Received</strong>${escapeHtml(`${item.received_count || 0}/${item.row_count || 0}`)}</div>
+        <div><strong>Balance</strong>${escapeHtml(item.payout_balance_display || money(item.payout_balance, "-"))}</div>
+      </div>
+    </article>
+  `).join("") : "";
+}
+
+function fileToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImageUrl(url) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = reject;
+    image.src = url;
+  });
+}
+
+async function imageFileToCompressedDataUrl(file) {
+  if (!file || !String(file.type || "").startsWith("image/")) return fileToDataUrl(file);
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await loadImageUrl(objectUrl);
+    const maxSide = 1600;
+    const sourceWidth = image.naturalWidth || image.width || maxSide;
+    const sourceHeight = image.naturalHeight || image.height || maxSide;
+    const scale = Math.min(1, maxSide / Math.max(sourceWidth, sourceHeight));
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) return fileToDataUrl(file);
+    context.drawImage(image, 0, 0, width, height);
+    return canvas.toDataURL("image/jpeg", 0.82);
+  } catch (_error) {
+    return fileToDataUrl(file);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
+
+async function identifyPhoto(file, target) {
+  const status = target === "certNumber" ? $("scanAddStatus") : $("scanSearchStatus");
+  status.textContent = "Preparing photo...";
+  try {
+    const image = await imageFileToCompressedDataUrl(file);
+    status.textContent = "Reading card photo...";
+    const result = await api("/card/identify", { image }, { timeoutMs: 45000 });
+    if (!result.ok) {
+      status.textContent = result.error || "Could not read that card.";
+      return;
+    }
+    const card = result.card || {};
+    const query = result.query || card.cert_number || card.card_title || "";
+    status.textContent = `Found ${card.cert_number || card.card_title || "card"}.`;
+    if (target === "certNumber") {
+      $("certNumber").value = card.cert_number || "";
+      if (card.grader) $("grader").value = card.grader;
+      if (card.card_title) $("cardTitle").value = card.card_title;
+      if (card.notes && !$("notes").value) $("notes").value = card.notes;
+      if (!$("source").value) $("source").value = "Mobile Photo";
+      status.textContent = card.cert_number
+        ? `Found cert ${card.cert_number}. Add purchase price, then tap Add Inventory.`
+        : "Found card details. Review fields, add purchase price, then tap Add Inventory.";
+    } else {
+      $("searchInput").value = query;
+      await searchInventory();
+    }
+  } catch (error) {
+    setConnectionStatus(false);
+    status.textContent = `Photo OCR needs desktop LUCAS online. You can still type the card info and queue the add. ${error.message || error}`;
+  }
+}
+
+function bindPhotoInput(inputId, targetId) {
+  $(inputId).addEventListener("change", () => {
+    const input = $(inputId);
+    const file = input.files && input.files[0];
+    if (file) identifyPhoto(file, targetId);
+    input.value = "";
+  });
+}
+
+function bind() {
+  loadQueue();
+  hydratePendingInventoryFromQueue();
+  document.body.classList.toggle("personalProfile", IS_PERSONAL_PROFILE);
+  $("pin").value = state.pin;
+  $("expenseDate").value = localDateString();
+  $("sellDate").value = localDateString();
+  $("tradeDate").value = localDateString();
+  fillSelect($("sellMethod"), ["Cash", "Wire", "Venmo", "Zelle", "PayPal", "Check", "Trade", "Other"], { includeAll: false });
+  fillSelect($("expenseType"), ["Travel", "Supplies", "Travel Meal", "Fees", "Shipping"], { includeAll: false });
+  fillSelect($("expenseRelatedType"), ["General", "Card", "Sheet"], { includeAll: false });
+  fillSelect($("profitPeriod"), ["Total", "Year", "Month", "Week", "5 Days"], { includeAll: false });
+  fillSelect($("profitGraph"), ["Daily Trend", "Overall Profit"], { includeAll: false });
+  $("profitPeriod").value = "Month";
+  $("profitGraph").value = "Overall Profit";
+  updatePeople([]);
+  syncPersonInputs(PERSONAL_DEFAULT_PERSON);
+  renderQueue();
+  setUnlocked(Boolean(state.pin));
+  $("savePin").addEventListener("click", () => {
+    state.pin = $("pin").value.trim();
+    localStorage.setItem("lucasMobilePin", state.pin);
+    setUnlocked(Boolean(state.pin));
+    searchInventory();
+  });
+  document.querySelectorAll(".tab").forEach((button) => {
+    button.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach((item) => item.classList.remove("active"));
+      button.classList.add("active");
+      ["search", "add", "trade", "expense", "profit", "payout", "sync"].forEach((view) => {
+        $(`${view}View`).classList.toggle("hidden", button.dataset.view !== view);
+      });
+      if (button.dataset.view === "trade" && !$("tradeIncomingRows").children.length) addTradeIncomingRow();
+      if (button.dataset.view === "profit") loadProfit();
+      if (button.dataset.view === "payout") loadPayouts();
+      if (button.dataset.view === "sync") renderQueue();
+    });
+  });
+  $("searchInput").addEventListener("input", () => searchInventory());
+  $("personFilter").addEventListener("change", () => {
+    syncPersonInputs($("personFilter").value);
+    searchInventory();
+  });
+  document.querySelectorAll(".categoryFilter").forEach((input) => {
+    input.addEventListener("change", () => searchInventory());
+  });
+  $("clearCategoryFilters").addEventListener("click", () => clearCategoryFilters());
+  $("includeSold").addEventListener("change", () => searchInventory());
+  $("cancelSell").addEventListener("click", () => cancelSell());
+  $("confirmSell").addEventListener("click", () => confirmSell());
+  $("tradePerson").addEventListener("change", () => searchTradeInventory());
+  $("tradeSearchInput").addEventListener("input", () => searchTradeInventory());
+  $("tradeSearchButton").addEventListener("click", () => searchTradeInventory());
+  $("addTradeIncoming").addEventListener("click", () => addTradeIncomingRow());
+  ["tradeCashPaid", "tradeCashReceived", "tradeNotes", "tradeDate"].forEach((id) => {
+    $(id).addEventListener("input", () => updateTradeSummary());
+    $(id).addEventListener("change", () => updateTradeSummary());
+  });
+  $("saveTrade").addEventListener("click", () => saveTrade());
+  $("profitPerson").addEventListener("change", () => loadProfit());
+  $("profitPeriod").addEventListener("change", () => loadProfit());
+  $("profitGraph").addEventListener("change", () => loadProfit());
+  $("profitSearch").addEventListener("input", () => loadProfit());
+  $("payoutPerson").addEventListener("change", () => loadPayouts());
+  $("syncQueue").addEventListener("click", () => syncQueuedActions());
+  $("exportQueue").addEventListener("click", () => exportQueue());
+  $("clearAppliedQueue").addEventListener("click", () => {
+    if (state.lastFailedQueueIds.size) {
+      state.queue = state.queue.filter((action) => !state.lastFailedQueueIds.has(action.id));
+      state.lastFailedQueueIds = new Set();
+      saveQueue();
+      $("syncStatus").textContent = "Cleared failed queue items.";
+      return;
+    }
+    if (state.queue.length) {
+      $("syncStatus").textContent = "Queue still has pending actions. Sync or export it first.";
+      return;
+    }
+    localStorage.removeItem(QUEUE_KEY);
+    loadQueue();
+    renderQueue();
+    $("syncStatus").textContent = "Queue is empty.";
+  });
+  $("closePhotoViewer").addEventListener("click", () => closeInventoryPhoto());
+  $("savePhotoViewer").addEventListener("click", () => {
+    shareInventoryPhoto(state.viewerRecord || {}, state.viewerPhoto || {});
+  });
+  $("photoViewer").addEventListener("click", (event) => {
+    if (event.target === $("photoViewer") || event.target.classList.contains("photoViewerCanvas")) {
+      closeInventoryPhoto();
+    }
+  });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeInventoryPhoto();
+  });
+  window.addEventListener("online", () => {
+    setConnectionStatus(true, "Network is back. Sync queued actions when desktop LUCAS is open.");
+    if (state.pin && state.queue.length) syncQueuedActions();
+  });
+  window.addEventListener("offline", () => setConnectionStatus(false));
+  bindPhotoInput("photoSearchInput", "searchInput");
+  bindPhotoInput("photoAddInput", "certNumber");
+  $("addInventory").addEventListener("click", () => addInventory(false));
+  $("updateDuplicate").addEventListener("click", () => addInventory(true));
+  $("addExpense").addEventListener("click", () => addExpense());
+  $("installHelp").addEventListener("click", () => alert("On iPhone: Share -> Add to Home Screen."));
+  setConnectionStatus(navigator.onLine !== false, navigator.onLine === false ? "" : "Ready. Live data loads when desktop LUCAS is reachable.");
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register(`${APP_BASE}/sw.js`, { scope: `${APP_BASE}/` }).catch(() => {});
+  }
+  if (state.pin) {
+    const cached = cachedInventoryWrapper();
+    if (cached && cached.payload) {
+      renderCachedInventory(cached, `Showing last synced inventory (${cacheAgeText(cached.saved_at)}). Refreshing if desktop LUCAS is reachable.`);
+    }
+    if (navigator.onLine === false) {
+      setConnectionStatus(false, "Offline mode: showing last synced inventory from this phone.");
+      if (!cached || !cached.payload) renderCachedSearch(null, "Phone is offline.");
+    } else {
+      refreshInventorySnapshot(true).then(() => searchInventory()).catch(() => searchInventory());
+    }
+  }
+}
+
+bind();

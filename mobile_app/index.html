@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#101820">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="LUCAS">
+    <title>LUCAS Mobile</title>
+    <link rel="manifest" href="/mobile/manifest.webmanifest">
+    <link rel="stylesheet" href="/mobile/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">L.U.C.A.S</p>
+        <h1>Inventory</h1>
+      </div>
+      <button id="installHelp" class="iconButton" type="button" aria-label="Install">+</button>
+    </header>
+
+    <main>
+      <section id="authPanel" class="panel">
+        <label for="pin">Mobile PIN</label>
+        <div class="inline">
+          <input id="pin" inputmode="numeric" autocomplete="one-time-code" placeholder="6 digits">
+          <button id="savePin" type="button">Unlock</button>
+        </div>
+        <p class="hint">The PIN is shown in the LUCAS desktop bridge status line.</p>
+      </section>
+
+      <section id="appPanel" class="hidden">
+        <div id="connectionBanner" class="connectionBanner hidden" role="status"></div>
+        <nav class="tabs" aria-label="Inventory actions">
+          <button class="tab active" data-view="search" type="button">Inventory</button>
+          <button class="tab" data-view="add" type="button">Add</button>
+          <button class="tab" data-view="trade" type="button">Trade</button>
+          <button class="tab" data-view="expense" type="button">Expense</button>
+          <button class="tab" data-view="profit" type="button">Profit</button>
+          <button class="tab teamControl" data-view="payout" type="button">Payouts</button>
+          <button class="tab" data-view="sync" type="button">Sync <span id="queueBadge" class="badge">0</span></button>
+        </nav>
+
+        <section id="searchView" class="view">
+          <label class="personControl">Person
+            <select id="personFilter"></select>
+          </label>
+          <div class="searchRow">
+            <input id="searchInput" placeholder="Cert number or card description">
+            <label class="fileButton" for="photoSearchInput">Scan Photo</label>
+            <input id="photoSearchInput" class="fileInput" type="file" accept="image/*" capture="environment">
+          </div>
+          <div id="scanSearchStatus" class="status"></div>
+          <details class="filterPanel">
+            <summary>Categories</summary>
+            <div class="categoryGrid" aria-label="Inventory category filters">
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="baseball"> Baseball</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="basketball"> Basketball</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="football"> Football</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="hockey"> Hockey</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="soccer"> Soccer</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="pokemon"> Pokemon</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="racing"> Racing</label>
+              <label class="checkLine"><input class="categoryFilter" type="checkbox" value="wrestling"> Wrestling</label>
+            </div>
+            <button id="clearCategoryFilters" class="secondary" type="button">Clear Categories</button>
+          </details>
+          <label class="checkLine"><input id="includeSold" type="checkbox"> Include inactive/sold</label>
+          <section id="sellPanel" class="panel inlinePanel hidden">
+            <h2 id="sellTitle">Mark Sold</h2>
+            <div class="grid">
+              <label>Sale Price<input id="sellPrice" inputmode="decimal" placeholder="0.00"></label>
+              <label>Date<input id="sellDate" type="date"></label>
+              <label>Method<select id="sellMethod"></select></label>
+              <label>Buyer/company<input id="sellCompany" placeholder="Cash buyer, Arena, etc."></label>
+            </div>
+            <div class="buttonRow">
+              <button id="cancelSell" class="secondary" type="button">Cancel</button>
+              <button id="confirmSell" class="primary" type="button">Mark Sold</button>
+            </div>
+            <div id="sellStatus" class="status"></div>
+          </section>
+          <div id="results" class="results"></div>
+        </section>
+
+        <section id="addView" class="view hidden">
+          <div class="scanBlock">
+            <input id="certNumber" inputmode="numeric" placeholder="Cert number">
+            <label class="fileButton" for="photoAddInput">Scan Photo</label>
+            <input id="photoAddInput" class="fileInput" type="file" accept="image/*" capture="environment">
+          </div>
+          <div id="scanAddStatus" class="status"></div>
+          <div class="grid">
+            <label>Grader<select id="grader">
+              <option value="">No grader</option>
+              <option value="PSA">PSA</option>
+              <option value="BGS">BGS</option>
+              <option value="CGC">CGC</option>
+              <option value="SGC">SGC</option>
+            </select></label>
+            <label>Purchase<input id="purchasePrice" inputmode="decimal" placeholder="0.00"></label>
+            <label>Card<input id="cardTitle" placeholder="Year set player grade"></label>
+            <label class="personControl">Person<select id="assignedPerson"></select></label>
+            <label>Seller/source<input id="source" placeholder="Mobile"></label>
+            <label>Value<input id="inventoryValue" inputmode="decimal" placeholder="Optional"></label>
+            <label>Notes<textarea id="notes" rows="3"></textarea></label>
+          </div>
+          <button id="addInventory" class="primary" type="button">Add Inventory</button>
+          <button id="updateDuplicate" class="secondary hidden" type="button">Update Existing</button>
+          <div id="addStatus" class="status"></div>
+        </section>
+
+        <section id="expenseView" class="view hidden">
+          <div class="grid">
+            <label class="personControl">Person<select id="expensePerson"></select></label>
+            <label>Date<input id="expenseDate" type="date"></label>
+            <label>Type<select id="expenseType"></select></label>
+            <label>Amount<input id="expenseAmount" inputmode="decimal" placeholder="0.00"></label>
+            <label>Tie To<select id="expenseRelatedType"></select></label>
+            <label>Sheet<input id="expenseSheet" placeholder="Optional"></label>
+            <label>Notes<textarea id="expenseNotes" rows="3"></textarea></label>
+          </div>
+          <button id="addExpense" class="primary" type="button">Add Expense</button>
+          <div id="expenseStatus" class="status"></div>
+        </section>
+
+        <section id="tradeView" class="view hidden">
+          <div class="grid">
+            <label class="personControl">Person<select id="tradePerson"></select></label>
+            <label>Date<input id="tradeDate" type="date"></label>
+          </div>
+          <section class="panel inlinePanel">
+            <h2>Cash</h2>
+            <div class="grid">
+              <label>Cash Paid<input id="tradeCashPaid" inputmode="decimal" placeholder="0.00"></label>
+              <label>Cash Received<input id="tradeCashReceived" inputmode="decimal" placeholder="0.00"></label>
+              <label>Notes<textarea id="tradeNotes" rows="3"></textarea></label>
+            </div>
+            <div id="tradeSummary" class="status"></div>
+          </section>
+          <section class="panel inlinePanel">
+            <h2>Outgoing</h2>
+            <div class="searchRow">
+              <input id="tradeSearchInput" placeholder="Search inventory to trade out">
+              <button id="tradeSearchButton" class="secondary" type="button">Search</button>
+            </div>
+            <div id="tradeOutgoingList" class="results compact"></div>
+            <div id="tradeSearchResults" class="results compact"></div>
+          </section>
+          <section class="panel inlinePanel">
+            <h2>Incoming</h2>
+            <div id="tradeIncomingRows" class="tradeRows"></div>
+            <button id="addTradeIncoming" class="secondary" type="button">Add Incoming Card</button>
+          </section>
+          <section class="panel inlinePanel">
+            <div id="tradeBalanceBanner" class="tradeBalanceBanner"></div>
+            <button id="saveTrade" class="primary" type="button">Save Trade</button>
+            <div id="tradeStatus" class="status"></div>
+          </section>
+        </section>
+
+        <section id="profitView" class="view hidden">
+          <div class="controlGrid">
+            <label class="personControl">Person<select id="profitPerson"></select></label>
+            <label>Period<select id="profitPeriod"></select></label>
+            <label>Graph<select id="profitGraph"></select></label>
+            <label>Sold Search<input id="profitSearch" type="search" placeholder="Title or cert"></label>
+          </div>
+          <div id="profitCards" class="metricGrid"></div>
+          <svg id="profitChart" class="chart" role="img" aria-label="Profit graph"></svg>
+          <div id="profitRecent" class="results"></div>
+        </section>
+
+        <section id="payoutView" class="view hidden">
+          <label class="personControl">Person<select id="payoutPerson"></select></label>
+          <div id="payoutCards" class="metricGrid"></div>
+          <div id="payoutSummary" class="results"></div>
+          <div id="payoutDetails" class="results compact"></div>
+        </section>
+
+        <section id="syncView" class="view hidden">
+          <section class="panel inlinePanel">
+            <h2>Offline Queue</h2>
+            <p class="hint">Queued adds, sales, and expenses can sync when desktop LUCAS is reachable, or export this queue and import it from Inventory on desktop.</p>
+            <div class="buttonRow">
+              <button id="syncQueue" class="primary" type="button">Sync Now</button>
+              <button id="exportQueue" class="secondary" type="button">Export Queue</button>
+            </div>
+            <button id="clearAppliedQueue" class="secondary" type="button">Clear Failed Queue</button>
+            <div id="syncStatus" class="status"></div>
+          </section>
+          <div id="queueList" class="results"></div>
+        </section>
+      </section>
+    </main>
+
+    <section id="photoViewer" class="photoViewer hidden" aria-modal="true" role="dialog" aria-label="Inventory photo viewer">
+      <div class="photoViewerBar">
+        <button id="closePhotoViewer" class="secondary" type="button">Back</button>
+        <div id="photoViewerTitle" class="photoViewerTitle"></div>
+        <button id="savePhotoViewer" class="secondary" type="button">Save</button>
+      </div>
+      <div class="photoViewerCanvas">
+        <img id="photoViewerImage" alt="Inventory photo">
+      </div>
+    </section>
+
+    <script src="/mobile/app.js" defer></script>
+  </body>
+</html>
