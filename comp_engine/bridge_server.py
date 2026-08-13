@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import mimetypes
+import os
 import re
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -17,10 +21,25 @@ from cardladder_ocr import extract_cl_value_from_data_url
 from workbook_io import WorkbookRow
 import assignment_engine
 
-BRIDGE_VERSION = "2026-07-21-cardladder-visible-cert-result-v24"
-EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-07-21-visible-cert-result-v24"
+BRIDGE_VERSION = "2026-07-21-cardladder-visible-cert-partial-v25"
+EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-07-21-visible-cert-partial-v25"
 EXPECTED_CARDLADDER_MANIFEST_VERSION = "0.1.7"
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "work" / "cardladder-bridge"
+DEBUG_LOG = DEBUG_DIR / "bridge.log"
+MOBILE_APP_DIR = Path(__file__).resolve().parent.parent / "mobile_app"
+MOBILE_PROFILE_LABELS = {
+    "team": "LUCAS Team",
+    "personal": "LUCAS Personal",
+}
+BRIDGE_LOCAL_ONLY_PATH_PREFIXES = (
+    "/command",
+    "/status",
+    "/ack",
+    "/result/cardladder",
+    "/ocr/cardladder",
+    "/finish/cardladder",
+    "/source/google-keep",
+)
 COMP_STRATEGY_AVERAGE = "average_last_5"
 COMP_STRATEGY_HIGH = "highest_last_5"
 COMP_STRATEGY_LOW = "lowest_last_5"
@@ -31,6 +50,34 @@ COMP_STRATEGY_LABELS = {
     COMP_STRATEGY_LOW: "Lowest of last 5",
     COMP_STRATEGY_STALE_NEWEST: "Date weighted",
 }
+_CY_ADAPTER = None
+_CY_ADAPTER_LOCK = threading.Lock()
+_CY_LOOKUP_LOCK = threading.Lock()
+
+
+def is_loopback_address(value: str) -> bool:
+    host = str(value or "").strip().lower()
+    if host in {"localhost", "ip6-localhost"}:
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def request_origin_allowed(origin: str, host_header: str) -> bool:
+    origin = str(origin or "").strip()
+    if not origin:
+        return True
+    parsed = urlparse(origin)
+    if parsed.scheme == "chrome-extension":
+        return True
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    request_host = str(host_header or "").strip().lower()
+    if parsed.netloc.lower() == request_host:
+        return True
+    return is_loopback_address(parsed.hostname or "")
 
 
 def fill_missing_category_from_title(row: WorkbookRow) -> None:
@@ -74,9 +121,28 @@ class BridgeState:
         self.comp_strategy = COMP_STRATEGY_AVERAGE
         self.comp_low_outlier_pct: float | None = None
         self.updated_row_ids: set[int] = set()
+        self.on_update: Callable[[], None] | None = None
+        self.mobile_pin_provider: Callable[[], str] | None = None
+        self.mobile_inventory_search: Callable[[dict], dict] | None = None
+        self.mobile_inventory_add: Callable[[dict], dict] | None = None
+        self.mobile_inventory_mark_sold: Callable[[dict], dict] | None = None
+        self.mobile_inventory_trade: Callable[[dict], dict] | None = None
+        self.mobile_card_identify: Callable[[dict], dict] | None = None
+        self.mobile_profit_summary: Callable[[dict], dict] | None = None
+        self.mobile_profit_refund: Callable[[dict], dict] | None = None
+        self.mobile_expense_add: Callable[[dict], dict] | None = None
+        self.mobile_payouts: Callable[[dict], dict] | None = None
+        self.mobile_queue_sync: Callable[[dict], dict] | None = None
+        self.mobile_inventory_photo_resolver: Callable[[str], tuple[bytes, str] | None] | None = None
+        self.instagram_media_token = uuid.uuid4().hex
+        self.instagram_media_resolver: Callable[[str], tuple[bytes, str] | None] | None = None
         self.keep_note_sources: list[dict[str, str]] = []
         self.last_keep_sync: dict[str, str] = {}
-        self.on_update: Callable[[], None] | None = None
+        self.cy_lookup_inflight: set[int] = set()
+        self.cy_lookup_pending: set[int] = set()
+        self.cy_lookup_generation = 0
+        self.cardladder_allows_cy = False
+        self.cy_batch_running = False
 
     def set_rows(self, rows: list[WorkbookRow]) -> None:
         with self.lock:
@@ -122,9 +188,129 @@ class BridgeState:
             self.last_keep_sync = {"url": url, "title": title, "syncedAt": synced_at, "saved": str(len(saved_paths))}
         return {"ok": bool(saved_paths), "saved": len(saved_paths), "paths": saved_paths}
 
-    def start_all_comps(self, requery_all: bool = False) -> int:
+    def mobile_auth_ok(self, payload: dict | None = None, query: dict[str, list[str]] | None = None) -> bool:
+        provider = self.mobile_pin_provider
+        expected = provider() if provider else ""
+        if not expected:
+            return False
+        candidate = ""
+        if payload:
+            candidate = str(payload.get("pin") or payload.get("token") or "").strip()
+        if not candidate and query:
+            candidate = str(query.get("pin", [""])[0] or query.get("token", [""])[0]).strip()
+        return bool(candidate and candidate == expected)
+
+    def mobile_config(self) -> dict:
+        return {
+            "ok": True,
+            "service": "lucas-mobile",
+            "requiresPin": bool(self.mobile_pin_provider),
+            "photoSearch": True,
+            "inventorySold": True,
+            "profit": True,
+            "expenses": True,
+            "payouts": True,
+        }
+
+    def search_mobile_inventory(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_inventory_search:
+            return {"ok": False, "error": "Inventory search is not available."}
+        return self.mobile_inventory_search(payload)
+
+    def add_mobile_inventory(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_inventory_add:
+            return {"ok": False, "error": "Inventory add is not available."}
+        return self.mobile_inventory_add(payload)
+
+    def mark_mobile_inventory_sold(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_inventory_mark_sold:
+            return {"ok": False, "error": "Inventory sale is not available."}
+        return self.mobile_inventory_mark_sold(payload)
+
+    def trade_mobile_inventory(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_inventory_trade:
+            return {"ok": False, "error": "Inventory trade is not available."}
+        return self.mobile_inventory_trade(payload)
+
+    def identify_mobile_card(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_card_identify:
+            return {"ok": False, "error": "Photo card search is not available."}
+        return self.mobile_card_identify(payload)
+
+    def get_mobile_profit_summary(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_profit_summary:
+            return {"ok": False, "error": "Profit view is not available."}
+        return self.mobile_profit_summary(payload)
+
+    def refund_mobile_profit(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_profit_refund:
+            return {"ok": False, "error": "Profit refund is not available."}
+        return self.mobile_profit_refund(payload)
+
+    def add_mobile_expense(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_expense_add:
+            return {"ok": False, "error": "Expense entry is not available."}
+        return self.mobile_expense_add(payload)
+
+    def get_mobile_payouts(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_payouts:
+            return {"ok": False, "error": "Payout view is not available."}
+        return self.mobile_payouts(payload)
+
+    def sync_mobile_queue(self, payload: dict) -> dict:
+        if not self.mobile_auth_ok(payload):
+            return {"ok": False, "error": "Invalid mobile PIN."}
+        if not self.mobile_queue_sync:
+            return {"ok": False, "error": "Mobile queue sync is not available."}
+        return self.mobile_queue_sync(payload)
+
+    def mobile_inventory_photo_path(self, photo_id: str, filename: str = "photo.jpg") -> str:
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(filename or "photo.jpg")).strip("-") or "photo.jpg"
+        return f"/mobile/api/inventory/photo/{photo_id}/{safe_name}"
+
+    def get_mobile_inventory_photo(self, payload: dict | None, query: dict[str, list[str]], photo_id: str) -> tuple[bytes, str] | None:
+        if not self.mobile_auth_ok(payload, query):
+            return None
+        resolver = self.mobile_inventory_photo_resolver
+        if resolver is None:
+            return None
+        return resolver(photo_id)
+
+    def instagram_media_path(self, photo_id: str, filename: str = "photo.jpg") -> str:
+        token = self.instagram_media_token
+        safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(filename or "photo.jpg")).strip("-") or "photo.jpg"
+        return f"/instagram/media/{token}/{photo_id}/{safe_name}"
+
+    def get_instagram_media(self, token: str, photo_id: str) -> tuple[bytes, str] | None:
+        if not token or token != self.instagram_media_token:
+            return None
+        resolver = self.instagram_media_resolver
+        if resolver is None:
+            return None
+        return resolver(photo_id)
+
+    def start_all_comps(self, requery_all: bool = False, allow_deferred_cy: bool = False) -> int:
         with self.lock:
             self.command_id += 1
+            self.cardladder_allows_cy = bool(allow_deferred_cy)
             eligible_rows = [
                 row
                 for row in self.rows
@@ -144,6 +330,8 @@ class BridgeState:
             if not queue:
                 self.command = None
                 self.cardladder_running = False
+                self.cardladder_allows_cy = False
+                debug_log(f"start_all_comps command={self.command_id} eligible=0 requery_all={requery_all} allow_deferred_cy={allow_deferred_cy}")
                 return self.command_id
             self.command = {
                 "id": self.command_id,
@@ -154,16 +342,58 @@ class BridgeState:
             }
             self.cardladder_running = True
             self.cancel_requested = False
+            debug_log(f"start_all_comps command={self.command_id} queued={len(queue)} requery_all={requery_all} allow_deferred_cy={allow_deferred_cy}")
             return self.command_id
 
+    def start_cy_lookups(self, rows: list[WorkbookRow], defer: bool = False) -> int:
+        cy_lookups: list[tuple[int, str, str, int]] = []
+        with self.lock:
+            self.command_id += 1
+            self.cy_lookup_generation += 1
+            cy_generation = self.cy_lookup_generation
+            if defer or self.cardladder_running:
+                self.cardladder_allows_cy = True
+            for row in rows:
+                candidate = self._cy_lookup_candidate(row, force=True)
+                if candidate is None:
+                    continue
+                row.status = "CY queued"
+                if defer or self.cardladder_running:
+                    self.cy_lookup_pending.add(row.excel_row)
+                    continue
+                self.cy_lookup_inflight.add(row.excel_row)
+                cy_lookups.append((*candidate, cy_generation))
+            if cy_lookups or self.cy_lookup_pending:
+                self.cy_batch_running = True
+            debug_log(
+                f"start_cy_lookups command={self.command_id} started={len(cy_lookups)} "
+                f"pending={len(self.cy_lookup_pending)} defer={defer}"
+            )
+        for cy_lookup in cy_lookups:
+            threading.Thread(target=self._cy_lookup_worker, args=cy_lookup, daemon=True).start()
+        if self.on_update:
+            self.on_update()
+        return self.command_id
+
     def request_cancel(self) -> None:
+        should_close_cy = False
         with self.lock:
             self.cancel_requested = True
             self.command = None
             self.cardladder_running = False
+            self.cardladder_allows_cy = False
+            self.cy_lookup_generation += 1
+            self.cy_lookup_pending.clear()
+            should_close_cy = bool(self.cy_lookup_inflight or self.cy_batch_running)
+            self.cy_lookup_inflight.clear()
+            self.cy_batch_running = False
             for row in self.rows:
                 if row.status == "Queued":
                     row.status = "Card Ladder cancelled"
+                elif row.status == "CY queued":
+                    row.status = "CY cancelled"
+        if should_close_cy:
+            close_cy_adapter()
         if self.on_update:
             self.on_update()
 
@@ -177,6 +407,12 @@ class BridgeState:
                 self.extension_manifest_version = metadata.get("manifestVersion") or self.extension_manifest_version
                 self.extension_name = metadata.get("extensionName") or self.extension_name
                 self.extension_url = metadata.get("extensionUrl") or self.extension_url
+                debug_log(
+                    "extension_poll "
+                    f"version={self.extension_version or 'unknown'} "
+                    f"manifest={self.extension_manifest_version or 'unknown'} "
+                    f"name={self.extension_name or 'unknown'}"
+                )
             command = self.command if extension_version == EXPECTED_CARDLADDER_EXTENSION_VERSION else None
             return {
                 "instanceId": self.instance_id,
@@ -196,6 +432,7 @@ class BridgeState:
             json.dumps(result, indent=2),
             encoding="utf-8",
         )
+        cy_lookup: tuple[int, str, str, int] | None = None
         with self.lock:
             result_extension_version = str(result.get("extensionVersion") or "")
             if result_extension_version:
@@ -212,6 +449,89 @@ class BridgeState:
             if target_row is not None:
                 self._apply_cardladder_result_to_row(target_row, result)
                 self.updated_row_ids.add(id(target_row))
+                if self.cardladder_allows_cy or target_row.excel_row in self.cy_lookup_pending:
+                    cy_lookup = self._queue_or_prepare_cy_lookup(target_row)
+                debug_log(f"cardladder_result row={target_row.excel_row} cert={target_row.cert_number} cy_lookup={bool(cy_lookup)}")
+            else:
+                debug_log(f"cardladder_result no_target excel_row={excel_row} cert={cert}")
+        if cy_lookup:
+            threading.Thread(target=self._cy_lookup_worker, args=cy_lookup, daemon=True).start()
+        if self.on_update:
+            self.on_update()
+
+    def _cy_lookup_candidate(self, row: WorkbookRow, force: bool = False) -> tuple[int, str, str] | None:
+        if not cy_lookup_enabled():
+            debug_log(f"cy_lookup_skip row={row.excel_row} reason=disabled")
+            return None
+        if row.cy_value is not None and not force:
+            debug_log(f"cy_lookup_skip row={row.excel_row} reason=has_value")
+            return None
+        if row.excel_row in self.cy_lookup_inflight:
+            debug_log(f"cy_lookup_skip row={row.excel_row} reason=inflight")
+            return None
+        cert_number = str(row.cert_number or "").strip()
+        slab_type = clean_grader(row.grader)
+        if not cert_number or slab_type not in {"PSA", "BGS", "CGC", "SGC"}:
+            debug_log(f"cy_lookup_skip row={row.excel_row} reason=missing_or_unsupported cert={cert_number} slab={slab_type}")
+            return None
+        return row.excel_row, cert_number, slab_type
+
+    def _queue_or_prepare_cy_lookup(self, row: WorkbookRow) -> tuple[int, str, str, int] | None:
+        candidate = self._cy_lookup_candidate(row)
+        if candidate is None:
+            return None
+        if self.cardladder_running:
+            self.cy_lookup_pending.add(row.excel_row)
+            debug_log(f"cy_lookup_pending row={row.excel_row} cert={row.cert_number}")
+            return None
+        self.cy_lookup_inflight.add(row.excel_row)
+        return (*candidate, self.cy_lookup_generation)
+
+    def _cy_lookup_worker(self, excel_row: int, cert_number: str, slab_type: str, generation: int) -> None:
+        value = None
+        confidence = None
+        message = ""
+        should_close = False
+        with self.lock:
+            if generation != self.cy_lookup_generation or excel_row not in self.cy_lookup_inflight:
+                debug_log(f"cy_lookup_cancelled_before_start row={excel_row} cert={cert_number}")
+                return
+        try:
+            result = lookup_cy_buy_price(cert_number, slab_type)
+            if len(result) == 3:
+                value, confidence, message = result
+            else:
+                value, message = result
+        except Exception as error:
+            message = str(error)
+            debug_log(f"cy_lookup_error row={excel_row} cert={cert_number} slab={slab_type} error={message}")
+        with self.lock:
+            if generation != self.cy_lookup_generation or excel_row not in self.cy_lookup_inflight:
+                debug_log(f"cy_lookup_cancelled_after_lookup row={excel_row} cert={cert_number}")
+                return
+            self.cy_lookup_inflight.discard(excel_row)
+            row = next((candidate for candidate in self.rows if candidate.excel_row == excel_row), None)
+            if row is not None and str(row.cert_number or "").strip() == cert_number:
+                self.updated_row_ids.add(id(row))
+                existing_status = str(row.status or "").strip()
+                is_cy_only_status = existing_status in {"CY queued", "CY unavailable", "CY OK"}
+                if value is not None:
+                    row.cy_value = value
+                    row.cy_confidence = confidence
+                    if is_cy_only_status:
+                        row.status = "CY OK"
+                    row.notes = append_note(row.notes, f"CY value: ${value:,.2f}")
+                    debug_log(f"cy_lookup_ok row={excel_row} cert={cert_number} value={value} confidence={confidence}")
+                elif message:
+                    if is_cy_only_status:
+                        row.status = "CY unavailable"
+                    row.notes = append_note(row.notes, f"CY lookup: {message}")
+                    debug_log(f"cy_lookup_unavailable row={excel_row} cert={cert_number} message={message}")
+            should_close = self.cy_batch_running and not self.cy_lookup_inflight and not self.cy_lookup_pending and not self.cardladder_running
+            if should_close:
+                self.cy_batch_running = False
+        if should_close and cy_close_after_batch_enabled():
+            close_cy_adapter()
         if self.on_update:
             self.on_update()
 
@@ -237,27 +557,17 @@ class BridgeState:
         filtered_comp_count = raw_comp_count - len(comps)
         generic_profile_reason = generic_profile_review_reason(profile_title, profile_grader, profile_grade, ocr)
         if result_status == "partial_comp_capture":
-            if not ocr and result_extension_is_stale(result.get("extensionVersion")):
-                row.card_ladder_value = None
-                row.card_ladder_comps_average = None
-                row.card_ladder_comps = ""
-                row.card_ladder_screenshot = ""
-                row.status = "Reload Card Ladder extension"
-                row.notes = (
-                    "Partial capture came from an older Card Ladder extension that does not preserve "
-                    "partial diagnostics. Reload the unpacked extension, then rerun this row."
-                )
-                return
             if profile_title:
                 row.card_title = build_card_title(profile_title, profile_grader, profile_grade)
                 fill_missing_category_from_title(row)
             if row_has_comp_data(row):
                 row.notes = str(result.get("error") or "Partial Card Ladder capture skipped; kept existing comps.")
                 return
-            row.card_ladder_value = None
+            if value is not None:
+                row.card_ladder_value = value
             row.card_ladder_comps_average = None
             row.card_ladder_comps = ""
-            row.card_ladder_screenshot = ""
+            row.card_ladder_screenshot = str(ocr.get("debugImage") or "")
             row.status = "Card Ladder partial capture"
             row.notes = str(result.get("error") or "Card Ladder comp capture was incomplete.")
             return
@@ -315,12 +625,31 @@ class BridgeState:
         row.notes = " ".join(part for part in (str(result.get("error") or result.get("status") or ""), filter_note) if part).strip()
 
     def finish_cardladder(self, payload: dict) -> None:
+        cy_lookups: list[tuple[int, str, str, int]] = []
         with self.lock:
             self.cardladder_running = False
             self.cancel_requested = False
+            cy_generation = self.cy_lookup_generation
             for row in self.rows:
                 if row.status == "Queued":
                     row.status = "Card Ladder not found"
+            pending_rows = [
+                row
+                for row in self.rows
+                if row.excel_row in self.cy_lookup_pending
+            ]
+            self.cy_lookup_pending.clear()
+            for row in pending_rows:
+                candidate = self._cy_lookup_candidate(row, force=True)
+                if candidate is not None:
+                    self.cy_lookup_inflight.add(row.excel_row)
+                    cy_lookups.append((*candidate, cy_generation))
+            if cy_lookups:
+                self.cy_batch_running = True
+            self.cardladder_allows_cy = False
+            debug_log(f"finish_cardladder pending_cy={len(cy_lookups)}")
+        for cy_lookup in cy_lookups:
+            threading.Thread(target=self._cy_lookup_worker, args=cy_lookup, daemon=True).start()
         if self.on_update:
             self.on_update()
 
@@ -392,6 +721,60 @@ def normalize_keep_url(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{parsed.path}#{parsed.fragment}".rstrip("/#").lower()
 
 
+def cy_lookup_enabled(platform: str | None = None) -> bool:
+    if os.environ.get("LUCAS_DISABLE_CY_LOOKUP", "").strip().lower() in {"1", "true", "yes"}:
+        return False
+    return (platform or sys.platform) == "darwin"
+
+
+def cy_close_after_batch_enabled() -> bool:
+    return os.environ.get("LUCAS_CY_CLOSE_AFTER_BATCH", "").strip().lower() in {"1", "true", "yes"}
+
+
+def lookup_cy_buy_price(cert_number: str, slab_type: str) -> tuple[float | None, object | None, str]:
+    cert_number = str(cert_number or "").strip()
+    slab_type = clean_grader(slab_type)
+    if not cert_number:
+        return None, None, "missing cert number"
+    if slab_type not in {"PSA", "BGS", "CGC", "SGC"}:
+        return None, None, f"unsupported slab type {slab_type or 'unknown'}"
+    return None, None, "CY GUI lookup is unavailable on Windows."
+
+
+def get_cy_adapter():
+    raise RuntimeError("CY GUI lookup is unavailable on Windows.")
+
+
+def close_cy_adapter() -> None:
+    with _CY_ADAPTER_LOCK:
+        adapter = _CY_ADAPTER
+    if adapter is None:
+        return
+    try:
+        adapter.close_app()
+        debug_log("cy_app_closed")
+    except Exception as error:
+        debug_log(f"cy_app_close_error error={error}")
+
+
+def append_note(existing: str, note: str) -> str:
+    existing = str(existing or "").strip()
+    note = str(note or "").strip()
+    if not note or note in existing:
+        return existing
+    return f"{existing}; {note}" if existing else note
+
+
+def debug_log(message: str) -> None:
+    try:
+        DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with DEBUG_LOG.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{stamp}] {message}\n")
+    except Exception:
+        pass
+
+
 def is_blank_card_title(card_title: str, grader: str) -> bool:
     title = str(card_title or "").strip()
     company = str(grader or "").strip()
@@ -416,11 +799,6 @@ def row_has_comp_data(row: WorkbookRow) -> bool:
         or bool(str(row.card_ladder_comps or "").strip())
         or has_terminal_empty_result
     )
-
-
-def result_extension_is_stale(extension_version: object) -> bool:
-    version = str(extension_version or "").strip()
-    return version != EXPECTED_CARDLADDER_EXTENSION_VERSION
 
 
 def clean_profile_title(value) -> str:
@@ -894,10 +1272,11 @@ def parse_formatted_comps(text: str) -> list[dict]:
 
 
 class BridgeServer:
-    def __init__(self, state: BridgeState, host: str = "127.0.0.1", port: int = 8765) -> None:
+    def __init__(self, state: BridgeState, host: str = "0.0.0.0", port: int = 8765, allow_port_fallback: bool | None = None) -> None:
         self.state = state
         self.host = host
         self.port = port
+        self.allow_port_fallback = bool(allow_port_fallback) if allow_port_fallback is not None else os.environ.get("LUCAS_ALLOW_BRIDGE_PORT_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
         self.httpd: ThreadingHTTPServer | None = None
         self.thread: threading.Thread | None = None
         self.started = False
@@ -908,11 +1287,70 @@ class BridgeServer:
 
         class Handler(BaseHTTPRequestHandler):
             def do_OPTIONS(self):
+                if not self._origin_allowed():
+                    self._send_json({"ok": False, "error": "origin not allowed"}, status=403)
+                    return
                 self._send_json({})
 
             def do_GET(self):
+                parsed = urlparse(self.path)
+                if not self._request_allowed(parsed.path):
+                    self._send_json({"ok": False, "error": "local bridge access only"}, status=403)
+                    return
+                media_match = re.match(r"^/instagram/media/([^/]+)/([^/]+)(?:/[^/]*)?$", parsed.path)
+                if media_match:
+                    media = state.get_instagram_media(media_match.group(1), media_match.group(2))
+                    if media is None:
+                        self._send_json({"ok": False, "error": "not found"}, status=404)
+                        return
+                    body, content_type = media
+                    self._send_bytes(body, content_type, cache_control="public, max-age=3600")
+                    return
+                mobile_photo_match = re.match(r"^/mobile/api/inventory/photo/([^/]+)(?:/[^/]*)?$", parsed.path)
+                if mobile_photo_match:
+                    query = parse_qs(parsed.query)
+                    media = state.get_mobile_inventory_photo(None, query, mobile_photo_match.group(1))
+                    if media is None:
+                        self._send_json({"ok": False, "error": "not found"}, status=404)
+                        return
+                    body, content_type = media
+                    self._send_bytes(body, content_type, cache_control="private, max-age=300")
+                    return
+                mobile_profile = self._mobile_profile(parsed.path)
+                if mobile_profile:
+                    profile_prefix = f"/mobile/{mobile_profile}"
+                    if parsed.path in {profile_prefix, f"{profile_prefix}/"}:
+                        self._send_mobile_index(mobile_profile)
+                        return
+                    relative = parsed.path.removeprefix(f"{profile_prefix}/") or "index.html"
+                    if relative == "index.html":
+                        self._send_mobile_index(mobile_profile)
+                        return
+                    if relative == "manifest.webmanifest":
+                        self._send_mobile_manifest(mobile_profile)
+                        return
+                    if relative.startswith("api/"):
+                        if relative == "api/config":
+                            self._send_json(state.mobile_config())
+                            return
+                        self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
+                        return
+                    self._send_static(MOBILE_APP_DIR / relative)
+                    return
+                if parsed.path in {"/mobile", "/mobile/"}:
+                    self._send_static(MOBILE_APP_DIR / "index.html")
+                    return
+                if parsed.path.startswith("/mobile/"):
+                    relative = parsed.path.removeprefix("/mobile/") or "index.html"
+                    if relative.startswith("api/"):
+                        if relative == "api/config":
+                            self._send_json(state.mobile_config())
+                            return
+                        self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
+                        return
+                    self._send_static(MOBILE_APP_DIR / relative)
+                    return
                 if self.path.startswith("/command"):
-                    parsed = urlparse(self.path)
                     query = parse_qs(parsed.query)
                     metadata = {
                         "extensionVersion": query.get("extensionVersion", [""])[0],
@@ -927,27 +1365,88 @@ class BridgeServer:
                     return
                 self._send_json({"ok": True, "service": "comp-orchestrator"})
 
+            def do_HEAD(self):
+                parsed = urlparse(self.path)
+                if not self._request_allowed(parsed.path):
+                    self._send_headers("application/json", 0, status=403)
+                    return
+                media_match = re.match(r"^/instagram/media/([^/]+)/([^/]+)(?:/[^/]*)?$", parsed.path)
+                if media_match:
+                    media = state.get_instagram_media(media_match.group(1), media_match.group(2))
+                    if media is None:
+                        self._send_headers("application/json", 0, status=404)
+                        return
+                    body, content_type = media
+                    self._send_headers(content_type, len(body), cache_control="public, max-age=3600")
+                    return
+                mobile_photo_match = re.match(r"^/mobile/api/inventory/photo/([^/]+)(?:/[^/]*)?$", parsed.path)
+                if mobile_photo_match:
+                    query = parse_qs(parsed.query)
+                    media = state.get_mobile_inventory_photo(None, query, mobile_photo_match.group(1))
+                    if media is None:
+                        self._send_headers("application/json", 0, status=404)
+                        return
+                    body, content_type = media
+                    self._send_headers(content_type, len(body), cache_control="private, max-age=300")
+                    return
+                self._send_headers("application/json", 0, status=404)
+
             def do_POST(self):
+                parsed = urlparse(self.path)
+                if not self._request_allowed(parsed.path):
+                    self._send_json({"ok": False, "error": "local bridge access only"}, status=403)
+                    return
                 payload = self._read_json()
-                if self.path.startswith("/ack"):
+                mobile_api_path = self._mobile_api_path(parsed.path)
+                if mobile_api_path.startswith("/mobile/api/inventory/search"):
+                    self._send_json(state.search_mobile_inventory(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/inventory/add"):
+                    self._send_json(state.add_mobile_inventory(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/inventory/sold"):
+                    self._send_json(state.mark_mobile_inventory_sold(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/inventory/trade"):
+                    self._send_json(state.trade_mobile_inventory(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/card/identify"):
+                    self._send_json(state.identify_mobile_card(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/profit/summary"):
+                    self._send_json(state.get_mobile_profit_summary(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/profit/refund"):
+                    self._send_json(state.refund_mobile_profit(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/expenses/add"):
+                    self._send_json(state.add_mobile_expense(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/payouts"):
+                    self._send_json(state.get_mobile_payouts(payload))
+                    return
+                if mobile_api_path.startswith("/mobile/api/sync/queue"):
+                    self._send_json(state.sync_mobile_queue(payload))
+                    return
+                if parsed.path.startswith("/ack"):
                     state.acknowledge_command(int(payload.get("id") or 0))
                     self._send_json({"ok": True})
                     return
-                if self.path.startswith("/result/cardladder"):
+                if parsed.path.startswith("/result/cardladder"):
                     state.post_cardladder_result(payload)
                     self._send_json({"ok": True})
                     return
-                if self.path.startswith("/ocr/cardladder"):
+                if parsed.path.startswith("/ocr/cardladder"):
                     try:
                         self._send_json(extract_cl_value_from_data_url(str(payload.get("image") or "")))
                     except Exception as error:
                         self._send_json({"ok": False, "value": None, "error": str(error)})
                     return
-                if self.path.startswith("/finish/cardladder"):
+                if parsed.path.startswith("/finish/cardladder"):
                     state.finish_cardladder(payload)
                     self._send_json({"ok": True})
                     return
-                if self.path.startswith("/source/google-keep"):
+                if parsed.path.startswith("/source/google-keep"):
                     self._send_json(state.post_google_keep_note(payload))
                     return
                 self._send_json({"ok": False, "error": "unknown endpoint"}, status=404)
@@ -961,12 +1460,93 @@ class BridgeServer:
                 body = json.dumps(payload).encode("utf-8")
                 self.send_response(status)
                 self.send_header("content-type", "application/json")
-                self.send_header("access-control-allow-origin", "*")
+                origin = self.headers.get("origin", "")
+                if origin and self._origin_allowed():
+                    self.send_header("access-control-allow-origin", origin)
+                    self.send_header("vary", "Origin")
                 self.send_header("access-control-allow-methods", "GET,POST,OPTIONS")
                 self.send_header("access-control-allow-headers", "content-type")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _origin_allowed(self) -> bool:
+                return request_origin_allowed(self.headers.get("origin", ""), self.headers.get("host", ""))
+
+            def _client_is_loopback(self) -> bool:
+                return is_loopback_address(str(self.client_address[0] if self.client_address else ""))
+
+            def _request_allowed(self, path: str) -> bool:
+                if not self._origin_allowed():
+                    return False
+                if any(path.startswith(prefix) for prefix in BRIDGE_LOCAL_ONLY_PATH_PREFIXES):
+                    return self._client_is_loopback()
+                return True
+
+            def _mobile_profile(self, path: str) -> str:
+                match = re.match(r"^/mobile/(team|personal)(?:/|$)", path)
+                return match.group(1) if match else ""
+
+            def _mobile_api_path(self, path: str) -> str:
+                match = re.match(r"^/mobile/(?:team|personal)/(api/.*)$", path)
+                if match:
+                    return f"/mobile/{match.group(1)}"
+                return path
+
+            def _send_mobile_index(self, profile: str) -> None:
+                label = MOBILE_PROFILE_LABELS.get(profile, "LUCAS")
+                base = f"/mobile/{profile}"
+                try:
+                    html = (MOBILE_APP_DIR / "index.html").read_text(encoding="utf-8")
+                except OSError:
+                    self._send_json({"ok": False, "error": "not found"}, status=404)
+                    return
+                html = html.replace('content="LUCAS"', f'content="{label}"')
+                html = html.replace("<title>LUCAS Mobile</title>", f"<title>{label} Mobile</title>")
+                html = html.replace('href="/mobile/manifest.webmanifest"', f'href="{base}/manifest.webmanifest"')
+                html = html.replace('href="/mobile/styles.css"', f'href="{base}/styles.css"')
+                html = html.replace('src="/mobile/app.js"', f'src="{base}/app.js"')
+                self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
+
+            def _send_mobile_manifest(self, profile: str) -> None:
+                label = MOBILE_PROFILE_LABELS.get(profile, "LUCAS")
+                payload = {
+                    "name": f"{label} Inventory",
+                    "short_name": label,
+                    "start_url": f"/mobile/{profile}",
+                    "scope": f"/mobile/{profile}/",
+                    "display": "standalone",
+                    "background_color": "#101820",
+                    "theme_color": "#101820",
+                    "description": f"{label} inventory companion.",
+                    "icons": [],
+                }
+                self._send_json(payload)
+
+            def _send_bytes(self, body: bytes, content_type: str, cache_control: str = "no-cache") -> None:
+                self._send_headers(content_type, len(body), cache_control=cache_control)
+                self.wfile.write(body)
+
+            def _send_headers(self, content_type: str, content_length: int, status: int = 200, cache_control: str = "no-cache") -> None:
+                self.send_response(status)
+                self.send_header("content-type", content_type)
+                self.send_header("cache-control", cache_control)
+                self.send_header("content-length", str(content_length))
+                self.end_headers()
+
+            def _send_static(self, path: Path) -> None:
+                try:
+                    root = MOBILE_APP_DIR.resolve()
+                    resolved = path.resolve()
+                    if root not in (resolved, *resolved.parents) or not resolved.is_file():
+                        self._send_json({"ok": False, "error": "not found"}, status=404)
+                        return
+                    body = resolved.read_bytes()
+                except OSError:
+                    self._send_json({"ok": False, "error": "not found"}, status=404)
+                    return
+                content_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+                self._send_bytes(body, content_type)
 
             def log_message(self, format, *args):
                 return
@@ -975,7 +1555,8 @@ class BridgeServer:
             allow_reuse_address = True
 
         last_error = ""
-        for candidate_port in range(self.port, self.port + 8):
+        port_count = 8 if self.allow_port_fallback else 1
+        for candidate_port in range(self.port, self.port + port_count):
             if self._port_has_listener(candidate_port):
                 last_error = f"{self.host}:{candidate_port} already has a listener"
                 continue
@@ -996,8 +1577,9 @@ class BridgeServer:
         self.started = True
 
     def _port_has_listener(self, port: int) -> bool:
+        host = "127.0.0.1" if self.host in {"0.0.0.0", "::"} else self.host
         try:
-            with socket.create_connection((self.host, port), timeout=0.2):
+            with socket.create_connection((host, port), timeout=0.2):
                 return True
         except OSError:
             return False
