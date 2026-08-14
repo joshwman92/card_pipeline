@@ -8246,10 +8246,17 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _load_inventory_ledger = app.CardPipelineApp._load_inventory_ledger
             _save_inventory_ledger = app.CardPipelineApp._save_inventory_ledger
             _inventory_photo_source_folder = app.CardPipelineApp._inventory_photo_source_folder
+            _inventory_photo_shared_folder = app.CardPipelineApp._inventory_photo_shared_folder
+            _inventory_photo_relative_path = app.CardPipelineApp._inventory_photo_relative_path
+            _inventory_photo_storage_value = app.CardPipelineApp._inventory_photo_storage_value
+            _inventory_photo_windows_safe_relative = app.CardPipelineApp._inventory_photo_windows_safe_relative
+            _inventory_photo_path_candidates = app.CardPipelineApp._inventory_photo_path_candidates
+            _inventory_photo_safe_candidates = app.CardPipelineApp._inventory_photo_safe_candidates
             _safe_inventory_photo_path = app.CardPipelineApp._safe_inventory_photo_path
+            _inventory_photo_file_hash = app.CardPipelineApp._inventory_photo_file_hash
             _load_inventory_photo_state = app.CardPipelineApp._load_inventory_photo_state
             _save_inventory_photo_state = app.CardPipelineApp._save_inventory_photo_state
-            _delete_inventory_photo_files_for_removed_records = app.CardPipelineApp._delete_inventory_photo_files_for_removed_records
+            _mark_inventory_photo_files_for_sold_records = app.CardPipelineApp._mark_inventory_photo_files_for_sold_records
             _mark_inventory_record_sold = app.CardPipelineApp._mark_inventory_record_sold
             _append_activity = lambda self, action, summary, details=None: None
 
@@ -8273,6 +8280,11 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             try:
                 self.assertEqual(dummy._mark_inventory_record_sold(str(record["inventory_key"]), "Arena Club", 10), 1)
                 self.assertTrue(photo.exists())
+                state = json.loads(app.INVENTORY_PHOTO_STATE_PATH.read_text(encoding="utf-8"))
+                state_record = next(iter(state["photos"].values()))
+                self.assertEqual(state_record["status"], "sold_inventory")
+                self.assertEqual(state_record["sale_context"], "inventory_sold")
+                self.assertEqual(state_record["linked_keys"], [record["inventory_key"]])
             finally:
                 app.CARD_PIPELINE_DIR = old_pipeline
                 app.INVENTORY_LEDGER_PATH = old_inventory
