@@ -57,4 +57,6 @@ if (!(Test-Path $configPath)) {
 }
 
 "[$(Get-Date -Format s)] starting $name with $cloudflared --config $configPath tunnel run $name" | Out-File -FilePath $logPath -Append -Encoding utf8
-& $cloudflared --config $configPath tunnel run $name 2>&1 | Tee-Object -FilePath $logPath -Append
+$ErrorActionPreference = "Continue"
+& $cloudflared --config $configPath tunnel run $name *>&1 | Tee-Object -FilePath $logPath -Append
+exit $LASTEXITCODE
