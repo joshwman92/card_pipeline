@@ -18,7 +18,13 @@ function Find-Cloudflared {
     }
     $candidates = @(
         (Join-Path $env:ProgramFiles "cloudflared\cloudflared.exe"),
+        (Join-Path $env:ProgramFiles "Cloudflare\cloudflared.exe"),
+        (Join-Path $env:ProgramFiles "Cloudflare\cloudflared\cloudflared.exe"),
         (Join-Path ${env:ProgramFiles(x86)} "cloudflared\cloudflared.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Cloudflare\cloudflared.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Cloudflare\cloudflared\cloudflared.exe"),
+        "C:\Cloudflared\bin\cloudflared.exe",
+        "C:\Cloudflared\cloudflared.exe",
         (Join-Path $env:USERPROFILE "cloudflared.exe"),
         (Join-Path $repoRoot "cloudflared.exe"),
         (Join-Path $repoRoot "bin\cloudflared.exe")
