@@ -50,7 +50,7 @@ if ($InstallService) {
 Write-Host ""
 Write-Host "Next:"
 Write-Host "  1. Make sure cloudflared.exe is installed and available in PATH."
-Write-Host "  2. Start servers with Run LUCAS Mobile Stack.vbs, or run each tunnel launcher separately."
+Write-Host "  2. Start servers and tunnels with Run LUCAS Mobile Stack.vbs."
 Write-Host "  3. Test:"
 Write-Host "     https://team-lucas.mikeyscards.com/mobile/team"
 Write-Host "     https://lucas.mikeyscards.com/mobile/personal"

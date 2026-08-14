@@ -16,7 +16,7 @@ For a full operating manual with workflow pictures, see [docs/LUCAS_USER_GUIDE.m
 4. Open `.env`, which the installer creates from `.env.example`.
 5. Add `GOOGLE_API_KEY`, `GOOGLE_SHEETS_OAUTH_CLIENT_ID`, `GOOGLE_SHEETS_OAUTH_CLIENT_SECRET`, and `LUCAS_WORKING_SHEETS_DIR` in `.env`.
 6. Complete Google billing, payment method, spend cap, and budget alert setup from `FIRST_RUN_SETUP.md`.
-7. Launch with `Run Card Pipeline.vbs` for the no-console app, or `Run Card Pipeline.bat` if you want to see console output.
+7. Launch Team LUCAS with `Run Team LUCAS.vbs`, or launch Personal/Michael LUCAS with `Run Michael LUCAS.vbs`.
 
 If automatic Python install is not available on that computer, install Python 3.11 or newer from python.org, include Tcl/Tk support, and check `Add python.exe to PATH`, then run `install_dependencies.bat` again.
 
@@ -122,6 +122,12 @@ The photo OCR helper used by L.U.C.A.S is bundled in `photo_tool`. It uses the s
 
 ## Troubleshooting
 
-If the app does not open, run `Run Card Pipeline.bat` instead of the `.vbs` launcher so Windows keeps the console visible. The most common cause is Python not being installed, not being on PATH, or missing Tcl/Tk support. Run `install_dependencies.bat` first; if automatic Python install is unavailable, install Python from python.org, include Tcl/Tk support, make sure `Add python.exe to PATH` is checked, then run `install_dependencies.bat` again.
+If the app does not open, run it from PowerShell so Windows keeps the console visible:
+
+```powershell
+.\.venv\Scripts\python.exe app.py
+```
+
+The most common cause is Python not being installed, not being on PATH, or missing Tcl/Tk support. Run `install_dependencies.bat` first; if automatic Python install is unavailable, install Python from python.org, include Tcl/Tk support, make sure `Add python.exe to PATH` is checked, then run `install_dependencies.bat` again.
 
 The app launcher uses `.venv` first. If `.venv` is missing, `install_dependencies.bat` recreates it and installs the packages from `requirements.txt`.

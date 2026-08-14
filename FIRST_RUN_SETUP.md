@@ -74,8 +74,9 @@ The folder should contain files like:
 ```text
 app.py
 install_dependencies.bat
-Run Card Pipeline.vbs
-Run Card Pipeline.bat
+Run Team LUCAS.vbs
+Run Michael LUCAS.vbs
+Run LUCAS Mobile Stack.vbs
 README.md
 cardladder-autocomp
 ```
@@ -185,13 +186,19 @@ G:\My Drive\CARD_PIPELINE\sheet_markers.json
 For normal use, double-click:
 
 ```text
-Run Card Pipeline.vbs
+Run Team LUCAS.vbs
 ```
 
-If the app does not open or you want to see error messages, double-click:
+For Personal/Michael LUCAS, double-click:
 
 ```text
-Run Card Pipeline.bat
+Run Michael LUCAS.vbs
+```
+
+If the app does not open or you want to see error messages, run this from PowerShell in the repo folder:
+
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
 
 ## Step 6: Choose The Working Folder
@@ -597,8 +604,8 @@ Do not send these to Git unless you know exactly why you are doing it.
 
 Run:
 
-```text
-Run Card Pipeline.bat
+```powershell
+.\.venv\Scripts\python.exe app.py
 ```
 
 Read the console message. Most startup issues are missing Python, missing dependencies, or a bad `.env` value.
