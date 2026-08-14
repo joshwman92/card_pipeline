@@ -8,6 +8,7 @@ Set env = shell.Environment("PROCESS")
 env("LUCAS_SETTINGS_PATH") = appDir & "\lucas_settings.json"
 env("LUCAS_ASSIGNMENT_CONFIG_PATH") = appDir & "\assignment_companies.json"
 env("LUCAS_MOBILE_PORT") = "8765"
+env("LUCAS_TEAM_MOBILE_PUBLIC_URL") = "https://team-lucas.mikeyscards.com"
 
 pythonwPath = appDir & "\.venv\Scripts\pythonw.exe"
 pythonPath = appDir & "\.venv\Scripts\python.exe"
