@@ -96,6 +96,7 @@ if load_dotenv:
     load_dotenv(PHOTO_APP_DIR / ".env", override=False)
 try:
     from google import genai
+    from google.genai import types as genai_types
     from multi_card_extraction import (
         ModelQuotaExceeded,
         ModelResponseParseError,
@@ -105,6 +106,7 @@ try:
     )
 except Exception:
     genai = None
+    genai_types = None
     identify_cards_sync = None
     _verify_cert_only_sync = None
     TemporaryModelUnavailable = ModelQuotaExceeded = ModelResponseParseError = Exception
@@ -171,6 +173,10 @@ PROFIT_SPORT_COLORS = {
 EXPENSE_CATEGORY_OPTIONS = ("Travel", "Supplies", "Travel Meal", "Fees", "Shipping")
 EXPENSE_LINK_OPTIONS = ("General", "Card", "Sheet")
 MAX_INVENTORY_PHOTOS_PER_CARD = 4
+try:
+    PHOTO_OCR_REQUEST_TIMEOUT_MS = int(os.environ.get("LUCAS_PHOTO_OCR_TIMEOUT_MS") or "120000")
+except ValueError:
+    PHOTO_OCR_REQUEST_TIMEOUT_MS = 120000
 INVENTORY_GRADER_OPTIONS = ("PSA", "BGS", "CGC", "SGC")
 ASSIGNMENT_CATEGORY_OPTIONS = (
     "basketball",
@@ -390,6 +396,20 @@ def parse_company_reset_time(value: object) -> datetime.time:
         except ValueError:
             continue
     raise ValueError("Use a time like 20:00 or 8:00 PM.")
+
+
+def make_photo_ocr_client(api_key: str):
+    if genai is None:
+        return None
+    if genai_types is None or not hasattr(genai_types, "HttpOptions"):
+        return genai.Client(api_key=api_key)
+    try:
+        return genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=PHOTO_OCR_REQUEST_TIMEOUT_MS),
+        )
+    except TypeError:
+        return genai.Client(api_key=api_key)
 
 
 def company_sheet_week_start_for_schedule(moment: datetime, weekday: object = DEFAULT_COMPANY_RESET_WEEKDAY, reset_time: object = DEFAULT_COMPANY_RESET_TIME) -> datetime.date:
@@ -4410,8 +4430,76 @@ class CardPipelineApp(tk.Tk):
             "query": query,
         }
 
+    def _refund_profit_records_to_inventory(self, records: list[dict[str, object]]) -> tuple[int, list[dict[str, object]]]:
+        if any(str(record.get("record_type") or "").strip().lower() == "expense" for record in records):
+            raise ValueError("Expense rows cannot be returned to inventory.")
+        inventory_records: list[dict[str, object]] = []
+        ledger = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
+        refund_keys = {str(self._normalize_profit_record(record).get("ledger_key") or "") for record in records}
+        kept = [record for record in ledger if str(record.get("ledger_key") or "") not in refund_keys]
+        refunded = len(ledger) - len(kept)
+        if refunded:
+            self._save_profit_ledger(kept)
+        for record in records:
+            normalized = self._normalize_profit_record(record)
+            source_sheet = str(normalized.get("source_sheet") or "")
+            cert = str(normalized.get("cert_number") or "")
+            if source_sheet and cert:
+                remove_company_sheet_rows_for_source(COMPANY_SHEETS_DIR, source_sheet, {cert})
+            inventory_records.append(
+                self._normalize_inventory_record(
+                    {
+                        "date_added": datetime.now().strftime("%Y-%m-%d"),
+                        "item_type": normalized.get("item_type") or ("Raw" if str(normalized.get("item_id") or "").upper().startswith("RAW-") else "Graded"),
+                        "item_id": normalized.get("item_id") or "",
+                        "assigned_person": normalized.get("assigned_person") or self._person_for_profit_record(normalized) or "Unassigned",
+                        "sport": CardPipelineApp._inventory_sport_from_value(self, normalized.get("sport") or normalized.get("category"), normalized.get("card_title")),
+                        "cert_number": normalized.get("cert_number") or "",
+                        "grader": normalized.get("grader") or "",
+                        "card_title": normalized.get("card_title") or "",
+                        "purchase_price": normalized.get("purchase_price"),
+                        "card_ladder_value": normalized.get("card_ladder_value"),
+                        "card_ladder_comps_average": normalized.get("card_ladder_comps_average") or normalized.get("comps"),
+                        "cy_value": normalized.get("cy_value") or normalized.get("cy_estimate"),
+                        "inventory_value": normalized.get("sale_price") or normalized.get("card_ladder_value") or normalized.get("comps") or normalized.get("cy_estimate"),
+                        "source_sheet": normalized.get("source_sheet") or "",
+                        "source": normalized.get("source") or "",
+                        "photo_paths": list(normalized.get("photo_paths") or []),
+                        "status": "Active",
+                        "notes": "Refunded from sold cards",
+                    }
+                )
+            )
+        restore_photos = getattr(self, "_restore_inventory_photo_files_for_records", None)
+        if callable(restore_photos):
+            restore_photos(inventory_records)
+        self.add_inventory_records(inventory_records, refresh=False)
+        return refunded, inventory_records
+
     def mobile_profit_refund(self, payload: dict) -> dict:
-        return {"ok": False, "error": "Mobile refund is not enabled on this Windows server branch yet."}
+        ledger = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
+        record = next((item for item in ledger if self._mobile_profit_record_matches_payload(item, payload)), None)
+        if record is None:
+            return {"ok": False, "error": "That sold card was not found in profit."}
+        if str(record.get("record_type") or "").strip().lower() == "expense":
+            return {"ok": False, "error": "Expenses cannot be returned to inventory."}
+        with shared_lock(CARD_PIPELINE_DIR, "mobile-profit-refund", self.lucas_identity):
+            ledger = [self._normalize_profit_record(item) for item in self._load_profit_ledger()]
+            record = next((item for item in ledger if self._mobile_profit_record_matches_payload(item, payload)), None)
+            if record is None:
+                return {"ok": False, "error": "That sold card was already refunded or removed."}
+            refunded, inventory_records = self._refund_profit_records_to_inventory([record])
+        title = record.get("cert_number") or record.get("card_title") or "card"
+        self.events.put(("inventory_refresh", f"Mobile refunded sold card: {title}."))
+        self.events.put(("profit_refresh", f"Mobile refunded sold card: {title}."))
+        self._append_activity("Mobile Refund", f"Mobile refunded sold card: {title}.", {"refunded": refunded or len(inventory_records), "ledger_key": record.get("ledger_key")})
+        self._record_mobile_direct_action(payload, "profit.refund")
+        return {
+            "ok": True,
+            "refunded": refunded or len(inventory_records),
+            "record": self._mobile_inventory_json_record(inventory_records[0]) if inventory_records else {},
+            "people": self._known_people(),
+        }
 
     def mobile_expense_add(self, payload: dict) -> dict:
         person = self._owner_for_profile(payload.get("person") or payload.get("assigned_person") or "")
@@ -4485,6 +4573,8 @@ class CardPipelineApp(tk.Tk):
             return self.mobile_inventory_trade(dict(payload))
         if action_type in {"expense.add", "expense_add", "add_expense"}:
             return self.mobile_expense_add(dict(payload))
+        if action_type in {"profit.refund", "profit_refund", "refund_profit"}:
+            return self.mobile_profit_refund(dict(payload))
         return {"ok": False, "error": f"Unsupported mobile queue action type: {action_type or 'blank'}."}
 
     def mobile_queue_sync(self, payload: dict) -> dict:
@@ -4585,8 +4675,142 @@ class CardPipelineApp(tk.Tk):
         total_balance = sum(float(item["balance"]) for item in summary)
         return {"ok": True, "people": self._known_people(), "summary": summary, "details": details, "totals": {"balance": round(total_balance, 2), "balance_display": format_money(total_balance), "sheets": sum(int(item["sheets"]) for item in summary), "cards": sum(int(item["cards"]) for item in summary)}}
 
+    def _mobile_image_parts(self, image: str) -> tuple[str, str, bytes]:
+        match = re.match(r"^data:([^;]+);base64,(.*)$", image, re.S)
+        if match:
+            mime_type = match.group(1) or "image/jpeg"
+            image_b64 = match.group(2)
+        else:
+            mime_type = "image/jpeg"
+            image_b64 = image
+        return mime_type, image_b64, base64.b64decode(image_b64)
+
+    def _parse_mobile_quick_card_response(self, raw: str) -> dict:
+        text = str(raw or "").strip()
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I | re.S).strip()
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            match = re.search(r"\{.*\}", text, re.S)
+            if not match:
+                return {}
+            try:
+                parsed = json.loads(match.group(0))
+            except Exception:
+                return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _mobile_quick_card_to_row(self, parsed: dict) -> dict[str, object]:
+        grader = normalize_grader(parsed.get("grading_company") or parsed.get("grader") or "")
+        title = build_card_title(
+            {
+                "description": "",
+                "year": parsed.get("year"),
+                "set": parsed.get("set"),
+                "player": parsed.get("player") or parsed.get("subject"),
+                "card_number": parsed.get("card_number"),
+                "parallel": parsed.get("parallel"),
+                "subset": parsed.get("subset") or parsed.get("attributes"),
+                "grader": grader,
+                "grade": parsed.get("grade"),
+            }
+        )
+        label_text = str(parsed.get("label_text") or "").strip()
+        if not title:
+            title = str(parsed.get("card_title") or parsed.get("title") or "").strip()
+        notes = clean_part("; ".join(part for part in ("Mobile quick scan", label_text[:180]) if part))
+        return {
+            "cert_number": scan_to_cert(parsed.get("cert_number")),
+            "grader": grader or infer_grader(title),
+            "card_title": title,
+            "purchase_price": None,
+            "source": "Mobile Photo",
+            "notes": notes,
+        }
+
+    def _mobile_single_card_quick_read(self, client, mime_type: str, image_bytes: bytes) -> dict[str, object] | None:
+        if genai_types is None:
+            return None
+        prompt = (
+            "Read this single trading card or graded slab photo for inventory entry. "
+            "Assume the user is photographing one card/slab. Extract only visible facts; do not guess. "
+            "Return JSON only with keys: grading_company, cert_number, player, year, set, card_number, "
+            "parallel, subset, attributes, grade, card_title, label_text, confidence. "
+            "Normalize cert_number to digits only when possible. If a field is unreadable, use an empty string. "
+            "For BGS/Beckett, grade must be the overall slab grade, not a subgrade."
+        )
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                prompt,
+                genai_types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
+            ],
+            config=genai_types.GenerateContentConfig(
+                thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+                max_output_tokens=700,
+                response_mime_type="application/json",
+                temperature=0,
+            ),
+        )
+        parsed = self._parse_mobile_quick_card_response(response.text or "")
+        row = self._mobile_quick_card_to_row(parsed)
+        if row.get("cert_number") or row.get("card_title") or row.get("grader"):
+            return row
+        return None
+
     def mobile_card_identify(self, payload: dict) -> dict:
-        return {"ok": False, "error": "Mobile photo OCR is not enabled on this Windows server branch yet."}
+        image = str(payload.get("image") or "").strip()
+        if not image:
+            return {"ok": False, "error": "Take or choose a card photo first."}
+        if genai is None or identify_cards_sync is None:
+            return {"ok": False, "error": "Photo OCR dependencies are not available."}
+        if hasattr(self, "_load_photo_env"):
+            self._load_photo_env()
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            return {"ok": False, "error": "Missing GOOGLE_API_KEY for photo card search."}
+        try:
+            mime_type, image_b64, image_bytes = self._mobile_image_parts(image)
+        except Exception as error:
+            return {"ok": False, "error": f"Could not read that photo: {error}"}
+        if len(image_bytes) > 8 * 1024 * 1024:
+            return {"ok": False, "error": "That photo is too large for mobile OCR. Retake it a little closer or choose a smaller image."}
+        try:
+            client = make_photo_ocr_client(api_key)
+            row = self._mobile_single_card_quick_read(client, mime_type, image_bytes)
+            if row is None:
+                cards = identify_cards_sync(client, image_b64)
+                self._inventory_photo_rescue_single_bgs_cert(cards, image_b64, client=client)
+                rows = [
+                    self._photo_card_to_row(Path("mobile-photo.jpg"), card)
+                    for card in cards
+                    if self._photo_card_has_inventory(card)
+                ]
+                if not rows:
+                    return {"ok": False, "error": "No card was found in that photo."}
+                row = rows[0]
+                cards_found = len(rows)
+                mode = "fallback"
+            else:
+                cards_found = 1
+                mode = "quick"
+        except (TemporaryModelUnavailable, ModelQuotaExceeded, ModelResponseParseError) as error:
+            return {"ok": False, "error": str(error)}
+        except Exception as error:
+            return {"ok": False, "error": f"Photo search failed: {error}"}
+        query = scan_to_cert(row.get("cert_number")) or str(row.get("card_title") or "").strip()
+        return {
+            "ok": True,
+            "query": query,
+            "card": {
+                "cert_number": row.get("cert_number"),
+                "grader": row.get("grader"),
+                "card_title": row.get("card_title"),
+                "notes": row.get("notes"),
+            },
+            "cards_found": cards_found,
+            "mode": mode,
+        }
 
     def mobile_inventory_photo_response(self, photo_id: str) -> tuple[bytes, str] | None:
         padding = "=" * (-len(str(photo_id or "")) % 4)

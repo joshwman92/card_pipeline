@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import queue
 import os
@@ -9034,6 +9035,140 @@ class PhotoOcrSpeedTests(unittest.TestCase):
         self.assertEqual(row["source"], "Photo: dense.jpg")
         self.assertIn("right", row["notes"])
         self.assertIn("OCR review needed", row["notes"])
+
+    def test_mobile_profit_refund_returns_card_to_inventory(self) -> None:
+        class MobileFinanceDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _load_inventory_ledger = app.CardPipelineApp._load_inventory_ledger
+            _save_inventory_ledger = app.CardPipelineApp._save_inventory_ledger
+            _mobile_trade_basis = app.CardPipelineApp._mobile_trade_basis
+            _mobile_inventory_json_record = app.CardPipelineApp._mobile_inventory_json_record
+            _profit_record_key = app.CardPipelineApp._profit_record_key
+            _load_profit_ledger = app.CardPipelineApp._load_profit_ledger
+            _save_profit_ledger = app.CardPipelineApp._save_profit_ledger
+            _normalize_profit_record = app.CardPipelineApp._normalize_profit_record
+            _person_for_profit_record = app.CardPipelineApp._person_for_profit_record
+            _mobile_profit_record_matches_payload = app.CardPipelineApp._mobile_profit_record_matches_payload
+            _refund_profit_records_to_inventory = app.CardPipelineApp._refund_profit_records_to_inventory
+            mobile_profit_refund = app.CardPipelineApp.mobile_profit_refund
+            add_inventory_records = app.CardPipelineApp.add_inventory_records
+            _append_activity = lambda self, action, summary, details=None: None
+            _record_mobile_direct_action = lambda self, payload, action_type: None
+            _restore_inventory_photo_files_for_records = lambda self, records: 0
+            _enrich_inventory_record_assignment = lambda self, record: record
+            refresh_inventory_tab = lambda self: None
+
+            def __init__(self):
+                self.events = queue.Queue()
+                self.lucas_identity = {"display_name": "Tester", "machine": "Test"}
+
+            def _known_people(self):
+                return ["Kevin Hambone", "Mike Seller"]
+
+        with TemporaryDirectory() as tmp:
+            old_pipeline = app.CARD_PIPELINE_DIR
+            old_profit = app.PROFIT_LEDGER_PATH
+            old_inventory = app.INVENTORY_LEDGER_PATH
+            app.CARD_PIPELINE_DIR = Path(tmp)
+            app.PROFIT_LEDGER_PATH = Path(tmp) / "profit_ledger.json"
+            app.INVENTORY_LEDGER_PATH = Path(tmp) / "inventory_ledger.json"
+            try:
+                dummy = MobileFinanceDummy()
+                dummy._save_profit_ledger(
+                    [
+                        {
+                            "assigned_person": "Kevin Hambone",
+                            "company": "Test Sold",
+                            "card_title": "Mobile Refund Card",
+                            "cert_number": "555222",
+                            "purchase_price": 10,
+                            "sale_price": 20,
+                            "date_added": "2026-06-18",
+                        }
+                    ]
+                )
+                ledger_key = dummy._normalize_profit_record(dummy._load_profit_ledger()[0])["ledger_key"]
+
+                refund = dummy.mobile_profit_refund({"ledger_key": ledger_key})
+
+                self.assertTrue(refund["ok"])
+                inventory = dummy._load_inventory_ledger()
+                self.assertEqual(len(inventory), 1)
+                self.assertEqual(inventory[0]["card_title"], "Mobile Refund Card")
+                self.assertEqual(inventory[0]["status"], "Active")
+                self.assertEqual(dummy._load_profit_ledger(), [])
+            finally:
+                app.CARD_PIPELINE_DIR = old_pipeline
+                app.PROFIT_LEDGER_PATH = old_profit
+                app.INVENTORY_LEDGER_PATH = old_inventory
+
+    def test_mobile_card_identify_returns_search_query_from_photo_ocr(self) -> None:
+        class MobilePhotoDummy:
+            _photo_card_to_row = app.CardPipelineApp._photo_card_to_row
+            _photo_card_has_inventory = app.CardPipelineApp._photo_card_has_inventory
+            _load_photo_env = lambda self: None
+            _mobile_image_parts = app.CardPipelineApp._mobile_image_parts
+            _parse_mobile_quick_card_response = app.CardPipelineApp._parse_mobile_quick_card_response
+            _mobile_quick_card_to_row = app.CardPipelineApp._mobile_quick_card_to_row
+            _mobile_single_card_quick_read = app.CardPipelineApp._mobile_single_card_quick_read
+            mobile_card_identify = app.CardPipelineApp.mobile_card_identify
+
+        quick_response = json.dumps(
+            {
+                "grading_company": "PSA",
+                "cert_number": "123456789",
+                "player": "Test Player",
+                "year": "2024",
+                "set": "Prizm",
+                "grade": "10",
+                "confidence": "high",
+            }
+        )
+
+        class FakeModels:
+            def generate_content(self, **_kwargs):
+                return types.SimpleNamespace(text=quick_response)
+
+        class FakeClient:
+            models = FakeModels()
+
+        fake_genai = types.SimpleNamespace(Client=lambda api_key: FakeClient())
+        fake_genai_types = types.SimpleNamespace(
+            Part=types.SimpleNamespace(from_bytes=lambda **kwargs: kwargs),
+            GenerateContentConfig=lambda **kwargs: kwargs,
+            ThinkingConfig=lambda **kwargs: kwargs,
+        )
+        with patch.object(app, "genai", fake_genai), \
+                patch.object(app, "genai_types", fake_genai_types), \
+                patch.object(app, "identify_cards_sync") as fallback_ocr, \
+                patch.dict(app.os.environ, {"GOOGLE_API_KEY": "test-key"}):
+            result = MobilePhotoDummy().mobile_card_identify({"image": "data:image/jpeg;base64,ZmFrZQ=="})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "quick")
+        self.assertEqual(result["query"], "123456789")
+        self.assertEqual(result["card"]["grader"], "PSA")
+        self.assertIn("Test Player", result["card"]["card_title"])
+        fallback_ocr.assert_not_called()
+
+    def test_mobile_card_identify_rejects_oversized_photos(self) -> None:
+        class MobilePhotoDummy:
+            _load_photo_env = lambda self: None
+            _mobile_image_parts = app.CardPipelineApp._mobile_image_parts
+            mobile_card_identify = app.CardPipelineApp.mobile_card_identify
+
+        oversized = base64.b64encode(b"x" * (8 * 1024 * 1024 + 1)).decode("ascii")
+        fake_genai = types.SimpleNamespace(Client=lambda api_key: object())
+        with patch.object(app, "genai", fake_genai), \
+                patch.object(app, "identify_cards_sync") as fallback_ocr, \
+                patch.dict(app.os.environ, {"GOOGLE_API_KEY": "test-key"}):
+            result = MobilePhotoDummy().mobile_card_identify({"image": f"data:image/jpeg;base64,{oversized}"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("too large", result["error"])
+        fallback_ocr.assert_not_called()
 
 
 if __name__ == "__main__":
