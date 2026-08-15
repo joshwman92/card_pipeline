@@ -329,6 +329,15 @@ def is_personal_lucas_profile(settings: dict[str, object] | None = None, setting
     return any(marker in text for marker in ("personal", "michael", "mikey", "lucas_personal"))
 
 
+def mobile_profile_data_root_error(profile: str, data_root: Path, settings_path: Path) -> str:
+    profile = str(profile or "").strip().lower()
+    root_text = str(data_root or "").strip().lower()
+    settings_text = str(settings_path or "").strip()
+    if profile == "personal" and not any(marker in root_text for marker in ("lucas_personal", "personal lucas")):
+        return f"Personal mobile is using the wrong data root: {data_root}. Fix {settings_text} so pipeline_root points to LUCAS_PERSONAL."
+    return ""
+
+
 def is_google_sheet_url(value: object) -> bool:
     parsed = urllib.parse.urlparse(str(value or "").strip())
     return parsed.scheme in {"http", "https"} and parsed.netloc.lower().endswith("docs.google.com") and "/spreadsheets/" in parsed.path
@@ -773,6 +782,7 @@ class CardPipelineApp(tk.Tk):
         self.state.mobile_profile = "personal" if is_personal_lucas_profile(self.app_settings, SETTINGS_PATH) else "team"
         self.state.mobile_data_root = str(CARD_PIPELINE_DIR)
         self.state.mobile_settings_path = str(SETTINGS_PATH)
+        self.state.mobile_profile_error = mobile_profile_data_root_error(self.state.mobile_profile, CARD_PIPELINE_DIR, SETTINGS_PATH)
         self.state.on_update = lambda: self.events.put("comp_refresh")
         self.state.mobile_pin_provider = lambda: self.mobile_pin
         self.state.mobile_inventory_search = self.mobile_inventory_search
@@ -4356,6 +4366,19 @@ class CardPipelineApp(tk.Tk):
         return result
 
     def mobile_inventory_search(self, payload: dict) -> dict:
+        profile = "personal" if self._is_personal_lucas() else "team"
+        profile_error = mobile_profile_data_root_error(profile, CARD_PIPELINE_DIR, SETTINGS_PATH)
+        if profile_error:
+            return {
+                "ok": False,
+                "error": profile_error,
+                "profile": profile,
+                "dataRoot": str(CARD_PIPELINE_DIR),
+                "settingsPath": str(SETTINGS_PATH),
+                "count": 0,
+                "items": [],
+                "people": [],
+            }
         query = str(payload.get("query") or payload.get("q") or "").strip().lower()
         cert_query = scan_to_cert(query)
         person = str(payload.get("person") or "").strip().lower()
@@ -4383,7 +4406,6 @@ class CardPipelineApp(tk.Tk):
             matched.append(self._mobile_inventory_json_record(record))
             if len(matched) >= limit:
                 break
-        profile = "personal" if self._is_personal_lucas() else "team"
         return {
             "ok": True,
             "profile": profile,
