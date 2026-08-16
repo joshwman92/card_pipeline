@@ -1247,6 +1247,11 @@ class GoogleSheetCacheTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(cache_path.read_text(encoding="utf-8").strip(), "Football $20-$200 95%")
 
+    def test_bundled_cardladder_helper_version_matches_bridge_expectation(self) -> None:
+        background_js = (ROOT / "cardladder-autocomp" / "extension" / "background.js").read_text(encoding="utf-8")
+
+        self.assertIn(f'CARDLADDER_BACKGROUND_VERSION = "{app.EXPECTED_CARDLADDER_EXTENSION_VERSION}"', background_js)
+
     def test_bridge_poll_keeps_google_keep_sources_private(self) -> None:
         bridge = app.BridgeState()
         bridge.register_keep_note_sources(
