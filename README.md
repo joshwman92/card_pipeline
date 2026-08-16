@@ -58,7 +58,7 @@ Card Ladder comping requires a Card Ladder account and an active Chrome login se
 
 The app starts the local Card Ladder bridge automatically when L.U.C.A.S opens.
 
-The bridge currently expects helper version `2026-07-21-visible-cert-result-v24`. If Chrome shows a debugger warning during non-PSA grader selection, that is Chrome's browser-level warning for the trusted-click fallback; the attach is scoped to the Card Ladder tab and detached after the grader click.
+The bridge currently expects helper version `2026-08-15-generic-title-settle-v26`. If Chrome shows a debugger warning during non-PSA grader selection, that is Chrome's browser-level warning for the trusted-click fallback; the attach is scoped to the Card Ladder tab and detached after the grader click.
 
 ## Input Modes
 
