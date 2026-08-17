@@ -309,6 +309,8 @@ def mobile_bridge_port(settings: dict[str, object] | None = None) -> int:
             return max(1024, min(int(raw_port), 65535))
         except ValueError:
             pass
+    if is_personal_lucas_profile(settings):
+        return 8766
     return 8765
 
 
@@ -783,7 +785,7 @@ class CardPipelineApp(tk.Tk):
         self.state.mobile_payouts = self.mobile_payouts
         self.state.mobile_queue_sync = self.mobile_queue_sync
         self.state.mobile_inventory_photo_resolver = self.mobile_inventory_photo_response
-        self.bridge = BridgeServer(self.state, port=mobile_bridge_port(self.app_settings))
+        self.bridge = BridgeServer(self.state, port=mobile_bridge_port(self.app_settings), allow_port_fallback=True)
         self.bridge.start()
         self._refresh_keep_source_registry()
         mobile_url = self._mobile_app_url()

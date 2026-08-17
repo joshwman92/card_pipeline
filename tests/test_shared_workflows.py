@@ -359,6 +359,11 @@ class SharedStateTests(unittest.TestCase):
         self.assertTrue(app.is_personal_lucas_profile({"pipeline_root": "G:/My Drive/LUCAS_PERSONAL"}, Path("lucas_settings.json")))
         self.assertTrue(app.is_personal_lucas_profile({"profile": "personal"}, Path("lucas_settings.json")))
         self.assertFalse(app.is_personal_lucas_profile({"pipeline_root": "G:/My Drive/CARD_PIPELINE"}, Path("lucas_settings.json")))
+        self.assertEqual(app.mobile_bridge_port({"profile": "personal"}), 8766)
+        self.assertEqual(app.mobile_bridge_port({"pipeline_root": "G:/My Drive/LUCAS_PERSONAL"}), 8766)
+        self.assertEqual(app.mobile_bridge_port({"pipeline_root": "G:/My Drive/CARD_PIPELINE"}), 8765)
+        with patch.dict(os.environ, {"LUCAS_MOBILE_PORT": "8799"}):
+            self.assertEqual(app.mobile_bridge_port({"profile": "personal"}), 8799)
 
         class PersonalDummy:
             _is_personal_lucas = app.CardPipelineApp._is_personal_lucas
