@@ -4216,6 +4216,40 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(items[0]["payout_balance"], 50.0)
         self.assertEqual(sum(float(item["payout_balance"]) for item in items), 60.0)
 
+    def test_payout_history_includes_manual_paid_adjustment_without_profit_row(self) -> None:
+        class Dummy:
+            _payout_history_items_for_person = app.CardPipelineApp._payout_history_items_for_person
+
+            def _payout_sheet_items(self):
+                return [
+                    {
+                        "key": "Sold|Tyler Hamlin|Open.xlsx",
+                        "person": "Tyler Hamlin",
+                        "name": "Open.xlsx",
+                        "stage": "Sold",
+                        "paid": False,
+                        "row_count": 1,
+                        "net_profit_total": 100,
+                        "payout_balance": 50,
+                    }
+                ]
+
+            home_sheet_markers = {
+                "SoldCard|Tyler Hamlin|manual-tyler-paid-payout-20260815-3000|general sold|2026-08-15|manual paid payout adjustment|tyler hamlin general sold": {
+                    "assigned_person": "Tyler Hamlin",
+                    "paid": True,
+                    "paid_at": "2026-08-15T19:24:32",
+                    "manual_paid_adjustment": True,
+                    "manual_paid_amount": 3000.0,
+                }
+            }
+
+        items = Dummy()._payout_history_items_for_person("Tyler Hamlin")
+
+        self.assertEqual(items[0]["name"], "Total paid at 2026-08-15T19:24:32")
+        self.assertEqual(items[0]["payout_balance"], 3000.0)
+        self.assertEqual(items[1]["name"], "Open.xlsx")
+
     def test_save_payout_marker_blocks_pending_seller_paid(self) -> None:
         class PayoutDummy:
             _split_home_sheet_key = app.CardPipelineApp._split_home_sheet_key

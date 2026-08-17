@@ -10591,6 +10591,7 @@ class CardPipelineApp(tk.Tk):
         ]
         paid_batches: dict[str, dict[str, object]] = {}
         open_items: list[dict[str, object]] = []
+        source_keys = {str(item.get("key") or "") for item in source_items}
         for item in source_items:
             if not item.get("paid"):
                 open_items.append(item)
@@ -10624,6 +10625,43 @@ class CardPipelineApp(tk.Tk):
                 batch[field] = int(batch.get(field) or 0) + int(item.get(field) or 0)
             for field in ("purchase_total", "estimated_payout_total", "estimated_profit", "realized_profit_total", "expense_total", "net_profit_total", "payout_balance"):
                 batch[field] = round(float(batch.get(field) or 0.0) + float(item.get(field) or 0.0), 2)
+        for key, marker in self.home_sheet_markers.items():
+            if key in source_keys:
+                continue
+            if not marker.get("manual_paid_adjustment") or not marker.get("paid"):
+                continue
+            if str(marker.get("assigned_person") or "").strip().lower() != person_key:
+                continue
+            try:
+                amount = float(marker.get("manual_paid_amount") or 0.0)
+            except (TypeError, ValueError):
+                amount = 0.0
+            if not amount:
+                continue
+            paid_at = str(marker.get("paid_at") or "Paid").strip() or "Paid"
+            batch = paid_batches.setdefault(
+                paid_at,
+                {
+                    "key": f"paid-batch:{paid_at}",
+                    "stage": "Paid",
+                    "name": f"Total paid at {paid_at}",
+                    "person": person,
+                    "paid": True,
+                    "paid_at": paid_at if paid_at != "Paid" else "",
+                    "row_count": 0,
+                    "received_count": 0,
+                    "purchase_total": 0.0,
+                    "estimated_payout_total": 0.0,
+                    "estimated_profit": 0.0,
+                    "realized_profit_total": 0.0,
+                    "expense_total": 0.0,
+                    "net_profit_total": 0.0,
+                    "payout_balance": 0.0,
+                    "payout_basis": "Total paid balance",
+                    "status": "Paid",
+                },
+            )
+            batch["payout_balance"] = round(float(batch.get("payout_balance") or 0.0) + amount, 2)
         return [
             *sorted(paid_batches.values(), key=lambda item: str(item.get("paid_at") or item.get("name") or ""), reverse=True),
             *sorted(open_items, key=lambda item: (str(item.get("stage") or ""), str(item.get("name") or "").lower())),
