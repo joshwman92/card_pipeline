@@ -3685,6 +3685,7 @@ class CardPipelineApp(tk.Tk):
                 "source": normalized.get("source") or "Inventory",
                 "item_type": normalized.get("item_type") or "",
                 "item_id": normalized.get("item_id") or "",
+                "inventory_key": normalized.get("inventory_key") or "",
                 "cert_number": normalized.get("cert_number") or "",
                 "grader": normalized.get("grader") or "",
                 "card_title": normalized.get("card_title") or "",
@@ -6889,14 +6890,38 @@ class CardPipelineApp(tk.Tk):
         keys = {primary} if primary else set()
         if str(normalized.get("record_type") or "").strip().lower() == "expense":
             return keys
-        company = str(normalized.get("company") or normalized.get("best_company") or "").strip().lower()
-        source_sheet = Path(str(normalized.get("source_sheet") or "")).name.strip().lower()
-        cert = scan_to_cert(normalized.get("cert_number"))
-        item_id = str(normalized.get("item_id") or "").strip().lower()
+        inventory_key = str(normalized.get("inventory_key") or "").strip().lower()
+        if inventory_key and str(normalized.get("status") or "").strip().lower() == "sold from inventory":
+            return {f"sold-inventory-card|{inventory_key}"}
+        weak_key = CardPipelineApp._profit_weak_sold_card_key(self, normalized)
+        if weak_key:
+            keys.add(weak_key)
+        return keys
+
+    def _profit_weak_sold_card_key(self, record: dict[str, object]) -> str:
+        company = str(record.get("company") or record.get("best_company") or "").strip().lower()
+        source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
+        cert = scan_to_cert(record.get("cert_number"))
+        item_id = str(record.get("item_id") or "").strip().lower()
         stable_id = cert or item_id
         if company and source_sheet and stable_id:
-            keys.add(f"sold-card|{company}|{source_sheet}|{stable_id}")
-        return keys
+            return f"sold-card|{company}|{source_sheet}|{stable_id}"
+        return ""
+
+    def _profit_recovery_duplicate_index(self, ledger: list[dict[str, object]], incoming: dict[str, object]) -> int | None:
+        if str(incoming.get("status") or "").strip().lower() == "sold from inventory":
+            return None
+        incoming_key = CardPipelineApp._profit_weak_sold_card_key(self, incoming)
+        if not incoming_key:
+            return None
+        for index, existing in enumerate(ledger):
+            if str(existing.get("record_type") or "").strip().lower() == "expense":
+                continue
+            if str(existing.get("status") or "").strip().lower() != "sold from inventory":
+                continue
+            if CardPipelineApp._profit_weak_sold_card_key(self, existing) == incoming_key:
+                return index
+        return None
 
     def _dedupe_profit_records(self, rows: list[dict[str, object]]) -> tuple[list[dict[str, object]], int]:
         kept: list[dict[str, object]] = []
@@ -7486,6 +7511,11 @@ class CardPipelineApp(tk.Tk):
             return False
         if str(existing.get("status") or "") != "Sold from inventory" or str(incoming.get("status") or "") != "Sold from inventory":
             return False
+        existing_inventory_key = str(existing.get("inventory_key") or "").strip().lower()
+        incoming_inventory_key = str(incoming.get("inventory_key") or "").strip().lower()
+        if existing_inventory_key or incoming_inventory_key:
+            if not existing_inventory_key or existing_inventory_key != incoming_inventory_key:
+                return False
         existing_stable_id = scan_to_cert(existing.get("cert_number")) or str(existing.get("item_id") or "").strip().lower()
         incoming_stable_id = scan_to_cert(incoming.get("cert_number")) or str(incoming.get("item_id") or "").strip().lower()
         if not existing_stable_id or existing_stable_id != incoming_stable_id:
@@ -7533,6 +7563,9 @@ class CardPipelineApp(tk.Tk):
                             existing_key_map[key] = existing_index
                         existing_keys = set(existing_key_map)
                         added += 1
+                    continue
+                recovery_index = CardPipelineApp._profit_recovery_duplicate_index(self, ledger, normalized)
+                if recovery_index is not None:
                     continue
                 if not str(normalized.get("ledger_added_at") or "").strip():
                     normalized["ledger_added_at"] = datetime.now().isoformat(timespec="microseconds")

@@ -5393,6 +5393,69 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 app.CARD_PIPELINE_DIR = old_pipeline
                 app.PROFIT_LEDGER_PATH = old_ledger
 
+    def test_record_profit_sales_keeps_distinct_inventory_sales_with_corrected_cert(self) -> None:
+        class ProfitDummy:
+            _load_profit_ledger = app.CardPipelineApp._load_profit_ledger
+            _save_profit_ledger = app.CardPipelineApp._save_profit_ledger
+            _profit_record_key = app.CardPipelineApp._profit_record_key
+            _profit_record_identity_keys = app.CardPipelineApp._profit_record_identity_keys
+            _money_value = app.CardPipelineApp._money_value
+            _normalize_profit_record = app.CardPipelineApp._normalize_profit_record
+            _update_duplicate_inventory_sale_profit_record = app.CardPipelineApp._update_duplicate_inventory_sale_profit_record
+            record_profit_sales = app.CardPipelineApp.record_profit_sales
+            refresh_profit_tab = lambda self: None
+
+        with TemporaryDirectory() as tmp:
+            old_pipeline = app.CARD_PIPELINE_DIR
+            old_ledger = app.PROFIT_LEDGER_PATH
+            app.CARD_PIPELINE_DIR = Path(tmp)
+            app.PROFIT_LEDGER_PATH = Path(tmp) / "profit_ledger.json"
+            dummy = ProfitDummy()
+            dummy.lucas_identity = {"display_name": "Tester", "machine": "Test"}
+            try:
+                old_sale = dummy._normalize_profit_record(
+                    {
+                        "assigned_person": "Mikey",
+                        "cert_number": "2668770",
+                        "grader": "SGC",
+                        "card_title": "2019 Topps Chrome 1 Shohei Ohtani SGC 10",
+                        "company": "FANATICS",
+                        "source_sheet": "COMPLETE_GRADED_INVENTORY_ADD_7_7_26.xlsx",
+                        "purchase_price": 120,
+                        "sale_price": 155.31,
+                        "date_added": "2026-08-16",
+                        "status": "Sold from inventory",
+                    }
+                )
+                dummy._save_profit_ledger([old_sale])
+
+                self.assertEqual(
+                    dummy.record_profit_sales(
+                        [
+                            {
+                                "assigned_person": "Mikey",
+                                "cert_number": "2668770",
+                                "grader": "SGC",
+                                "card_title": "2019 Topps Chrome 1 Shohei Ohtani SGC 10",
+                                "company": "FANATICS",
+                                "source_sheet": "COMPLETE_GRADED_INVENTORY_ADD_7_7_26.xlsx",
+                                "inventory_key": "2668770|complete_graded_inventory_add_7_7_26.xlsx|mikey",
+                                "purchase_price": 100,
+                                "sale_price": 190,
+                                "date_added": "2026-08-17",
+                                "status": "Sold from inventory",
+                            }
+                        ]
+                    ),
+                    1,
+                )
+                ledger = [dummy._normalize_profit_record(record) for record in dummy._load_profit_ledger()]
+                self.assertEqual(len(ledger), 2)
+                self.assertEqual(sorted(record["sale_price"] for record in ledger), [155.31, 190.0])
+            finally:
+                app.CARD_PIPELINE_DIR = old_pipeline
+                app.PROFIT_LEDGER_PATH = old_ledger
+
     def test_expense_records_deduct_from_person_profit(self) -> None:
         class ExpenseDummy:
             _load_profit_ledger = app.CardPipelineApp._load_profit_ledger
