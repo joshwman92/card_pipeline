@@ -37,6 +37,7 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
 
 ## Latest Completed Work
 
+- Create now shows the same non-editable bottom `TOTAL` row as Comp, summing visible Purchase, Card Ladder, Comps, CY Estimate, and Est. Payout columns when those columns are present.
 - Payout history now supports explicit manual paid-payout markers with `manual_paid_adjustment` and `manual_paid_amount`, so a historical paid amount can appear in the payout history popup without adding a fake profit/sale row to `profit_ledger.json`. Live Team L.U.C.A.S was repaired by removing the bogus Tyler Hamlin `Manual paid Tyler payout adjustment` profit row and preserving a `$3,000` paid marker only.
 - Team and Personal L.U.C.A.S can now stay open while using Card Ladder comping. Team keeps bridge port `8765`; Personal/Michael defaults to `8766` unless an explicit `LUCAS_MOBILE_PORT` or `mobile_port` setting is supplied, and the bridge can fall forward through the helper's known port range if a port is already occupied.
 - Windows synced the latest Mac People Rules/network payout semantics through Mac `691eee9`: People Rules now uses `Person`, supports blank Sheet Type rows with `Balance Share %` for team profit-share payouts, keeps Seller Rate/Deduction rows tied to active Sheet Types, defaults blank seller min/max bounds to `$0` and `$1,000,000,000`, and prevents balance-share-only rows from classifying that person as a seller source. Team payouts now use each person's balance-share rule when present and otherwise default to 50%.
