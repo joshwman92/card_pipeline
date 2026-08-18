@@ -557,6 +557,14 @@ class BridgeState:
         filtered_comp_count = raw_comp_count - len(comps)
         generic_profile_reason = generic_profile_review_reason(profile_title, profile_grader, profile_grade, ocr)
         if result_status == "partial_comp_capture":
+            result_extension_version = str(result.get("extensionVersion") or "")
+            if result_extension_version and result_extension_version != EXPECTED_CARDLADDER_EXTENSION_VERSION:
+                row.status = "Reload Card Ladder extension"
+                row.notes = (
+                    "The Card Ladder result came from an older Card Ladder extension that cannot "
+                    "reliably capture partial comp results. Reload the bundled Card Ladder Auto-Comp extension."
+                )
+                return
             if profile_title:
                 row.card_title = build_card_title(profile_title, profile_grader, profile_grade)
                 fill_missing_category_from_title(row)
