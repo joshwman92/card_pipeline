@@ -1308,7 +1308,11 @@ function extractResultCount(text) {
 
 function extractProfileFromText(text) {
   const normalized = String(text || "").replace(/\s+/g, " ");
-  const titleStop = `(?=\\s+(?:CL\\s*Value|Card\\s*Ladder\\s*Value|Grade:|Grader:|${COMP_SOURCE_PATTERN_TEXT}|close\\s+\\$|[x×]|help[_\\s-]*outline|Date\\s+Sold|No\\s+sales|No\\s+results|There\\s+are\\s+no\\s+results|Try\\s+searching|$))`;
+  // A visible close icon can look like a standalone "x", but set names also
+  // use X/XY (for example, "Chrome X Cactus Jack").  Let the surrounding
+  // Card Ladder labels establish the boundary; cleanProfileTitle removes a
+  // trailing close icon after that boundary is found.
+  const titleStop = `(?=\\s+(?:CL\\s*Value|Card\\s*Ladder\\s*Value|Grade:|Grader:|${COMP_SOURCE_PATTERN_TEXT}|close\\s+\\$|help[_\\s-]*outline|Date\\s+Sold|No\\s+sales|No\\s+results|There\\s+are\\s+no\\s+results|Try\\s+searching|$))`;
   const gradeGraderProfile = normalized.match(new RegExp(`Grade:\\s*([^,|]+).*?Grader:\\s*([A-Z]+).*?Profile:\\s*(.*?)${titleStop}`, "i"));
   if (gradeGraderProfile) {
     return {

@@ -38,10 +38,13 @@ ${functionSource("parseCompChunk")}
 ${functionSource("parseMoneyValue")}
 ${functionSource("escapeRegExp")}
 ${functionSource("visibleTextMatchesCert")}
+${functionSource("cleanProfileTitle")}
+${functionSource("extractProfileFromText")}
 globalThis.parseCompChunk = parseCompChunk;
 globalThis.sourceLineMatch = sourceLineMatch;
 globalThis.parseMoneyValue = parseMoneyValue;
 globalThis.visibleTextMatchesCert = visibleTextMatchesCert;
+globalThis.extractProfileFromText = extractProfileFromText;
 `;
 
 const context = {};
@@ -76,6 +79,26 @@ assert.strictEqual(
 assert.strictEqual(
   context.visibleTextMatchesCert("Cert # 121465725 Grade: GEM MT 10", "121465724"),
   false,
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(context.extractProfileFromText(
+    "254 results Grade: 10, Grader: PSA, Profile: 2016 Pokemon Japanese XY PokeKyun Collection 019 Full Art/Gardevoir Ex 1st Edition (Pop 2239) x CL Value $990.00",
+  ))),
+  {
+    grade: "10",
+    grader: "PSA",
+    title: "2016 Pokemon Japanese XY PokeKyun Collection 019 Full Art/Gardevoir Ex 1st Edition",
+  },
+);
+assert.deepStrictEqual(
+  JSON.parse(JSON.stringify(context.extractProfileFromText(
+    "2 results Grade: 9, Grader: PSA, Profile: 2025 Topps Chrome X Cactus Jack 15 Aaron Judge Gold Refractor (Pop 8) x CL Value $196.00",
+  ))),
+  {
+    grade: "9",
+    grader: "PSA",
+    title: "2025 Topps Chrome X Cactus Jack 15 Aaron Judge Gold Refractor",
+  },
 );
 
 console.log("extension parser regression ok");
