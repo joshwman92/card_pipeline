@@ -1664,8 +1664,7 @@ class CardPipelineApp(tk.Tk):
         tree.tag_configure("add_review_row", background="#242424", foreground="#1ed760")
         tree.tag_configure("total_row", background="#242424", foreground="#ffffff", font=("Segoe UI Semibold", 10))
         if editable:
-            tree.bind("<Double-1>", self._begin_cell_edit)
-            tree.bind("<Button-1>", self._handle_table_click, add="+")
+            tree.bind("<Button-1>", self._begin_editable_table_click)
             tree.bind("<Delete>", self._delete_selected_table_rows)
         tree.bind("<ButtonRelease-1>", lambda _event, target=tree: self._remember_column_widths(target), add="+")
         content.columnconfigure(0, weight=1)
@@ -1988,8 +1987,7 @@ class CardPipelineApp(tk.Tk):
         self.payout_summary_tree.tag_configure("total_divider", background="#1f1f1f", foreground="#ffffff", font=("Segoe UI Semibold", 10))
         self.payout_summary_tree.tag_configure("total_row", background="#242424", foreground="#ffffff", font=("Segoe UI Semibold", 10))
         self.payout_summary_tree.bind("<ButtonRelease-1>", self.mark_payout_person_paid)
-        self.payout_summary_tree.bind("<Button-3>", self.open_payout_history_menu)
-        self.payout_summary_tree.bind("<Control-Button-1>", self.open_payout_history_menu)
+        self._bind_context_menu(self.payout_summary_tree, self.open_payout_history_menu)
 
         detail_panel = ttk.Frame(payout_split, style="Panel.TFrame", padding=(12, 12))
         payout_split.add(detail_panel, minsize=360)
@@ -2070,7 +2068,7 @@ class CardPipelineApp(tk.Tk):
         self.inventory_tree.configure(selectmode="extended")
         self._configure_sortable_tree_headings(self.inventory_tree, INVENTORY_HEADINGS, "inventory")
         self._bind_context_menu(self.inventory_tree, self._show_inventory_context_menu)
-        self.inventory_tree.bind("<Button-1>", self._inventory_bulk_click, add="+")
+        self.inventory_tree.bind("<Button-1>", self._begin_inventory_cell_edit_from_click, add="+")
         self.inventory_tree.bind("<Double-1>", self._begin_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<Return>", self._begin_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<F2>", self._begin_inventory_bulk_edit, add="+")
@@ -4030,6 +4028,24 @@ class CardPipelineApp(tk.Tk):
         if column in INVENTORY_EDIT_COLUMN_FIELDS:
             self._set_inventory_bulk_cell(row_id, column)
 
+    def _begin_inventory_cell_edit_from_click(self, event: tk.Event) -> str | None:
+        column_id = self.inventory_tree.identify_column(event.x)
+        row_id = self.inventory_tree.identify_row(event.y)
+        if not row_id or not column_id:
+            return None
+        try:
+            column_index = int(str(column_id).replace("#", "")) - 1
+        except ValueError:
+            return None
+        columns = list(self.inventory_tree["columns"])
+        if column_index < 0 or column_index >= len(columns):
+            return None
+        column = columns[column_index]
+        if column not in INVENTORY_EDIT_COLUMN_FIELDS:
+            return None
+        self._set_inventory_bulk_cell(row_id, column)
+        return self._begin_inventory_bulk_edit(force=True)
+
     def _set_inventory_bulk_cell(self, iid: str, column: str) -> None:
         if not iid or column not in INVENTORY_EDIT_COLUMN_FIELDS:
             return
@@ -4061,8 +4077,8 @@ class CardPipelineApp(tk.Tk):
             self._begin_inventory_bulk_edit()
         return "break"
 
-    def _begin_inventory_bulk_edit(self, event: tk.Event | None = None) -> str | None:
-        if not getattr(self, "inventory_bulk_edit_var", None) or not self.inventory_bulk_edit_var.get():
+    def _begin_inventory_bulk_edit(self, event: tk.Event | None = None, force: bool = False) -> str | None:
+        if not force and (not getattr(self, "inventory_bulk_edit_var", None) or not self.inventory_bulk_edit_var.get()):
             return None
         if event is not None and getattr(event, "x", None) is not None:
             self._inventory_bulk_click(event)
@@ -4621,7 +4637,11 @@ class CardPipelineApp(tk.Tk):
         self._show_assignment_explanation_popup(explanation)
 
     def _bind_context_menu(self, widget: tk.Widget, callback) -> None:
-        for sequence in ("<Button-3>", "<Button-2>", "<Control-Button-1>", "<Command-Button-1>"):
+        # Windows/Linux report a physical right click as Button-3. Binding
+        # Ctrl/Command-left-click here made ordinary clicks capable of opening
+        # a context menu when a modifier state leaked into Tk.
+        sequences = ("<Button-2>",) if sys.platform == "darwin" else ("<Button-3>",)
+        for sequence in sequences:
             widget.bind(sequence, callback, add="+")
 
     def _show_comp_context_menu(self, event: tk.Event) -> str:
@@ -13729,6 +13749,12 @@ class CardPipelineApp(tk.Tk):
             if 0 <= column_index < len(columns) and columns[column_index] == "company_pile":
                 self._toggle_company_pile(row_id)
                 return "break"
+        return None
+
+    def _begin_editable_table_click(self, event: tk.Event) -> str | None:
+        if self._handle_table_click(event) == "break":
+            return "break"
+        self._begin_cell_edit(event)
         return None
 
     def _toggle_company_pile(self, row_id: str) -> None:
