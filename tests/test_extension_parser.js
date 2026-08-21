@@ -5,6 +5,8 @@ const vm = require("vm");
 
 const contentPath = path.join(__dirname, "..", "cardladder-autocomp", "extension", "content.js");
 const source = fs.readFileSync(contentPath, "utf8");
+const backgroundPath = path.join(__dirname, "..", "cardladder-autocomp", "extension", "background.js");
+const backgroundSource = fs.readFileSync(backgroundPath, "utf8");
 
 function functionSource(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -20,6 +22,22 @@ function functionSource(name) {
     }
   }
   throw new Error(`Could not extract function ${name}`);
+}
+
+function backgroundFunctionSource(name) {
+  const start = backgroundSource.indexOf(`function ${name}(`);
+  if (start < 0) throw new Error(`Missing background function ${name}`);
+  const bodyStart = backgroundSource.indexOf("{", start);
+  let depth = 0;
+  for (let index = bodyStart; index < backgroundSource.length; index += 1) {
+    const char = backgroundSource[index];
+    if (char === "{") depth += 1;
+    if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return backgroundSource.slice(start, index + 1);
+    }
+  }
+  throw new Error(`Could not extract background function ${name}`);
 }
 
 const parserCode = `
@@ -40,11 +58,19 @@ ${functionSource("escapeRegExp")}
 ${functionSource("visibleTextMatchesCert")}
 ${functionSource("cleanProfileTitle")}
 ${functionSource("extractProfileFromText")}
+${functionSource("shouldAcceptStableResultAfterFreshRetry")}
+${backgroundFunctionSource("isRecoverableResultWaitFailure")}
+${backgroundFunctionSource("profileIdFromPageUrl")}
+${backgroundFunctionSource("isBareProfileIdTitle")}
 globalThis.parseCompChunk = parseCompChunk;
 globalThis.sourceLineMatch = sourceLineMatch;
 globalThis.parseMoneyValue = parseMoneyValue;
 globalThis.visibleTextMatchesCert = visibleTextMatchesCert;
 globalThis.extractProfileFromText = extractProfileFromText;
+globalThis.shouldAcceptStableResultAfterFreshRetry = shouldAcceptStableResultAfterFreshRetry;
+globalThis.isRecoverableResultWaitFailure = isRecoverableResultWaitFailure;
+globalThis.profileIdFromPageUrl = profileIdFromPageUrl;
+globalThis.isBareProfileIdTitle = isBareProfileIdTitle;
 `;
 
 const context = {};
@@ -99,6 +125,41 @@ assert.deepStrictEqual(
     grader: "PSA",
     title: "2025 Topps Chrome X Cactus Jack 15 Aaron Judge Gold Refractor",
   },
+);
+assert.strictEqual(
+  context.shouldAcceptStableResultAfterFreshRetry({ cardTitle: "", allowStableResultAfterFreshRetry: true }),
+  true,
+);
+assert.strictEqual(
+  context.shouldAcceptStableResultAfterFreshRetry({ cardTitle: "Mega Venusaur", allowStableResultAfterFreshRetry: true }),
+  false,
+);
+assert.strictEqual(
+  context.isRecoverableResultWaitFailure({
+    status: "error",
+    error: "Card Ladder did not load a new matching result after submit.",
+    pageUrl: "https://app.cardladder.com/sales-history?filters=grader%3Apsa%7CprofileId%3Apsa-12168705",
+  }),
+  true,
+);
+assert.strictEqual(
+  context.isRecoverableResultWaitFailure({
+    status: "error",
+    error: "Card Ladder did not load a new matching result after submit.",
+    pageUrl: "https://app.cardladder.com/sales-history",
+  }),
+  false,
+);
+assert.strictEqual(
+  context.profileIdFromPageUrl(
+    "https://app.cardladder.com/sales-history?filters=grader%3Apsa%7Cgrade%3Ag8%7CprofileId%3Apsa-6029173",
+  ),
+  "psa-6029173",
+);
+assert.strictEqual(context.isBareProfileIdTitle("psa-6029173", "PSA-6029173"), true);
+assert.strictEqual(
+  context.isBareProfileIdTitle("2021 Pokemon Swsh Black Star Promo #136 Mimikyu-Holo", "psa-6029173"),
+  false,
 );
 
 console.log("extension parser regression ok");
