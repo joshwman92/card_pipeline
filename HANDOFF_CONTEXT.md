@@ -37,6 +37,9 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
 
 ## Latest Completed Work
 
+- Create now shows the same non-editable bottom `TOTAL` row as Comp, summing visible Purchase, Card Ladder, Comps, CY Estimate, and Est. Payout columns when those columns are present.
+- Payout history now supports explicit manual paid-payout markers with `manual_paid_adjustment` and `manual_paid_amount`, so a historical paid amount can appear in the payout history popup without adding a fake profit/sale row to `profit_ledger.json`. Live Team L.U.C.A.S was repaired by removing the bogus Tyler Hamlin `Manual paid Tyler payout adjustment` profit row and preserving a `$3,000` paid marker only.
+- Team and Personal L.U.C.A.S can now stay open while using Card Ladder comping. Team keeps bridge port `8765`; Personal/Michael defaults to `8766` unless an explicit `LUCAS_MOBILE_PORT` or `mobile_port` setting is supplied, and the bridge can fall forward through the helper's known port range if a port is already occupied.
 - Windows synced the latest Mac People Rules/network payout semantics through Mac `691eee9`: People Rules now uses `Person`, supports blank Sheet Type rows with `Balance Share %` for team profit-share payouts, keeps Seller Rate/Deduction rows tied to active Sheet Types, defaults blank seller min/max bounds to `$0` and `$1,000,000,000`, and prevents balance-share-only rows from classifying that person as a seller source. Team payouts now use each person's balance-share rule when present and otherwise default to 50%.
 - Windows synced recent shared Mac desktop/general fixes: Profit supports right-click `Edit Expense`; sold-from-inventory profit rows with the same stable cert/item id can update stale sale/date/purchase data instead of being ignored; raw inventory keys include source-sheet namespace; received/incoming inventory sync de-dupes raw item/title duplicates while still generating missing raw IDs; Home right-click moves to Received sync inventory immediately; raw create/reload keeps blank graders instead of defaulting to PSA; Inventory metric text no longer clips. Covered by the full `tests.test_shared_workflows` suite.
 - Comp now exposes a green `Update Best Company/Payouts` button for the currently loaded incoming/working sheet rows, plus right-click `Update Best Company/Payout` for selected line items. These recalculate assignment fields only; users still click `Save Back to Source Sheet` to persist changes.
@@ -143,9 +146,9 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
 - Home right-click delete for incoming/working/received sheets includes a confirmation prompt.
 - Comping no longer recalculates assignments on load. Assignment recalculates only for rows involved in the user-chosen comp run or when explicitly needed.
 - Create now has `Manual Entry` mode. Use the `+ Add row` line in the Create table, then double-click cells to edit. The extra toolbar button was removed.
-- Card Ladder recovery note, 2026-06-17: known-good helper version is `2026-07-21-visible-cert-result-v24`. The verified CGC grader test opens the cert modal, uses trusted debugger clicks only when synthetic clicks fail, selects CGC, and leaves the modal open. Do not restore blind guessed grader-option coordinates; they closed/submitted the modal.
+- Card Ladder recovery note, 2026-06-17: known-good helper version is `2026-08-15-generic-title-settle-v26`. The verified CGC grader test opens the cert modal, uses trusted debugger clicks only when synthetic clicks fail, selects CGC, and leaves the modal open. Do not restore blind guessed grader-option coordinates; they closed/submitted the modal.
 
-- Card Ladder helper update, 2026-07-21: current helper version is `2026-07-21-visible-cert-result-v24`. It preserves the v22 CGC/trusted-click behavior, keeps the v23 one-time retry when the first queued cert stays on a previous Card Ladder result page after submit, and treats a page as loaded when the requested cert is visibly present even if the Card Ladder URL/value text is slow or unchanged.
+- Card Ladder helper update, 2026-07-21: current helper version is `2026-08-15-generic-title-settle-v26`. It preserves the v22 CGC/trusted-click behavior, keeps the v23 one-time retry when the first queued cert stays on a previous Card Ladder result page after submit, and treats a page as loaded when the requested cert is visibly present even if the Card Ladder URL/value text is slow or unchanged.
 
 ## Platform Split
 
@@ -287,9 +290,9 @@ Common gotchas:
 
 - User must be logged into Card Ladder in the Chrome profile where the unpacked extension is loaded.
 - Old unpacked extension versions should be removed or disabled.
-- Current extension/background version: `2026-07-21-visible-cert-result-v24`.
-- Current content-script version: `2026-07-21-visible-cert-result-v24`.
-- Current bridge expected helper version: `2026-07-21-visible-cert-result-v24`.
+- Current extension/background version: `2026-08-15-generic-title-settle-v26`.
+- Current content-script version: `2026-08-15-generic-title-settle-v26`.
+- Current bridge expected helper version: `2026-08-15-generic-title-settle-v26`.
 - App warns if the extension version seen by the bridge is stale.
 - No-results pages preserve the Card Ladder title when available.
 - Old partial Card Ladder captures request extension reload/manual review.
@@ -335,5 +338,5 @@ python -c "import app; root = app.CardPipelineApp(); root.update_idletasks(); ro
 Tell a new chat:
 
 ```text
-Work in C:\Users\User\Documents\Codex\2026-06-04\card_pipeline for Windows and C:\Users\User\Documents\Codex\2026-06-13\card-pipeline-mac for Mac. Read HANDOFF_CONTEXT.md first. Current known-good Card Ladder helper is 2026-07-21-visible-cert-result-v24. Do not reintroduce blind guessed grader-option coordinates; v22 fixed CGC by opening the cert modal, avoiding blind option clicks, re-preparing the modal if synthetic selection closes it, then using trusted chrome.debugger clicks on the visible grader bar only as fallback. The debugger banner is expected during trusted fallback because Chrome owns that UI. Windows has no CourtYard automation; Mac keeps CY automation. Keep main and master in both repos pushed.
+Work in C:\Users\User\Documents\Codex\2026-06-04\card_pipeline for Windows and C:\Users\User\Documents\Codex\2026-06-13\card-pipeline-mac for Mac. Read HANDOFF_CONTEXT.md first. Current known-good Card Ladder helper is 2026-08-15-generic-title-settle-v26. Do not reintroduce blind guessed grader-option coordinates; v22 fixed CGC by opening the cert modal, avoiding blind option clicks, re-preparing the modal if synthetic selection closes it, then using trusted chrome.debugger clicks on the visible grader bar only as fallback. The debugger banner is expected during trusted fallback because Chrome owns that UI. Windows has no CourtYard automation; Mac keeps CY automation. Keep main and master in both repos pushed.
 ```

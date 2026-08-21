@@ -34,7 +34,7 @@ from ebay_api import (
 )
 
 BRIDGE_VERSION = "2026-07-21-cardladder-visible-cert-partial-v25"
-EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-07-21-visible-cert-partial-v25"
+EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-08-15-generic-title-settle-v26"
 EXPECTED_CARDLADDER_MANIFEST_VERSION = "0.1.7"
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "work" / "cardladder-bridge"
 DEBUG_LOG = DEBUG_DIR / "bridge.log"
@@ -593,6 +593,14 @@ class BridgeState:
         filtered_comp_count = raw_comp_count - len(comps)
         generic_profile_reason = generic_profile_review_reason(profile_title, profile_grader, profile_grade, ocr)
         if result_status == "partial_comp_capture":
+            result_extension_version = str(result.get("extensionVersion") or "")
+            if result_extension_version and result_extension_version != EXPECTED_CARDLADDER_EXTENSION_VERSION:
+                row.status = "Reload Card Ladder extension"
+                row.notes = (
+                    "The Card Ladder result came from an older Card Ladder extension that cannot "
+                    "reliably capture partial comp results. Reload the bundled Card Ladder Auto-Comp extension."
+                )
+                return
             if profile_title:
                 row.card_title = build_card_title(profile_title, profile_grader, profile_grade)
                 fill_missing_category_from_title(row)
@@ -638,11 +646,11 @@ class BridgeState:
             return
         if generic_profile_reason:
             row.card_title = ""
-            row.card_ladder_value = None
-            row.card_ladder_comps_average = None
-            row.card_ladder_comps = ""
+            row.card_ladder_value = value
+            row.card_ladder_comps_average = comp_price(comps, self.comp_strategy, self.comp_low_outlier_pct)
+            row.card_ladder_comps = format_comps(comps, self.comp_strategy, self.comp_low_outlier_pct)
             row.card_ladder_screenshot = str(ocr.get("debugImage") or "")
-            row.status = "Card Ladder review"
+            row.status = "Card Ladder title review"
             row.notes = generic_profile_reason
             return
         if profile_title:

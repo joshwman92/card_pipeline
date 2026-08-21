@@ -320,8 +320,9 @@ class SharedStateTests(unittest.TestCase):
             },
         )
         self.assertEqual(row.card_title, "")
-        self.assertIsNone(row.card_ladder_value)
-        self.assertEqual(row.status, "Card Ladder review")
+        self.assertEqual(row.card_ladder_value, 60)
+        self.assertEqual(row.card_ladder_comps_average, 60)
+        self.assertEqual(row.status, "Card Ladder title review")
         self.assertIn("overly broad profile title", row.notes)
 
     def test_google_ssl_context_uses_certifi_when_no_cert_env_is_set(self) -> None:
@@ -399,6 +400,11 @@ class SharedStateTests(unittest.TestCase):
         self.assertTrue(app.is_personal_lucas_profile({"pipeline_root": "G:/My Drive/LUCAS_PERSONAL"}, Path("lucas_settings.json")))
         self.assertTrue(app.is_personal_lucas_profile({"profile": "personal"}, Path("lucas_settings.json")))
         self.assertFalse(app.is_personal_lucas_profile({"pipeline_root": "G:/My Drive/CARD_PIPELINE"}, Path("lucas_settings.json")))
+        self.assertEqual(app.mobile_bridge_port({"profile": "personal"}), 8766)
+        self.assertEqual(app.mobile_bridge_port({"pipeline_root": "G:/My Drive/LUCAS_PERSONAL"}), 8766)
+        self.assertEqual(app.mobile_bridge_port({"pipeline_root": "G:/My Drive/CARD_PIPELINE"}), 8765)
+        with patch.dict(os.environ, {"LUCAS_MOBILE_PORT": "8799"}):
+            self.assertEqual(app.mobile_bridge_port({"profile": "personal"}), 8799)
 
         class PersonalDummy:
             _is_personal_lucas = app.CardPipelineApp._is_personal_lucas
@@ -1288,6 +1294,11 @@ class GoogleSheetCacheTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             self.assertEqual(cache_path.read_text(encoding="utf-8").strip(), "Football $20-$200 95%")
 
+    def test_bundled_cardladder_helper_version_matches_bridge_expectation(self) -> None:
+        background_js = (ROOT / "cardladder-autocomp" / "extension" / "background.js").read_text(encoding="utf-8")
+
+        self.assertIn(f'CARDLADDER_BACKGROUND_VERSION = "{app.EXPECTED_CARDLADDER_EXTENSION_VERSION}"', background_js)
+
     def test_bridge_poll_keeps_google_keep_sources_private(self) -> None:
         bridge = app.BridgeState()
         bridge.register_keep_note_sources(
@@ -1467,10 +1478,10 @@ class AssignmentEngineTests(unittest.TestCase):
 
         bridge._apply_cardladder_result_to_row(row, result)
 
-        self.assertEqual(row.status, "Card Ladder review")
+        self.assertEqual(row.status, "Card Ladder title review")
         self.assertEqual(row.card_title, "")
-        self.assertIsNone(row.card_ladder_value)
-        self.assertIsNone(row.card_ladder_comps_average)
+        self.assertEqual(row.card_ladder_value, 615)
+        self.assertEqual(row.card_ladder_comps_average, 638.5)
         self.assertIn("overly broad", row.notes)
 
     def test_cardladder_result_fills_blank_sport_from_profile_title(self) -> None:
@@ -2787,9 +2798,9 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(info["remaining"], 0.0)
         self.assertEqual(info["unallocated_absorbed"], 3000.0)
 
-    def test_comp_total_row_sums_value_columns(self) -> None:
+    def test_value_total_row_sums_create_and_comp_value_columns(self) -> None:
         class Dummy:
-            _comp_purchase_total_row_values = app.CardPipelineApp._comp_purchase_total_row_values
+            _value_total_row_values = app.CardPipelineApp._value_total_row_values
 
         rows = [
             WorkbookRow(excel_row=2, cert_number="1", grader="PSA", card_title="One", existing_value=10, card_ladder_value=15, card_ladder_comps_average=12, cy_value=11, estimated_payout=9),
@@ -2797,7 +2808,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             WorkbookRow(excel_row=4, cert_number="3", grader="PSA", card_title="Three", existing_value=None),
         ]
 
-        values = Dummy()._comp_purchase_total_row_values(
+        values = Dummy()._value_total_row_values(
             ("excel_row", "card_title", "purchase_price", "card_ladder_value", "card_ladder_comps_average", "cy_value", "estimated_payout"),
             rows,
         )
@@ -4246,6 +4257,40 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertEqual(items[0]["payout_balance"], 50.0)
         self.assertEqual(sum(float(item["payout_balance"]) for item in items), 60.0)
 
+    def test_payout_history_includes_manual_paid_adjustment_without_profit_row(self) -> None:
+        class Dummy:
+            _payout_history_items_for_person = app.CardPipelineApp._payout_history_items_for_person
+
+            def _payout_sheet_items(self):
+                return [
+                    {
+                        "key": "Sold|Tyler Hamlin|Open.xlsx",
+                        "person": "Tyler Hamlin",
+                        "name": "Open.xlsx",
+                        "stage": "Sold",
+                        "paid": False,
+                        "row_count": 1,
+                        "net_profit_total": 100,
+                        "payout_balance": 50,
+                    }
+                ]
+
+            home_sheet_markers = {
+                "SoldCard|Tyler Hamlin|manual-tyler-paid-payout-20260815-3000|general sold|2026-08-15|manual paid payout adjustment|tyler hamlin general sold": {
+                    "assigned_person": "Tyler Hamlin",
+                    "paid": True,
+                    "paid_at": "2026-08-15T19:24:32",
+                    "manual_paid_adjustment": True,
+                    "manual_paid_amount": 3000.0,
+                }
+            }
+
+        items = Dummy()._payout_history_items_for_person("Tyler Hamlin")
+
+        self.assertEqual(items[0]["name"], "Total paid at 2026-08-15T19:24:32")
+        self.assertEqual(items[0]["payout_balance"], 3000.0)
+        self.assertEqual(items[1]["name"], "Open.xlsx")
+
     def test_save_payout_marker_blocks_pending_seller_paid(self) -> None:
         class PayoutDummy:
             _split_home_sheet_key = app.CardPipelineApp._split_home_sheet_key
@@ -5424,6 +5469,69 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 self.assertEqual(ledger[0]["profit"], 600.0)
                 self.assertEqual(ledger[0]["date_added"], "2026-08-07")
                 self.assertEqual(ledger[0]["recorded_by"], "Tester")
+            finally:
+                app.CARD_PIPELINE_DIR = old_pipeline
+                app.PROFIT_LEDGER_PATH = old_ledger
+
+    def test_record_profit_sales_keeps_distinct_inventory_sales_with_corrected_cert(self) -> None:
+        class ProfitDummy:
+            _load_profit_ledger = app.CardPipelineApp._load_profit_ledger
+            _save_profit_ledger = app.CardPipelineApp._save_profit_ledger
+            _profit_record_key = app.CardPipelineApp._profit_record_key
+            _profit_record_identity_keys = app.CardPipelineApp._profit_record_identity_keys
+            _money_value = app.CardPipelineApp._money_value
+            _normalize_profit_record = app.CardPipelineApp._normalize_profit_record
+            _update_duplicate_inventory_sale_profit_record = app.CardPipelineApp._update_duplicate_inventory_sale_profit_record
+            record_profit_sales = app.CardPipelineApp.record_profit_sales
+            refresh_profit_tab = lambda self: None
+
+        with TemporaryDirectory() as tmp:
+            old_pipeline = app.CARD_PIPELINE_DIR
+            old_ledger = app.PROFIT_LEDGER_PATH
+            app.CARD_PIPELINE_DIR = Path(tmp)
+            app.PROFIT_LEDGER_PATH = Path(tmp) / "profit_ledger.json"
+            dummy = ProfitDummy()
+            dummy.lucas_identity = {"display_name": "Tester", "machine": "Test"}
+            try:
+                old_sale = dummy._normalize_profit_record(
+                    {
+                        "assigned_person": "Mikey",
+                        "cert_number": "2668770",
+                        "grader": "SGC",
+                        "card_title": "2019 Topps Chrome 1 Shohei Ohtani SGC 10",
+                        "company": "FANATICS",
+                        "source_sheet": "COMPLETE_GRADED_INVENTORY_ADD_7_7_26.xlsx",
+                        "purchase_price": 120,
+                        "sale_price": 155.31,
+                        "date_added": "2026-08-16",
+                        "status": "Sold from inventory",
+                    }
+                )
+                dummy._save_profit_ledger([old_sale])
+
+                self.assertEqual(
+                    dummy.record_profit_sales(
+                        [
+                            {
+                                "assigned_person": "Mikey",
+                                "cert_number": "2668770",
+                                "grader": "SGC",
+                                "card_title": "2019 Topps Chrome 1 Shohei Ohtani SGC 10",
+                                "company": "FANATICS",
+                                "source_sheet": "COMPLETE_GRADED_INVENTORY_ADD_7_7_26.xlsx",
+                                "inventory_key": "2668770|complete_graded_inventory_add_7_7_26.xlsx|mikey",
+                                "purchase_price": 100,
+                                "sale_price": 190,
+                                "date_added": "2026-08-17",
+                                "status": "Sold from inventory",
+                            }
+                        ]
+                    ),
+                    1,
+                )
+                ledger = [dummy._normalize_profit_record(record) for record in dummy._load_profit_ledger()]
+                self.assertEqual(len(ledger), 2)
+                self.assertEqual(sorted(record["sale_price"] for record in ledger), [155.31, 190.0])
             finally:
                 app.CARD_PIPELINE_DIR = old_pipeline
                 app.PROFIT_LEDGER_PATH = old_ledger
