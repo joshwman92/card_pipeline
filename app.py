@@ -3938,6 +3938,23 @@ class CardPipelineApp(tk.Tk):
         host = mobile_app_host(getattr(self, "app_settings", {}))
         return f"http://{host}:{self.bridge.port}/mobile/{profile}"
 
+    def _ebay_connect_url(self, account: str = "default") -> str:
+        profile = "personal" if self._is_personal_lucas() else "team"
+        public_url = mobile_public_app_url(profile, getattr(self, "app_settings", {}))
+        if public_url:
+            parsed = urllib.parse.urlparse(public_url)
+            base_path = re.sub(r"/mobile/(?:team|personal)/?$", "", parsed.path.rstrip("/"))
+            base = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, base_path, "", "", "")).rstrip("/")
+        else:
+            host = mobile_app_host(getattr(self, "app_settings", {}))
+            base = f"http://{host}:{self.bridge.port}"
+        return f"{base}/ebay/connect?{urllib.parse.urlencode({'profile': profile, 'account': account})}"
+
+    def open_ebay_connection_helper(self) -> None:
+        url = self._ebay_connect_url()
+        webbrowser.open(url)
+        self.events.put(("status", "Opened eBay Connect in browser. Sign in once to link this seller account to LUCAS."))
+
     def _mobile_local_calendar_date(self, value: object) -> str:
         text = str(value or "").strip()
         if not text:
@@ -8801,6 +8818,8 @@ class CardPipelineApp(tk.Tk):
         menu.add_command(label="Working Folder", command=self.choose_working_folder)
         menu.add_separator()
         menu.add_command(label="Recover Sold Ledger", command=self.recover_sold_ledger)
+        menu.add_separator()
+        menu.add_command(label="Connect eBay", command=self.open_ebay_connection_helper)
         try:
             menu.tk_popup(anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height())
         finally:
