@@ -261,7 +261,12 @@ async function waitForResultsPage(row = {}, beforeUrl = "", beforeSignature = ""
       const lateInvalidCertReason = invalidCertToastReason() || invalidCertReasonFromText(document.body.innerText || "");
       if (lateInvalidCertReason) return { status: "invalid_cert", reason: lateInvalidCertReason };
       const settledText = document.body.innerText || "";
-      if (!resultPageChanged(beforeUrl, beforeSignature) && !visibleTextMatchesCert(settledText, row.certNumber) && !profileMatchesRequestedRow(row, settledText)) {
+      if (
+        !resultPageChanged(beforeUrl, beforeSignature)
+        && !visibleTextMatchesCert(settledText, row.certNumber)
+        && !profileMatchesRequestedRow(row, settledText)
+        && !shouldAcceptStableResultAfterFreshRetry(row)
+      ) {
         return { status: "stale_result", reason: "Card Ladder stayed on the previous result page after submit." };
       }
       return { status: "results" };
@@ -301,6 +306,14 @@ function profileMatchesRequestedRow(row = {}, text = "") {
   const profileSet = new Set(profileTokens);
   const matches = requestedTokens.filter((token) => profileSet.has(token)).length;
   return matches >= Math.min(4, Math.ceil(requestedTokens.length * 0.45));
+}
+
+function shouldAcceptStableResultAfterFreshRetry(row) {
+  // A blank source title cannot distinguish two slabs that resolve to the
+  // same Card Ladder profile. After a fresh-page retry, accept the loaded
+  // profile instead of falsely rejecting it as the preceding result.
+  const target = row || {};
+  return Boolean(target.allowStableResultAfterFreshRetry) && !String(target.cardTitle || "").trim();
 }
 
 function meaningfulTitleTokens(value) {
