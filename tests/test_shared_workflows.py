@@ -5972,6 +5972,13 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         dummy.inventory_company_var = FieldVar("Arena Club")
         self.assertEqual([row["cert_number"] for row in dummy._filtered_inventory_records(rows)], ["222"])
 
+        dummy.inventory_company_var = FieldVar("Arena Club|Fanatics")
+        self.assertEqual([row["cert_number"] for row in dummy._filtered_inventory_records(rows)], ["151740304", "222"])
+
+        dummy.inventory_company_var = FieldVar("[")
+        self.assertEqual(dummy._filtered_inventory_records(rows), [])
+        self.assertTrue(dummy.inventory_company_filter_error)
+
     def test_best_company_dropdown_includes_configured_and_current_values(self) -> None:
         class Dummy:
             _best_company_choices = app.CardPipelineApp._best_company_choices
