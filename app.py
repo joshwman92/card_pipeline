@@ -133,6 +133,8 @@ UNASSIGNED_PLAYERS_PATH = CARD_PIPELINE_DIR / "unassigned_players.json"
 PLAYER_OVERRIDES_PATH = CARD_PIPELINE_DIR / "assignment_player_overrides.json"
 SELLER_TERMS_PATH = CARD_PIPELINE_DIR / "ASSIGNMENT RULES" / "seller_terms.csv"
 PERFORMANCE_LOG_PATH = CARD_PIPELINE_DIR / "lucas_performance.log"
+HOME_SUMMARY_CACHE_PATH = CARD_PIPELINE_DIR / "home_summary_cache.json"
+GOOGLE_SHEET_CACHE_MAX_AGE_SECONDS = 5 * 60
 LUCAS_LOGO_PATH = ROOT / "assets" / "lucas.png"
 MIKEYS_CARDS_LOGO_PATH = ROOT / "assets" / "mikeys_cards_logo.png"
 CARDLADDER_EXTENSION_DIR = ROOT / "cardladder-autocomp" / "extension"
@@ -340,7 +342,7 @@ def is_google_sheet_url(value: object) -> bool:
 
 
 def set_pipeline_root(path: Path, working_sheets_dir: Path | None = None) -> None:
-    global CARD_PIPELINE_DIR, WORKING_SHEETS_DIR, INCOMING_SHEETS_DIR, RECEIVED_SHEETS_DIR, ARCHIVED_SHEETS_DIR, COMPANY_SHEETS_DIR, SHEET_MARKERS_PATH, WEEKLY_COMPANY_SHEETS_PATH, PROFIT_LEDGER_PATH, INVENTORY_LEDGER_PATH, INVENTORY_PHOTOS_DIR, INVENTORY_PHOTO_STATE_PATH, ACTIVITY_LOG_PATH, MOBILE_ACTION_LOG_PATH, UNASSIGNED_PLAYERS_PATH, PLAYER_OVERRIDES_PATH, SELLER_TERMS_PATH, PERFORMANCE_LOG_PATH
+    global CARD_PIPELINE_DIR, WORKING_SHEETS_DIR, INCOMING_SHEETS_DIR, RECEIVED_SHEETS_DIR, ARCHIVED_SHEETS_DIR, COMPANY_SHEETS_DIR, SHEET_MARKERS_PATH, WEEKLY_COMPANY_SHEETS_PATH, PROFIT_LEDGER_PATH, INVENTORY_LEDGER_PATH, INVENTORY_PHOTOS_DIR, INVENTORY_PHOTO_STATE_PATH, ACTIVITY_LOG_PATH, MOBILE_ACTION_LOG_PATH, UNASSIGNED_PLAYERS_PATH, PLAYER_OVERRIDES_PATH, SELLER_TERMS_PATH, PERFORMANCE_LOG_PATH, HOME_SUMMARY_CACHE_PATH
     CARD_PIPELINE_DIR = Path(path).expanduser()
     WORKING_SHEETS_DIR = Path(working_sheets_dir).expanduser() if working_sheets_dir else CARD_PIPELINE_DIR / "WORKING SHEETS"
     INCOMING_SHEETS_DIR = CARD_PIPELINE_DIR / "INCOMING SHEETS"
@@ -359,6 +361,7 @@ def set_pipeline_root(path: Path, working_sheets_dir: Path | None = None) -> Non
     PLAYER_OVERRIDES_PATH = CARD_PIPELINE_DIR / "assignment_player_overrides.json"
     SELLER_TERMS_PATH = CARD_PIPELINE_DIR / "ASSIGNMENT RULES" / "seller_terms.csv"
     PERFORMANCE_LOG_PATH = CARD_PIPELINE_DIR / "lucas_performance.log"
+    HOME_SUMMARY_CACHE_PATH = CARD_PIPELINE_DIR / "home_summary_cache.json"
 
 
 def set_pipeline_from_working_dir(path: Path) -> None:
@@ -825,6 +828,7 @@ class CardPipelineApp(tk.Tk):
         self.review_sources: dict[int, str] = {}
         self.review_sheet_sources: dict[int, str] = {}
         self.incoming_cert_index: dict[str, dict[str, object]] = {}
+        self.startup_sheet_index_loading = False
         self.comp_output_saved = True
         self.lucas_identity = local_identity(SETTINGS_PATH)
         self.app_settings = load_app_settings()
@@ -918,8 +922,8 @@ class CardPipelineApp(tk.Tk):
         self.home_sheet_kind = tk.StringVar(value="Incoming")
         self.home_sheet_paths: dict[str, dict[str, Path]] = {"Incoming": {}, "Working": {}, "Received": {}}
         self.home_sheet_summaries: dict[str, dict[str, object]] = {}
-        self.home_summary_cache: dict[str, dict[str, object]] = {}
         self.home_summary_cache_lock = threading.Lock()
+        self.home_summary_cache: dict[str, dict[str, object]] = self._load_home_summary_cache()
         self.home_sheet_markers: dict[str, dict[str, object]] = self._load_sheet_markers()
         self.deleted_sheet_marker_keys: set[str] = set()
         self.home_selected_sheet_key = ""
@@ -8874,7 +8878,7 @@ class CardPipelineApp(tk.Tk):
             colors.get("activebackground"),
         )
 
-    def refresh_home(self, reconcile_accounted: bool = True) -> None:
+    def refresh_home(self, reconcile_accounted: bool = True, archive_received: bool = True) -> None:
         perf_start = time.perf_counter()
         self.home_sheet_paths = {"Incoming": {}, "Working": {}, "Received": {}}
         self.home_sheet_summaries = {}
@@ -8887,12 +8891,13 @@ class CardPipelineApp(tk.Tk):
         conflict_files = self._shared_conflict_files()
         if conflict_files:
             errors.append(f"Shared conflicts: {', '.join(path.name for path in conflict_files[:3])}")
-        try:
-            archived = self._archive_eligible_received_sheets()
-            if archived:
-                archived_count = len(archived)
-        except Exception as error:
-            errors.append(f"Archive: {error}")
+        if archive_received:
+            try:
+                archived = self._archive_eligible_received_sheets()
+                if archived:
+                    archived_count = len(archived)
+            except Exception as error:
+                errors.append(f"Archive: {error}")
         if reconcile_accounted:
             try:
                 reconciliation = self._reconcile_accounted_home_sheets()
@@ -8944,11 +8949,44 @@ class CardPipelineApp(tk.Tk):
         record_performance_event(
             "home.refresh",
             perf_start,
-            f"sheets={total_sheets} summaries={len(self.home_sheet_summaries)} archived={archived_count} reconciled={reconciled_count} duplicate_warnings={len(duplicate_warnings)} duplicate_notices={len(duplicate_notices)} reconcile_accounted={reconcile_accounted} errors={len(errors)}",
+            f"sheets={total_sheets} summaries={len(self.home_sheet_summaries)} archived={archived_count} reconciled={reconciled_count} duplicate_warnings={len(duplicate_warnings)} duplicate_notices={len(duplicate_notices)} reconcile_accounted={reconcile_accounted} archive_received={archive_received} errors={len(errors)}",
         )
 
     def _home_summary_cache_key(self, path: Path) -> str:
         return os.path.normcase(str(path.resolve()))
+
+    def _load_home_summary_cache(self) -> dict[str, dict[str, object]]:
+        try:
+            raw = json.loads(HOME_SUMMARY_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        entries = raw.get("entries") if isinstance(raw, dict) else None
+        if not isinstance(entries, dict):
+            return {}
+        return {
+            str(key): dict(value)
+            for key, value in entries.items()
+            if isinstance(key, str) and isinstance(value, dict) and isinstance(value.get("summary"), dict)
+        }
+
+    def _save_home_summary_cache(self) -> None:
+        with self.home_summary_cache_lock:
+            entries = {
+                key: {
+                    "mtime_ns": value.get("mtime_ns"),
+                    "size": value.get("size"),
+                    "summary": {
+                        summary_key: summary_value
+                        for summary_key, summary_value in dict(value.get("summary") or {}).items()
+                        if summary_key != "path"
+                    },
+                }
+                for key, value in self.home_summary_cache.items()
+            }
+        try:
+            atomic_write_json(HOME_SUMMARY_CACHE_PATH, {"entries": entries})
+        except Exception:
+            return
 
     def _summarize_home_workbook_cached(self, path: Path) -> dict[str, object]:
         stat = path.stat()
@@ -8968,6 +9006,9 @@ class CardPipelineApp(tk.Tk):
             for key in list(self.home_summary_cache):
                 if key not in live_keys:
                     self.home_summary_cache.pop(key, None)
+        save_cache = getattr(self, "_save_home_summary_cache", None)
+        if callable(save_cache):
+            save_cache()
 
     def _accounted_source_key(self, value: object) -> str:
         return Path(str(value or "")).name.strip().lower()
@@ -9088,12 +9129,15 @@ class CardPipelineApp(tk.Tk):
         return sorted({path for path in found if path.name.lower() != PROFIT_LEDGER_PATH.name.lower() and path.name.lower() != SHEET_MARKERS_PATH.name.lower()})
 
     def _start_startup_refresh(self) -> None:
+        if self.startup_sheet_index_loading:
+            return
+        self.startup_sheet_index_loading = True
         self.status_var.set("Loading sheet lists...")
         thread = threading.Thread(target=self._startup_refresh_worker, daemon=True)
         thread.start()
 
     def _refresh_startup_google_sheet_caches(self) -> dict[str, object]:
-        result = {"refreshed": 0, "errors": []}
+        result = {"refreshed": 0, "cached": 0, "errors": []}
         sources = self._saved_google_sheet_sources()
         if not sources:
             return result
@@ -9107,6 +9151,9 @@ class CardPipelineApp(tk.Tk):
                         continue
                     try:
                         output_path = path_from_source_value(path, ASSIGNMENT_CONFIG_PATH.parent)
+                        if self._google_sheet_cache_is_fresh(output_path):
+                            result["cached"] = int(result["cached"]) + 1
+                            continue
                         export_google_sheet_to_xlsx(url, output_path, interactive=False)
                         result["refreshed"] = int(result["refreshed"]) + 1
                     except Exception as error:
@@ -9114,6 +9161,12 @@ class CardPipelineApp(tk.Tk):
         except Exception as error:
             result["errors"].append(str(error))
         return result
+
+    def _google_sheet_cache_is_fresh(self, path: Path) -> bool:
+        try:
+            return path.is_file() and (time.time() - path.stat().st_mtime) < GOOGLE_SHEET_CACHE_MAX_AGE_SECONDS
+        except OSError:
+            return False
 
     def _refresh_keep_source_registry(self) -> None:
         try:
@@ -9295,7 +9348,7 @@ class CardPipelineApp(tk.Tk):
         record_performance_event(
             "startup.google_sheet_cache",
             google_start,
-            f"refreshed={google_cache_result.get('refreshed') or 0} errors={len(google_cache_result.get('errors') or [])}",
+            f"refreshed={google_cache_result.get('refreshed') or 0} cached={google_cache_result.get('cached') or 0} errors={len(google_cache_result.get('errors') or [])}",
         )
         payload["google_sheet_cache"] = google_cache_result
         errors.extend(google_cache_result.get("errors") or [])
@@ -9412,6 +9465,7 @@ class CardPipelineApp(tk.Tk):
 
     def _apply_startup_refresh(self, payload: dict[str, object]) -> None:
         perf_start = time.perf_counter()
+        self.startup_sheet_index_loading = False
         self.incoming_sheet_paths = dict(payload.get("incoming_paths") or {})
         self.working_sheet_paths = dict(payload.get("working_paths") or {})
         self._populate_comp_sheet_list()
@@ -13009,6 +13063,17 @@ class CardPipelineApp(tk.Tk):
                 self.review_status.set(f"Matched {len(matches)} incoming row(s) for {label}. Ready for next scan.")
                 self._arm_review_scanner()
                 return
+            if raw_input and getattr(self, "startup_sheet_index_loading", False):
+                pending_row = {"source": "Receive Search", "notes": "Received"}
+                if raw_input.upper().startswith("RAW-"):
+                    pending_row["item_id"] = raw_input
+                else:
+                    pending_row["card_title"] = raw_input
+                self._append_review_rows([pending_row])
+                self.review_scan_cert.set("")
+                self.review_status.set("Received scan queued. It will match when sheet indexing finishes. Ready for next scan.")
+                self._arm_review_scanner()
+                return
             self.review_status.set("No cert, raw ID, or matching incoming card found in the current index. Click Refresh Incoming Index if you expected a match.")
             self._arm_review_scanner()
             return
@@ -13023,7 +13088,10 @@ class CardPipelineApp(tk.Tk):
             }
         ])
         self.review_scan_cert.set("")
-        self.review_status.set(f"Received {cert}. Ready for next scan.")
+        if getattr(self, "startup_sheet_index_loading", False):
+            self.review_status.set(f"Received {cert}. Matching it when sheet indexing finishes. Ready for next scan.")
+        else:
+            self.review_status.set(f"Received {cert}. Ready for next scan.")
         self._arm_review_scanner()
 
     def add_review_photos(self) -> None:
@@ -13113,7 +13181,7 @@ class CardPipelineApp(tk.Tk):
                 and not str(match.get("best_company") or "").strip()
                 and match.get("estimated_payout") is None
             )
-            if cert and stale_assignment_match and not refreshed_incoming_index:
+            if cert and stale_assignment_match and not refreshed_incoming_index and not getattr(self, "startup_sheet_index_loading", False):
                 self.refresh_incoming_index()
                 refreshed_incoming_index = True
                 match = self._incoming_match(cert)
@@ -13134,8 +13202,9 @@ class CardPipelineApp(tk.Tk):
                 status = str(row.get("status") or "Received")
             elif cert or str(row.get("item_id") or "").strip():
                 sheet_source = str(row.get("sheet_source") or "CHECKING INDEX")
-                status = str(row.get("status") or "Checking incoming index")
-                missing_index_retry = True
+                startup_loading = getattr(self, "startup_sheet_index_loading", False)
+                status = str(row.get("status") or ("Received - matching incoming sheets" if startup_loading else "Checking incoming index"))
+                missing_index_retry = not startup_loading
             else:
                 sheet_source = str(row.get("sheet_source") or "NO SHEET FOUND")
                 status = str(row.get("status") or "Needs raw match")
@@ -13410,7 +13479,7 @@ class CardPipelineApp(tk.Tk):
                     row.estimated_payout = match.get("estimated_payout")
                 self._ensure_receive_row_assignment(row)
                 row.status = "Received"
-            elif row.status == "Received":
+            elif row.status in {"Received", "Received - matching incoming sheets"}:
                 row.status = "Received - no incoming match"
 
     def _ensure_receive_row_assignment(self, row: WorkbookRow) -> None:
@@ -13489,27 +13558,35 @@ class CardPipelineApp(tk.Tk):
             self.review_status.set("Select receive or assignment rows to delete.")
 
     def mark_review_received_in_sheets(self) -> None:
+        perf_start = time.perf_counter()
         certs = {scan_to_cert(row.cert_number) for row in self.review_rows if scan_to_cert(row.cert_number)}
         row_refs = {row_ref for row in self.review_rows if not scan_to_cert(row.cert_number) for row_ref in [self._receive_row_ref(row)] if row_ref}
         if not certs and not row_refs:
             messagebox.showinfo("No received cards", "Scan/load certed cards or load/match raw rows in Receive before marking sheets.")
             return
-        paths: list[Path] = []
+        available_paths: list[Path] = []
         errors: list[str] = []
         for directory in (INCOMING_SHEETS_DIR, WORKING_SHEETS_DIR):
             try:
                 directory.mkdir(parents=True, exist_ok=True)
-                paths.extend(sorted(directory.glob("*.xlsx"), key=lambda path: path.name.lower()))
+                available_paths.extend(sorted(directory.glob("*.xlsx"), key=lambda path: path.name.lower()))
             except Exception as error:
                 errors.append(f"{directory}: {error}")
-        if not paths:
+        if not available_paths:
             messagebox.showinfo("No sheets found", "No incoming or working sheets were found to update.")
             return
+        paths = self._receive_mark_target_paths(available_paths, certs, row_refs)
         marked_certs: set[str] = set()
         marked_row_refs: set[tuple[str, str, int]] = set()
         try:
             with shared_lock(CARD_PIPELINE_DIR, "receive-company-sheets", self.lucas_identity):
+                mark_started = time.perf_counter()
                 result = mark_received_in_workbooks(paths, certs, row_refs)
+                record_performance_event(
+                    "receive.mark_workbooks",
+                    mark_started,
+                    f"target_sheets={len(paths)} available_sheets={len(available_paths)} rows={len(certs) + len(row_refs)}",
+                )
                 errors.extend(result.get("errors") or [])
                 rows_marked = int(result.get("rows_marked") or 0)
                 files_updated = int(result.get("files_updated") or 0)
@@ -13557,14 +13634,18 @@ class CardPipelineApp(tk.Tk):
                             for row in inventory_rows
                         ]
                         inventory_rows_added = self.add_inventory_records(inventory_records)
+                move_started = time.perf_counter()
                 moved_received = self._move_fully_received_sheets_to_received(paths)
+                record_performance_event("receive.move_fully_received", move_started, f"target_sheets={len(paths)} moved={len(moved_received)}")
                 if moved_received:
                     self._save_sheet_markers()
         except Exception as error:
             messagebox.showerror("Shared folder busy", str(error))
             self.status_var.set(f"Receive update failed: {error}")
             return
-        self.refresh_incoming_index()
+        self._drop_marked_receive_rows_from_index(marked_certs, marked_row_refs)
+        for sheet_name in moved_received:
+            self._drop_sheet_from_incoming_index(sheet_name)
         self.refresh_working_sheets()
         self.refresh_received_sheets()
         cleared_receive_rows = self._clear_received_rows(marked_certs, marked_row_refs)
@@ -13582,7 +13663,7 @@ class CardPipelineApp(tk.Tk):
             self.status_var.set(f"Added {inventory_rows_added} received card(s) to active inventory.")
         elif company_rows_missing_company:
             self.status_var.set(f"{company_rows_missing_company} checked company pile card(s) had no Best Company.")
-        self.refresh_home()
+        self.refresh_home(reconcile_accounted=False, archive_received=False)
         summary_lines = [
             f"Marked rows: {rows_marked}",
             f"Updated sheet files: {files_updated}",
@@ -13621,6 +13702,62 @@ class CardPipelineApp(tk.Tk):
                 "warnings": errors[:8],
             },
         )
+        record_performance_event(
+            "receive.mark_total",
+            perf_start,
+            f"target_sheets={len(paths)} available_sheets={len(available_paths)} marked={rows_marked} moved={len(moved_received)}",
+            force=True,
+        )
+
+    def _receive_mark_target_paths(
+        self,
+        available_paths: list[Path],
+        certs: set[str],
+        row_refs: set[tuple[str, str, int]],
+    ) -> list[Path]:
+        target_names: set[str] = set()
+        has_unresolved_target = False
+        for row in self.review_rows:
+            cert = scan_to_cert(row.cert_number)
+            row_ref = self._receive_row_ref(row) if not cert else None
+            if cert not in certs and row_ref not in row_refs:
+                continue
+            source_name = Path(str(self.review_sheet_sources.get(row.excel_row, "") or "")).name
+            if source_name and source_name.upper() != "NO SHEET FOUND":
+                target_names.add(source_name.lower())
+            else:
+                has_unresolved_target = True
+        if has_unresolved_target or not target_names:
+            return list(available_paths)
+        targets = [path for path in available_paths if path.name.lower() in target_names]
+        return targets or list(available_paths)
+
+    def _drop_marked_receive_rows_from_index(
+        self,
+        marked_certs: set[str],
+        marked_row_refs: set[tuple[str, str, int]],
+    ) -> None:
+        index = getattr(self, "incoming_cert_index", None)
+        if not isinstance(index, dict) or not (marked_certs or marked_row_refs):
+            return
+        normalized_refs = {
+            (str(sheet).strip().lower(), str(tab).strip().lower(), int(row_number))
+            for sheet, tab, row_number in marked_row_refs
+        }
+        kept: dict[str, dict[str, object]] = {}
+        for key, candidate in index.items():
+            candidate_cert = "" if str(key).startswith("raw:") else scan_to_cert(key)
+            candidate_ref = self._receive_row_ref_key(candidate)
+            candidate_ref_parts = candidate_ref.split(":", 3) if candidate_ref else []
+            candidate_row_ref = (
+                (candidate_ref_parts[1], candidate_ref_parts[2], int(candidate_ref_parts[3]))
+                if len(candidate_ref_parts) == 4 and candidate_ref_parts[0] == "raw" and candidate_ref_parts[3].isdigit()
+                else None
+            )
+            if candidate_cert in marked_certs or candidate_row_ref in normalized_refs:
+                continue
+            kept[key] = candidate
+        self.incoming_cert_index = kept
 
     def _apply_recommendations_to_rows(self, rows: list[WorkbookRow], force: bool = False) -> None:
         for row in rows:
@@ -14096,7 +14233,7 @@ class CardPipelineApp(tk.Tk):
             return
         self.comp_output_saved = True
         self._refresh_table(schedule_recommendations=False)
-        self.refresh_home()
+        self.refresh_home(reconcile_accounted=False, archive_received=False)
         suffix = f" Seller prices updated on {seller_updates} row(s)." if key and seller_updates else ""
         stage_label = f"{stage.lower()} " if stage else ""
         self.status_var.set(f"Saved current comp rows back to {stage_label}{path.name}.{suffix}")
@@ -14171,7 +14308,7 @@ class CardPipelineApp(tk.Tk):
         self.intake_sheet_sources = {}
         self.working_sheet_title.set("")
         self._refresh_table()
-        self.refresh_home()
+        self.refresh_home(reconcile_accounted=False, archive_received=False)
 
     def refresh_pipeline(self) -> None:
         self.refresh_working_sheets()

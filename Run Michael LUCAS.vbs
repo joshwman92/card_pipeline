@@ -6,7 +6,7 @@ shell.CurrentDirectory = appDir
 
 Set env = shell.Environment("PROCESS")
 env("LUCAS_SETTINGS_PATH") = appDir & "\lucas_settings.michael.json"
-env("LUCAS_ASSIGNMENT_CONFIG_PATH") = appDir & "\assignment_companies.michael.json"
+env("LUCAS_ASSIGNMENT_CONFIG_PATH") = appDir & "\assignment_companies.json"
 
 pythonwPath = appDir & "\.venv\Scripts\pythonw.exe"
 pythonPath = appDir & "\.venv\Scripts\python.exe"
