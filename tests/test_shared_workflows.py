@@ -5954,8 +5954,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         dummy.inventory_min_var = FieldVar("")
         dummy.inventory_max_var = FieldVar("")
         rows = [
-            {"status": "Active", "cert_number": "151740304", "card_title": "2024 Prizm Victor Wembanyama Silver PSA 10", "inventory_value": 100},
-            {"status": "Active", "cert_number": "222", "card_title": "2019 Panini Mosaic Stephen Curry Green PSA 10", "inventory_value": 90},
+            {"status": "Active", "best_company": "Fanatics", "cert_number": "151740304", "card_title": "2024 Prizm Victor Wembanyama Silver PSA 10", "inventory_value": 100},
+            {"status": "Active", "best_company": "Arena Club", "cert_number": "222", "card_title": "2019 Panini Mosaic Stephen Curry Green PSA 10", "inventory_value": 90},
             {"status": "Sold", "cert_number": "333", "card_title": "Hidden Sold Card", "inventory_value": 80},
         ]
 
@@ -5967,6 +5967,24 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
 
         dummy.inventory_search_var = FieldVar("hidden sold")
         self.assertEqual(dummy._filtered_inventory_records(rows), [])
+
+        dummy.inventory_search_var = FieldVar("")
+        dummy.inventory_company_var = FieldVar("Arena Club")
+        self.assertEqual([row["cert_number"] for row in dummy._filtered_inventory_records(rows)], ["222"])
+
+    def test_best_company_dropdown_includes_configured_and_current_values(self) -> None:
+        class Dummy:
+            _best_company_choices = app.CardPipelineApp._best_company_choices
+
+        dummy = Dummy()
+        dummy.assignment_engine = types.SimpleNamespace(
+            companies=[types.SimpleNamespace(name="Fanatics"), types.SimpleNamespace(name="Arena Club")]
+        )
+
+        self.assertEqual(
+            dummy._best_company_choices("Legacy Buyer"),
+            ["", "Arena Club", "Fanatics", "Legacy Buyer", app.NO_COMPANY_TAKES_LABEL],
+        )
 
     def test_inventory_filter_finds_missing_card_descriptions(self) -> None:
         class FieldVar:
