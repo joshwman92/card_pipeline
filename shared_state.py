@@ -60,6 +60,7 @@ def shared_lock(root: Path, name: str, owner: dict[str, str] | None = None, time
     payload = {
         "token": token,
         "name": name,
+        "pid": os.getpid(),
         "user": owner.get("display_name") or "",
         "machine": owner.get("machine") or "",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -71,7 +72,7 @@ def shared_lock(root: Path, name: str, owner: dict[str, str] | None = None, time
                 json.dump(payload, handle, indent=2, sort_keys=True)
             break
         except FileExistsError:
-            if is_stale_lock(lock_path, timeout):
+            if is_abandoned_local_lock(lock_path) or is_stale_lock(lock_path, timeout):
                 try:
                     lock_path.unlink()
                     continue
@@ -99,6 +100,31 @@ def is_stale_lock(path: Path, timeout: float) -> bool:
     except OSError:
         return False
     return age > max(timeout * 3, 120)
+
+
+def is_abandoned_local_lock(path: Path) -> bool:
+    detail = read_json(path, {})
+    if not isinstance(detail, dict):
+        return False
+    machine = str(detail.get("machine") or "").strip().casefold()
+    local_machine = socket.gethostname().strip().casefold()
+    if not machine or machine != local_machine:
+        return False
+    try:
+        pid = int(detail.get("pid") or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+    return False
 
 
 def safe_lock_name(name: str) -> str:
