@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import ipaddress
 import mimetypes
@@ -21,6 +22,7 @@ from cardladder_ocr import extract_cl_value_from_data_url
 from cy_appium import CourtyardAndroidAdapter, NOT_BUYING_MESSAGE, SUPPORTED_GRADERS as WINDOWS_CY_GRADERS, appium_client_available
 from workbook_io import WorkbookRow
 import assignment_engine
+from ebay_api import EbayOAuthError, ebay_account_status, ebay_broker_url, ebay_token_store_path, save_ebay_broker_account
 
 BRIDGE_VERSION = "2026-07-21-cardladder-visible-cert-partial-v25"
 EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-08-15-generic-title-settle-v26"
@@ -136,6 +138,7 @@ class BridgeState:
         self.mobile_payouts: Callable[[dict], dict] | None = None
         self.mobile_queue_sync: Callable[[dict], dict] | None = None
         self.mobile_inventory_photo_resolver: Callable[[str], tuple[bytes, str] | None] | None = None
+        self.ebay_token_store_path = ""
         self.instagram_media_token = uuid.uuid4().hex
         self.instagram_media_resolver: Callable[[str], tuple[bytes, str] | None] | None = None
         self.keep_note_sources: list[dict[str, str]] = []
@@ -213,7 +216,13 @@ class BridgeState:
             "profit": True,
             "expenses": True,
             "payouts": True,
+            "ebay": ebay_account_status(self.ebay_store_path()),
         }
+
+    def ebay_store_path(self) -> Path:
+        if self.ebay_token_store_path:
+            return Path(self.ebay_token_store_path).expanduser()
+        return ebay_token_store_path()
 
     def search_mobile_inventory(self, payload: dict) -> dict:
         if not self.mobile_auth_ok(payload):
@@ -1382,6 +1391,12 @@ class BridgeServer:
                 if not self._request_allowed(parsed.path):
                     self._send_json({"ok": False, "error": "local bridge access only"}, status=403)
                     return
+                if parsed.path in {"/ebay/broker/callback", "/mobile/ebay/broker/callback"}:
+                    self._send_ebay_broker_callback(parsed)
+                    return
+                if parsed.path == "/ebay/status":
+                    self._send_json(ebay_account_status(state.ebay_store_path()))
+                    return
                 media_match = re.match(r"^/instagram/media/([^/]+)/([^/]+)(?:/[^/]*)?$", parsed.path)
                 if media_match:
                     media = state.get_instagram_media(media_match.group(1), media_match.group(2))
@@ -1557,6 +1572,97 @@ class BridgeServer:
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _send_page(self, title: str, body_html: str, status: int = 200) -> None:
+                page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+body {{
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #0b141b;
+  color: #f3f4f6;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+main {{ max-width: 720px; padding: 32px; }}
+h1 {{ font-size: 40px; margin: 0 0 16px; }}
+p {{ color: #cbd5e1; font-size: 18px; line-height: 1.5; }}
+code {{ color: #f8fafc; }}
+</style>
+</head>
+<body><main>{body_html}</main></body>
+</html>
+""".encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "text/html; charset=utf-8")
+                self.send_header("cache-control", "no-store")
+                self.send_header("x-content-type-options", "nosniff")
+                self.send_header("content-length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+            def _send_ebay_broker_callback(self, parsed) -> None:
+                query = parse_qs(parsed.query)
+                error = str(query.get("error", [""])[0] or "").strip()
+                if error:
+                    self._send_page(
+                        "eBay Connection Failed",
+                        f"""
+<h1>eBay Connection Failed</h1>
+<p>{html.escape(str(query.get("error_description", [error])[0] or error))}</p>
+<p>You can close this tab and try Connect eBay again from LUCAS.</p>
+""",
+                        status=400,
+                    )
+                    return
+                token = str(
+                    query.get("connection_token", [""])[0]
+                    or query.get("lucas_connection_token", [""])[0]
+                    or query.get("token", [""])[0]
+                    or ""
+                ).strip()
+                if not token:
+                    self._send_page(
+                        "Missing eBay Connection",
+                        """
+<h1>Missing eBay Connection</h1>
+<p>The LUCAS eBay service returned to this app, but did not include a connection token. Try Connect eBay again.</p>
+""",
+                        status=400,
+                    )
+                    return
+                account = str(query.get("account", ["default"])[0] or "default").strip() or "default"
+                seller_username = str(query.get("seller_username", [""])[0] or query.get("seller", [""])[0] or "").strip()
+                marketplace_id = str(query.get("marketplace_id", ["EBAY_US"])[0] or "EBAY_US").strip() or "EBAY_US"
+                broker = str(query.get("broker_url", [""])[0] or ebay_broker_url()).strip().rstrip("/")
+                try:
+                    save_ebay_broker_account(state.ebay_store_path(), account, broker, token, seller_username=seller_username, marketplace_id=marketplace_id)
+                except EbayOAuthError as error:
+                    self._send_page(
+                        "eBay Connection Failed",
+                        f"""
+<h1>eBay Connection Failed</h1>
+<p>{html.escape(str(error))}</p>
+<p>You can close this tab and try Connect eBay again.</p>
+""",
+                        status=400,
+                    )
+                    return
+                display = seller_username or ("Primary eBay Account" if account == "default" else account)
+                self._send_page(
+                    "eBay Ready in LUCAS",
+                    f"""
+<h1>eBay Ready in LUCAS</h1>
+<p>LUCAS connected seller account <strong>{html.escape(display)}</strong>.</p>
+<p>You can close this tab, return to LUCAS, and upload cards to eBay.</p>
+""",
+                )
 
             def _origin_allowed(self) -> bool:
                 return request_origin_allowed(self.headers.get("origin", ""), self.headers.get("host", ""))

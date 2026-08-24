@@ -32,6 +32,8 @@ import lucas_diagnostics
 import cardladder_ocr
 import bridge_server
 import cy_appium
+import ebay_api
+import ebay_broker_server
 import shared_state
 from bridge_server import BridgeState, cert_match_key as bridge_cert_match_key, clean_profile_title as bridge_clean_profile_title, generic_profile_review_reason, keep_urls_match, normalize_result_cert as bridge_normalize_result_cert, parse_value as bridge_parse_value
 from comp_engine.workbook_io import WorkbookRow
@@ -74,6 +76,57 @@ import multi_card_extraction
 
 
 class SharedStateTests(unittest.TestCase):
+    def test_ebay_broker_state_accepts_hosted_lucas_callback(self) -> None:
+        payload = {
+            "kind": ebay_broker_server.BROKER_STATE_KIND,
+            "account": "default",
+            "callback": "https://lucas.mikeyscards.com/mobile/ebay/broker/callback",
+            "created_at": 1787544385,
+        }
+        with patch.dict(ebay_broker_server.os.environ, {"LUCAS_EBAY_BROKER_STATE_SECRET": "state-secret"}, clear=False):
+            state = ebay_broker_server._encode_state(payload)
+            self.assertEqual(ebay_broker_server._decode_state(state)["account"], "default")
+            tampered = ("A" if state[0] != "A" else "B") + state[1:]
+            self.assertEqual(ebay_broker_server._decode_state(tampered), {})
+
+        self.assertTrue(ebay_broker_server._callback_allowed("https://lucas.mikeyscards.com/mobile/ebay/broker/callback"))
+        self.assertTrue(ebay_broker_server._callback_allowed("http://127.0.0.1:8765/ebay/broker/callback"))
+        self.assertFalse(ebay_broker_server._callback_allowed("https://lucas.mikeyscards.com/ebay/broker/callback"))
+
+    def test_ebay_broker_connection_token_can_supply_access_token(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "ebay_accounts.json"
+            record = ebay_api.save_ebay_broker_account(
+                store_path,
+                "default",
+                "https://connect.lucas.example/ebay",
+                "lucas-link-secret",
+                seller_username="mikeycards",
+            )
+            self.assertEqual(record["connection_mode"], "broker")
+            status = ebay_api.ebay_account_status(store_path)
+            self.assertEqual(status["accounts"][0]["seller_username"], "mikeycards")
+            self.assertNotEqual(status["accounts"][0]["connection_token"], "lucas-link-secret")
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+                def read(self):
+                    return b'{"access_token":"access-from-broker"}'
+
+            config = ebay_api.EbayConfig(env="production", client_id="", client_secret="", runame="")
+            with patch("ebay_api.urllib.request.urlopen", return_value=FakeResponse()) as urlopen:
+                token = ebay_api.ebay_access_token_for_account(store_path, config, "default")
+
+            self.assertEqual(token, "access-from-broker")
+            request = urlopen.call_args.args[0]
+            self.assertEqual(request.full_url, "https://connect.lucas.example/ebay/token")
+            self.assertIn("lucas-link-secret", request.data.decode("utf-8"))
+
     def test_courtyard_result_description_parses_value_confidence_and_profile(self) -> None:
         result = cy_appium.parse_result_description(
             "Pippi-Prism #035, Pocket Monsters Sealdass Series 2, PSA 9, $47.50, CONFIDENCE, 5"
