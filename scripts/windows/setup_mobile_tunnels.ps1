@@ -15,7 +15,8 @@ function Write-TunnelConfig {
         [string]$Name,
         [string]$TunnelId,
         [string]$Hostname,
-        [int]$Port
+        [int]$Port,
+        [string[]]$ExtraIngress = @()
     )
 
     $credentialsFile = Join-Path $cloudflaredDir "$TunnelId.json"
@@ -25,20 +26,30 @@ function Write-TunnelConfig {
     }
 
     $configPath = Join-Path $cloudflaredDir "$Name.yml"
-    $config = @"
+    $ingressLines = @()
+    $ingressLines += "ingress:"
+    $ingressLines += $ExtraIngress
+    $ingressLines += "  - hostname: $Hostname"
+    $ingressLines += "    service: http://127.0.0.1:$Port"
+    $ingressLines += "  - service: http_status:404"
+
+    $config = @(
+@"
 tunnel: $TunnelId
 credentials-file: $credentialsFile
-ingress:
-  - hostname: $Hostname
-    service: http://127.0.0.1:$Port
-  - service: http_status:404
 "@
+    )
+    $config += $ingressLines
     Set-Content -Path $configPath -Value $config -Encoding ascii
     Write-Host "Wrote $configPath -> http://127.0.0.1:$Port"
 }
 
 Write-TunnelConfig -Name "lucas-team" -TunnelId $teamTunnelId -Hostname "team-lucas.mikeyscards.com" -Port 8765
-Write-TunnelConfig -Name "lucas-personal" -TunnelId $personalTunnelId -Hostname "lucas.mikeyscards.com" -Port 8766
+Write-TunnelConfig -Name "lucas-personal" -TunnelId $personalTunnelId -Hostname "lucas.mikeyscards.com" -Port 8766 -ExtraIngress @(
+    "  - hostname: lucas.mikeyscards.com",
+    "    path: /ebay*",
+    "    service: http://127.0.0.1:8788"
+)
 
 if ($InstallService) {
     Write-Host ""

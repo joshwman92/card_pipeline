@@ -43,6 +43,8 @@ if (!$cloudflared) {
     throw "cloudflared.exe not found."
 }
 
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "setup_mobile_tunnels.ps1")
+
 $cloudflaredDir = Join-Path $env:USERPROFILE ".cloudflared"
 if ($Profile -eq "team") {
     $configPath = Join-Path $cloudflaredDir "lucas-team.yml"
@@ -50,10 +52,6 @@ if ($Profile -eq "team") {
 } else {
     $configPath = Join-Path $cloudflaredDir "lucas-personal.yml"
     $name = "lucas-personal"
-}
-
-if (!(Test-Path $configPath)) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "setup_mobile_tunnels.ps1")
 }
 
 "[$(Get-Date -Format s)] starting $name with $cloudflared --config $configPath tunnel run $name" | Out-File -FilePath $logPath -Append -Encoding utf8

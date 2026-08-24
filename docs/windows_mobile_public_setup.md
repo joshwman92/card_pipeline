@@ -21,7 +21,7 @@ C:\Users\user\.cloudflared\789db1ce-bcba-479c-9fb5-f7b374e63fe3.json
 Tunnel mapping:
 
 - `lucas-team`: `3b34592e-77d8-4976-8eac-26e771289bee` -> `http://127.0.0.1:8765`
-- `lucas-personal`: `789db1ce-bcba-479c-9fb5-f7b374e63fe3` -> `http://127.0.0.1:8766`
+- `lucas-personal`: `789db1ce-bcba-479c-9fb5-f7b374e63fe3` -> `/ebay*` to `http://127.0.0.1:8788`, everything else to `http://127.0.0.1:8766`
 
 ## Setup
 
@@ -50,6 +50,7 @@ That starts:
 
 - Team mobile server on port `8765`
 - Personal mobile server on port `8766`
+- eBay broker on port `8788`
 - Team Cloudflare tunnel
 - Personal Cloudflare tunnel
 
