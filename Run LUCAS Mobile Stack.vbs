@@ -34,9 +34,20 @@ Sub LaunchTunnel(profile)
     End If
 End Sub
 
+Sub LaunchEbayBroker()
+    scriptPath = appDir & "\deploy\ebay-broker\windows\run-ebay-broker.ps1"
+    If fso.FileExists(scriptPath) Then
+        shell.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & scriptPath & """", 0, False
+    Else
+        MsgBox "Could not find " & scriptPath, vbExclamation, "L.U.C.A.S eBay Broker"
+    End If
+End Sub
+
 LaunchMobileServer "lucas_settings.json", "assignment_companies.json", "8765", "LUCAS_TEAM_MOBILE_PUBLIC_URL", "https://team-lucas.mikeyscards.com"
 WScript.Sleep 1500
 LaunchMobileServer "lucas_settings.michael.json", "assignment_companies.michael.json", "8766", "LUCAS_PERSONAL_MOBILE_PUBLIC_URL", "https://lucas.mikeyscards.com"
+WScript.Sleep 1500
+LaunchEbayBroker
 WScript.Sleep 1500
 LaunchTunnel "team"
 WScript.Sleep 1500

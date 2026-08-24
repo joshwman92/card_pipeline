@@ -57,6 +57,7 @@ That starts:
 Logs are written to:
 
 ```text
+work\logs\ebay-broker.log
 work\logs\mobile-tunnel-team.log
 work\logs\mobile-tunnel-personal.log
 ```

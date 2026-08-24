@@ -2,6 +2,9 @@ $ErrorActionPreference = "Stop"
 
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
 Set-Location $RepoRoot
+$LogDir = Join-Path $RepoRoot "work\logs"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$LogPath = Join-Path $LogDir "ebay-broker.log"
 
 if (-not $env:LUCAS_EBAY_BROKER_PUBLIC_URL) {
     $env:LUCAS_EBAY_BROKER_PUBLIC_URL = "https://lucas.mikeyscards.com/ebay"
@@ -26,5 +29,7 @@ if (Test-Path ".\.venv\Scripts\python.exe") {
     $Python = ".\.venv\Scripts\python.exe"
 }
 
-Write-Host "Starting LUCAS eBay broker from $RepoRoot on http://$($env:HOST):$($env:PORT)"
-& $Python ".\ebay_broker_server.py"
+$message = "Starting LUCAS eBay broker from $RepoRoot on http://$($env:HOST):$($env:PORT)"
+Write-Host $message
+"[$(Get-Date -Format s)] $message" | Out-File -FilePath $LogPath -Append -Encoding utf8
+& $Python ".\ebay_broker_server.py" *>&1 | Tee-Object -FilePath $LogPath -Append
