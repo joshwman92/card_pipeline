@@ -5954,8 +5954,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         dummy.inventory_min_var = FieldVar("")
         dummy.inventory_max_var = FieldVar("")
         rows = [
-            {"status": "Active", "cert_number": "151740304", "card_title": "2024 Prizm Victor Wembanyama Silver PSA 10", "inventory_value": 100},
-            {"status": "Active", "cert_number": "222", "card_title": "2019 Panini Mosaic Stephen Curry Green PSA 10", "inventory_value": 90},
+            {"status": "Active", "best_company": "Fanatics", "cert_number": "151740304", "card_title": "2024 Prizm Victor Wembanyama Silver PSA 10", "inventory_value": 100},
+            {"status": "Active", "best_company": "Arena Club", "cert_number": "222", "card_title": "2019 Panini Mosaic Stephen Curry Green PSA 10", "inventory_value": 90},
             {"status": "Sold", "cert_number": "333", "card_title": "Hidden Sold Card", "inventory_value": 80},
         ]
 
@@ -5967,6 +5967,31 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
 
         dummy.inventory_search_var = FieldVar("hidden sold")
         self.assertEqual(dummy._filtered_inventory_records(rows), [])
+
+        dummy.inventory_search_var = FieldVar("")
+        dummy.inventory_company_var = FieldVar("Arena Club")
+        self.assertEqual([row["cert_number"] for row in dummy._filtered_inventory_records(rows)], ["222"])
+
+        dummy.inventory_company_var = FieldVar("Arena Club|Fanatics")
+        self.assertEqual([row["cert_number"] for row in dummy._filtered_inventory_records(rows)], ["151740304", "222"])
+
+        dummy.inventory_company_var = FieldVar("[")
+        self.assertEqual(dummy._filtered_inventory_records(rows), [])
+        self.assertTrue(dummy.inventory_company_filter_error)
+
+    def test_best_company_dropdown_includes_configured_and_current_values(self) -> None:
+        class Dummy:
+            _best_company_choices = app.CardPipelineApp._best_company_choices
+
+        dummy = Dummy()
+        dummy.assignment_engine = types.SimpleNamespace(
+            companies=[types.SimpleNamespace(name="Fanatics"), types.SimpleNamespace(name="Arena Club")]
+        )
+
+        self.assertEqual(
+            dummy._best_company_choices("Legacy Buyer"),
+            ["", "Arena Club", "Fanatics", "Legacy Buyer", app.NO_COMPANY_TAKES_LABEL],
+        )
 
     def test_inventory_filter_finds_missing_card_descriptions(self) -> None:
         class FieldVar:
@@ -7274,6 +7299,29 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         self.assertTrue(rows[0].item_id.startswith(prefix))
         self.assertEqual(int(rows[1].item_id.removeprefix(prefix)), int(rows[0].item_id.removeprefix(prefix)) + 1)
         self.assertEqual(rows[2].item_id, "")
+
+    def test_scroll_tree_to_row_selects_and_reveals_new_row(self) -> None:
+        class Tree:
+            def __init__(self):
+                self.actions = []
+
+            def exists(self, iid):
+                self.actions.append(("exists", iid))
+                return iid == "18"
+
+            def selection_set(self, iid):
+                self.actions.append(("select", iid))
+
+            def focus(self, iid):
+                self.actions.append(("focus", iid))
+
+            def see(self, iid):
+                self.actions.append(("see", iid))
+
+        tree = Tree()
+        app.CardPipelineApp._scroll_tree_to_row(tree, 18)
+
+        self.assertEqual(tree.actions, [("exists", "18"), ("select", "18"), ("focus", "18"), ("see", "18")])
 
     def test_certified_create_rows_skip_global_raw_id_scan(self) -> None:
         class CreateDummy:

@@ -550,6 +550,7 @@ EDITABLE_COLUMNS = {
     "card_ladder_comps_average",
     "cy_value",
     "cy_confidence",
+    "best_company",
 }
 
 HEADINGS = {
@@ -694,7 +695,7 @@ BUTTON_TOOLTIPS = {
     "refresh home view": "Reload Home lists, summaries, and sheet statuses.",
     "add card": "Add a card directly to inventory.",
     "export": "Export the current visible inventory rows.",
-    "filters": "Open inventory filters for sport, grader, price, and date.",
+    "filters": "Open inventory filters for Best Company regex, sport, grader, price, and date.",
     "settings": "Open inventory maintenance actions.",
     "bulk edit": "Turn multi-cell inventory editing on or off.",
     "clear filters": "Reset the inventory filter fields.",
@@ -940,6 +941,7 @@ class CardPipelineApp(tk.Tk):
         self.inventory_status_var = tk.StringVar(value="No inventory loaded.")
         self.inventory_metric_var = tk.StringVar(value="")
         self.inventory_person_var = tk.StringVar()
+        self.inventory_company_var = tk.StringVar()
         self.inventory_sport_var = tk.StringVar()
         self.inventory_grader_var = tk.StringVar()
         self.inventory_year_var = tk.StringVar()
@@ -2137,7 +2139,7 @@ class CardPipelineApp(tk.Tk):
         self._make_inventory_toolbar_icon_button(
             action_row,
             "filter",
-            "Open inventory filters for sport, grader, card year, price, date, missing values, descriptions, and photos.",
+            "Open inventory filters for Best Company regex, sport, grader, card year, price, date, missing values, descriptions, and photos.",
             self.open_inventory_filters_popup,
         ).pack(side=tk.LEFT, padx=(8, 0))
         settings_button = self._make_inventory_toolbar_icon_button(
@@ -2164,7 +2166,7 @@ class CardPipelineApp(tk.Tk):
         self.inventory_bulk_toggle.pack(side=tk.LEFT, padx=(14, 0))
         self._style_inventory_bulk_toggle()
         ttk.Label(controls, textvariable=self.inventory_status_var, style="Muted.TLabel").grid(row=3, column=0, columnspan=10, sticky="w", pady=(8, 0))
-        for var in (self.inventory_sport_var, self.inventory_grader_var, self.inventory_year_var, self.inventory_search_var, self.inventory_min_var, self.inventory_max_var, self.inventory_date_min_var, self.inventory_date_max_var, self.inventory_missing_title_var, self.inventory_missing_comps_var, self.inventory_missing_cl_var, self.inventory_missing_photos_var):
+        for var in (self.inventory_company_var, self.inventory_sport_var, self.inventory_grader_var, self.inventory_year_var, self.inventory_search_var, self.inventory_min_var, self.inventory_max_var, self.inventory_date_min_var, self.inventory_date_max_var, self.inventory_missing_title_var, self.inventory_missing_comps_var, self.inventory_missing_cl_var, self.inventory_missing_photos_var):
             var.trace_add("write", lambda *_args: self._schedule_inventory_filter_refresh())
 
         self.inventory_tree = self._build_home_tree(
@@ -2197,15 +2199,19 @@ class CardPipelineApp(tk.Tk):
         popup.title("Inventory Filters")
         popup.configure(bg=self.colors["bg"])
         popup.transient(self)
-        popup.geometry("760x650")
-        popup.minsize(720, 620)
+        popup.geometry("760x750")
+        popup.minsize(720, 720)
         frame = ttk.Frame(popup, style="App.TFrame", padding=18)
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text="Inventory Filters", style="AppTitle.TLabel", font=("Segoe UI Semibold", 13)).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 12))
 
-        ttk.Label(frame, text="Sport", style="AppMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Best Company (regex)", style="AppMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 10))
+        ttk.Entry(frame, textvariable=self.inventory_company_var, width=36).grid(row=1, column=1, columnspan=3, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Example: Arena Club|Fanatics. Leave blank to include every company.", style="Muted.TLabel").grid(row=2, column=1, columnspan=3, sticky="w", pady=(0, 6))
+
+        ttk.Label(frame, text="Sport", style="AppMuted.TLabel").grid(row=3, column=0, sticky="w", pady=(0, 10))
         sport_frame = ttk.Frame(frame, style="App.TFrame")
-        sport_frame.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(0, 10))
+        sport_frame.grid(row=3, column=1, columnspan=3, sticky="ew", pady=(0, 10))
         selected_sports = self._inventory_sport_filter_values()
         sport_vars: dict[str, tk.BooleanVar] = {}
 
@@ -2225,9 +2231,9 @@ class CardPipelineApp(tk.Tk):
                 style="Panel.TCheckbutton",
             ).grid(row=index // 3, column=index % 3, sticky="w", padx=(0, 14), pady=(0, 4))
 
-        ttk.Label(frame, text="Grader", style="AppMuted.TLabel").grid(row=2, column=0, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Grader", style="AppMuted.TLabel").grid(row=4, column=0, sticky="w", pady=(0, 10))
         grader_frame = ttk.Frame(frame, style="App.TFrame")
-        grader_frame.grid(row=2, column=1, columnspan=3, sticky="ew", pady=(0, 10))
+        grader_frame.grid(row=4, column=1, columnspan=3, sticky="ew", pady=(0, 10))
         selected_graders = inventory_grader_filter_values(self.inventory_grader_var.get())
         grader_vars: dict[str, tk.BooleanVar] = {}
 
@@ -2246,49 +2252,49 @@ class CardPipelineApp(tk.Tk):
                 style="Panel.TCheckbutton",
             ).grid(row=0, column=index, sticky="w", padx=(0, 14), pady=(0, 4))
 
-        ttk.Label(frame, text="Card Year", style="AppMuted.TLabel").grid(row=3, column=0, sticky="w", pady=(0, 10))
-        ttk.Entry(frame, textvariable=self.inventory_year_var, width=12).grid(row=3, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Card Year", style="AppMuted.TLabel").grid(row=5, column=0, sticky="w", pady=(0, 10))
+        ttk.Entry(frame, textvariable=self.inventory_year_var, width=12).grid(row=5, column=1, sticky="w", pady=(0, 10))
 
-        ttk.Label(frame, text="Price", style="AppMuted.TLabel").grid(row=4, column=0, sticky="w", pady=(0, 10))
-        ttk.Entry(frame, textvariable=self.inventory_min_var, width=12).grid(row=4, column=1, sticky="w", pady=(0, 10))
-        ttk.Label(frame, text="to", style="AppMuted.TLabel").grid(row=4, column=2, sticky="w", padx=(8, 8), pady=(0, 10))
-        ttk.Entry(frame, textvariable=self.inventory_max_var, width=12).grid(row=4, column=3, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Price", style="AppMuted.TLabel").grid(row=6, column=0, sticky="w", pady=(0, 10))
+        ttk.Entry(frame, textvariable=self.inventory_min_var, width=12).grid(row=6, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="to", style="AppMuted.TLabel").grid(row=6, column=2, sticky="w", padx=(8, 8), pady=(0, 10))
+        ttk.Entry(frame, textvariable=self.inventory_max_var, width=12).grid(row=6, column=3, sticky="w", pady=(0, 10))
 
-        ttk.Label(frame, text="Date Added", style="AppMuted.TLabel").grid(row=5, column=0, sticky="w", pady=(0, 10))
-        self._inventory_date_picker(frame, self.inventory_date_min_var).grid(row=5, column=1, sticky="w", pady=(0, 10))
-        ttk.Label(frame, text="to", style="AppMuted.TLabel").grid(row=5, column=2, sticky="w", padx=(8, 8), pady=(0, 10))
-        self._inventory_date_picker(frame, self.inventory_date_max_var).grid(row=5, column=3, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="Date Added", style="AppMuted.TLabel").grid(row=7, column=0, sticky="w", pady=(0, 10))
+        self._inventory_date_picker(frame, self.inventory_date_min_var).grid(row=7, column=1, sticky="w", pady=(0, 10))
+        ttk.Label(frame, text="to", style="AppMuted.TLabel").grid(row=7, column=2, sticky="w", padx=(8, 8), pady=(0, 10))
+        self._inventory_date_picker(frame, self.inventory_date_max_var).grid(row=7, column=3, sticky="w", pady=(0, 10))
 
         ttk.Checkbutton(
             frame,
             text="Missing Card Description Only",
             variable=self.inventory_missing_title_var,
             style="Panel.TCheckbutton",
-        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         ttk.Checkbutton(
             frame,
             text="Missing Comps Only",
             variable=self.inventory_missing_comps_var,
             style="Panel.TCheckbutton",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         ttk.Checkbutton(
             frame,
             text="Missing CL Value Only",
             variable=self.inventory_missing_cl_var,
             style="Panel.TCheckbutton",
-        ).grid(row=8, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ).grid(row=10, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         ttk.Checkbutton(
             frame,
             text="Missing Photos Only",
             variable=self.inventory_missing_photos_var,
             style="Panel.TCheckbutton",
-        ).grid(row=9, column=0, columnspan=4, sticky="w", pady=(0, 10))
+        ).grid(row=11, column=0, columnspan=4, sticky="w", pady=(0, 10))
 
         actions = ttk.Frame(frame, style="App.TFrame")
-        actions.grid(row=10, column=0, columnspan=4, sticky="ew", pady=(16, 0))
+        actions.grid(row=12, column=0, columnspan=4, sticky="ew", pady=(16, 0))
         actions.columnconfigure(1, weight=1)
         ttk.Button(actions, text="Clear Filters", command=self.clear_inventory_filters, style="Soft.TButton").grid(row=0, column=0, sticky="w")
         ttk.Button(actions, text="Close", command=popup.destroy, style="Soft.TButton").grid(row=0, column=2, sticky="e", padx=(0, 8))
@@ -2387,7 +2393,7 @@ class CardPipelineApp(tk.Tk):
         render_days()
 
     def clear_inventory_filters(self) -> None:
-        for var in (self.inventory_sport_var, self.inventory_grader_var, self.inventory_year_var, self.inventory_min_var, self.inventory_max_var, self.inventory_date_min_var, self.inventory_date_max_var):
+        for var in (self.inventory_company_var, self.inventory_sport_var, self.inventory_grader_var, self.inventory_year_var, self.inventory_min_var, self.inventory_max_var, self.inventory_date_min_var, self.inventory_date_max_var):
             var.set("")
         if hasattr(self, "inventory_missing_title_var"):
             self.inventory_missing_title_var.set(False)
@@ -6561,7 +6567,11 @@ class CardPipelineApp(tk.Tk):
             )
             self.inventory_tree_records[iid] = record
         self.inventory_metric_var.set(f"Cards: {len(self.filtered_inventory_rows)}   Purchase Total: {format_money(total_purchase)}   Source Value: {format_money(total_value)}")
-        self.inventory_status_var.set(f"Loaded {len(self.filtered_inventory_rows)}/{len(self.inventory_rows)} inventory card(s) from {INVENTORY_LEDGER_PATH.name}.")
+        regex_error = str(getattr(self, "inventory_company_filter_error", "") or "")
+        if regex_error:
+            self.inventory_status_var.set(f"Invalid Best Company regex: {regex_error}")
+        else:
+            self.inventory_status_var.set(f"Loaded {len(self.filtered_inventory_rows)}/{len(self.inventory_rows)} inventory card(s) from {INVENTORY_LEDGER_PATH.name}.")
         record_performance_event(
             "inventory.refresh",
             perf_start,
@@ -6835,6 +6845,13 @@ class CardPipelineApp(tk.Tk):
 
     def _filtered_inventory_records(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
         person = self.inventory_person_var.get().strip().lower() if hasattr(self, "inventory_person_var") else ""
+        best_company_pattern_text = self.inventory_company_var.get().strip() if hasattr(self, "inventory_company_var") else ""
+        self.inventory_company_filter_error = ""
+        try:
+            best_company_pattern = re.compile(best_company_pattern_text, re.IGNORECASE) if best_company_pattern_text else None
+        except re.error as error:
+            self.inventory_company_filter_error = str(error)
+            return []
         sport_filters = self._inventory_sport_filter_values()
         grader_filters = inventory_grader_filter_values(self.inventory_grader_var.get() if hasattr(self, "inventory_grader_var") else "")
         card_year = re.sub(r"\D", "", self.inventory_year_var.get()) if hasattr(self, "inventory_year_var") else ""
@@ -6852,6 +6869,8 @@ class CardPipelineApp(tk.Tk):
             if str(record.get("status") or "").lower() != "active":
                 continue
             if person and person not in str(record.get("assigned_person") or "Unassigned").lower():
+                continue
+            if best_company_pattern and not best_company_pattern.search(str(record.get("best_company") or "")):
                 continue
             if sport_filters:
                 record_sport_text = str(record.get("sport") or "").strip().lower()
@@ -13243,6 +13262,12 @@ class CardPipelineApp(tk.Tk):
                 setattr(workbook_row, "_needs_receive_index_retry", True)
         self.review_rows = existing
         self._refresh_table(schedule_recommendations=schedule_recommendations)
+        if added_excel_rows:
+            latest_row = added_excel_rows[-1]
+            for tree_name in ("receive_tree", "review_tree"):
+                tree = getattr(self, tree_name, None)
+                if tree is not None:
+                    self._scroll_tree_to_row(tree, latest_row)
         retry = getattr(self, "_start_receive_index_retry", None)
         if callable(retry) and any(getattr(row, "_needs_receive_index_retry", False) for row in self.review_rows):
             retry()
@@ -14635,6 +14660,8 @@ class CardPipelineApp(tk.Tk):
         self.intake_rows = existing
         self.apply_create_seller_terms(show_status=False)
         self._refresh_table()
+        if added_excel_rows:
+            self._scroll_tree_to_row(self.intake_tree, added_excel_rows[-1])
         return added_excel_rows
 
     def _apply_recommendations(self) -> None:
@@ -15570,12 +15597,19 @@ class CardPipelineApp(tk.Tk):
             if col in widths:
                 tree.column(col, width=widths[col])
 
-    def _select_excel_row(self, excel_row: int) -> None:
+    @staticmethod
+    def _scroll_tree_to_row(tree: ttk.Treeview, excel_row: int) -> None:
         iid = str(excel_row)
-        if self.intake_tree.exists(iid):
-            self.intake_tree.selection_set(iid)
-            self.intake_tree.focus(iid)
-            self.intake_tree.see(iid)
+        try:
+            if tree.exists(iid):
+                tree.selection_set(iid)
+                tree.focus(iid)
+                tree.see(iid)
+        except tk.TclError:
+            pass
+
+    def _select_excel_row(self, excel_row: int) -> None:
+        self._scroll_tree_to_row(self.intake_tree, excel_row)
 
     def _handle_table_click(self, event):
         tree = event.widget
@@ -15649,10 +15683,13 @@ class CardPipelineApp(tk.Tk):
         x, y, width, height = bbox
         current = tree.set(row_id, column)
         is_receive_card_autocomplete = self._is_review_row_tree(tree) and column == "card_title"
+        is_best_company_choice = (tree is self.comp_tree or self._is_review_row_tree(tree)) and column == "best_company"
         editor: ttk.Entry | ttk.Combobox
         if is_receive_card_autocomplete:
             editor = ttk.Combobox(tree, values=(), width=max(24, width // 8))
             self._refresh_receive_card_autocomplete(editor, current)
+        elif is_best_company_choice:
+            editor = ttk.Combobox(tree, values=self._best_company_choices(current), state="readonly", width=max(18, width // 8))
         else:
             editor = ttk.Entry(tree)
         editor.insert(0, current)
@@ -15668,6 +15705,21 @@ class CardPipelineApp(tk.Tk):
         if is_receive_card_autocomplete:
             editor.bind("<KeyRelease>", lambda event, widget=editor: self._on_receive_card_autocomplete_key(event, widget), add="+")
             editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
+        elif is_best_company_choice:
+            editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
+
+    def _best_company_choices(self, current: object = "") -> list[str]:
+        """Return the manual Best Company dropdown choices for Comp and Receive rows."""
+        companies = {
+            str(getattr(company, "name", "") or "").strip()
+            for company in getattr(getattr(self, "assignment_engine", None), "companies", [])
+            if str(getattr(company, "name", "") or "").strip()
+        }
+        current_name = str(current or "").strip()
+        if current_name:
+            companies.add(current_name)
+        companies.discard(NO_COMPANY_TAKES_LABEL)
+        return ["", *sorted(companies, key=str.casefold), NO_COMPANY_TAKES_LABEL]
 
     def _commit_cell_edit(self) -> None:
         if not self.cell_editor or not self.cell_edit:
@@ -15811,7 +15863,16 @@ class CardPipelineApp(tk.Tk):
                 row.cy_value = self._parse_money_text(clean_value)
             elif column == "cy_confidence":
                 row.cy_confidence = clean_value
-            row.status = "Ready" if (row.cert_number and row.grader) or row.item_id else "Needs setup"
+            elif column == "best_company":
+                row.best_company = clean_value
+                if not clean_value or clean_value.upper() == NO_COMPANY_TAKES_LABEL:
+                    row.estimated_payout = None
+                else:
+                    person = getattr(self, "_assignment_person_for_row", lambda _row: "")(row)
+                    decision = self._specific_company_decision(row, person, clean_value)
+                    row.estimated_payout = round(decision.payout, 2) if decision and decision.accepted and decision.payout is not None else None
+            if column != "best_company":
+                row.status = "Ready" if (row.cert_number and row.grader) or row.item_id else "Needs setup"
             if tree is self.intake_tree:
                 if column == "purchase_price":
                     setattr(row, "_seller_terms_base_purchase", row.existing_value)
