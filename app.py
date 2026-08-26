@@ -7089,11 +7089,13 @@ class CardPipelineApp(tk.Tk):
         match = re.search(r"-?[\d,.]+\s*[kK]?", str(value))
         if not match:
             return None
-        text = match.group(0).strip().strip(".,").replace(",", "")
+        # Keep a leading decimal point intact: users commonly enter amounts such
+        # as ".43" in the expense fields, which Python correctly reads as 0.43.
+        text = match.group(0).strip().replace(",", "")
         multiplier = 1
         if text.lower().endswith("k"):
             multiplier = 1000
-            text = text[:-1].strip().strip(".,")
+            text = text[:-1].strip()
         if re.fullmatch(r"-?\d{1,3}\.\d{3}", text):
             text = text.replace(".", "")
         try:

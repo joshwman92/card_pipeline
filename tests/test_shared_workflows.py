@@ -186,6 +186,8 @@ class SharedStateTests(unittest.TestCase):
         self.assertEqual(MoneyDummy()._money_value("$20.27k"), 20270.0)
         self.assertEqual(intake_parse_money("$20.27k"), 20270.0)
         self.assertEqual(MoneyDummy()._money_value("$20.27"), 20.27)
+        self.assertEqual(MoneyDummy()._money_value(".43"), 0.43)
+        self.assertEqual(MoneyDummy()._money_value("-.43"), -0.43)
 
     def test_desktop_trade_payload_matches_trade_shape(self) -> None:
         dummy = self._trade_dummy()
