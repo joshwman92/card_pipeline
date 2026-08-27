@@ -813,6 +813,44 @@ class WorkbookCompanyProfitTests(unittest.TestCase):
             self.assertEqual(rows[0]["purchase_price"], 25)
             self.assertEqual(rows[0]["card_ladder_comps_average"], 80)
 
+    def test_sheet_loader_scans_read_only_worksheet_without_random_cell_access(self) -> None:
+        class FakeSheet:
+            title = "Cards"
+
+            def iter_rows(self, values_only=False):
+                self.values_only = values_only
+                return iter(
+                    [
+                        ("Cert", "Card", "Purchase Price"),
+                        ("12345678", "Test Card PSA 10", 25),
+                    ]
+                )
+
+            def cell(self, *_args, **_kwargs):
+                raise AssertionError("read-only worksheets must not use random cell access")
+
+        class FakeWorkbook:
+            sheetnames = ["Cards"]
+
+            def __init__(self):
+                self.sheet = FakeSheet()
+                self.closed = False
+
+            def __getitem__(self, _name):
+                return self.sheet
+
+            def close(self):
+                self.closed = True
+
+        workbook = FakeWorkbook()
+        with patch("intake_io.load_workbook", return_value=workbook):
+            rows = read_simple_spreadsheet(Path("large.xlsx"))
+
+        self.assertTrue(workbook.sheet.values_only)
+        self.assertTrue(workbook.closed)
+        self.assertEqual(rows[0]["cert_number"], "12345678")
+        self.assertEqual(rows[0]["purchase_price"], 25)
+
     def test_courtyard_weekly_sheet_uses_cy_ingest_format(self) -> None:
         with TemporaryDirectory() as tmp:
             company_dir = Path(tmp) / "COMPANY SHEETS"
@@ -2678,6 +2716,66 @@ class AssignmentEngineTests(unittest.TestCase):
 
 
 class AppSharedWorkflowLogicTests(unittest.TestCase):
+    def test_tab_navigation_moves_across_editable_cells_and_wraps_rows(self) -> None:
+        class FakeTree:
+            _display_columns = ("excel_row", "cert_number", "status", "card_title")
+
+            def get_children(self):
+                return ("2", "3", app.ADD_COMP_ROW_IID, app.COMP_TOTAL_ROW_IID)
+
+        class Dummy:
+            _tree_columns = app.CardPipelineApp._tree_columns
+            _adjacent_editable_cell = app.CardPipelineApp._adjacent_editable_cell
+
+        dummy = Dummy()
+        tree = FakeTree()
+
+        self.assertEqual(dummy._adjacent_editable_cell(tree, "2", "cert_number", 1), ("2", "card_title"))
+        self.assertEqual(dummy._adjacent_editable_cell(tree, "2", "card_title", 1), ("3", "cert_number"))
+        self.assertEqual(dummy._adjacent_editable_cell(tree, "3", "cert_number", -1), ("2", "card_title"))
+        self.assertEqual(dummy._adjacent_editable_cell(tree, "3", "card_title", 1), ("2", "cert_number"))
+
+    def test_tab_commits_and_opens_the_adjacent_cell(self) -> None:
+        class FakeTree:
+            _display_columns = ("cert_number", "card_title")
+
+            def get_children(self):
+                return ("2", "3")
+
+            def exists(self, row_id):
+                return row_id in self.get_children()
+
+            def selection_set(self, row_id):
+                self.selected = row_id
+
+            def focus(self, row_id):
+                self.focused = row_id
+
+            def see(self, row_id):
+                self.seen = row_id
+
+        class Dummy:
+            _tree_columns = app.CardPipelineApp._tree_columns
+            _adjacent_editable_cell = app.CardPipelineApp._adjacent_editable_cell
+            _commit_cell_edit_and_move = app.CardPipelineApp._commit_cell_edit_and_move
+
+            def _commit_cell_edit(self):
+                self.committed = True
+
+            def _begin_cell_edit_at(self, tree, row_id, column):
+                self.opened = (tree, row_id, column)
+
+        tree = FakeTree()
+        dummy = Dummy()
+        dummy.cell_edit = (tree, "2", "card_title")
+
+        result = dummy._commit_cell_edit_and_move(1)
+
+        self.assertEqual(result, "break")
+        self.assertTrue(dummy.committed)
+        self.assertEqual(dummy.opened, (tree, "3", "cert_number"))
+        self.assertEqual((tree.selected, tree.focused, tree.seen), ("3", "3", "3"))
+
     def test_bridge_only_hands_commands_to_expected_extension_version(self) -> None:
         bridge = app.BridgeState()
         row = WorkbookRow(excel_row=2, cert_number="123", grader="CGC", card_title="Test Card CGC 9")
@@ -7673,7 +7771,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             refresh_received_sheets = lambda self: None
             refresh_incoming_index = lambda self: None
             refresh_home = lambda self: None
-            refresh_inventory_tab = lambda self, enrich=False: None
+            def refresh_inventory_tab(self, enrich=False):
+                self.inventory_refresh_enrich.append(enrich)
 
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -7713,6 +7812,8 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             dummy.received_sheet_paths = {}
             dummy.deleted_sheet_marker_keys = set()
             dummy.status_var = Status()
+            dummy.inventory_tree = object()
+            dummy.inventory_refresh_enrich = []
             try:
                 dummy.save_home_sheet_markers(
                     {
@@ -7741,6 +7842,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 self.assertNotEqual(inventory[2]["item_id"], inventory[3]["item_id"])
                 self.assertEqual(inventory[3]["card_title"], "Second Raw Card Without Sheet ID")
                 self.assertIn("Added 4 inventory row", dummy.status_var.value)
+                self.assertEqual(dummy.inventory_refresh_enrich, [False])
             finally:
                 app.CARD_PIPELINE_DIR = old_pipeline
                 app.INCOMING_SHEETS_DIR = old_incoming
