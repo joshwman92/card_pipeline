@@ -11704,7 +11704,7 @@ class CardPipelineApp(tk.Tk):
         if callable(refresh_marker_save):
             refresh_marker_save(current_name, _current_kind, moved=moved, source_stage=source_kind)
         if hasattr(self, "inventory_tree") and (inventory_rows_added or inventory_rows_reassigned):
-            self.refresh_inventory_tab(enrich=True)
+            self.refresh_inventory_tab()
         if profit_rows_reassigned and hasattr(self, "profit_tree"):
             self.refresh_profit_tab()
         if popup is not None:
@@ -15678,7 +15678,12 @@ class CardPipelineApp(tk.Tk):
         column = columns[column_index]
         if column not in EDITABLE_COLUMNS:
             return
-        bbox = tree.bbox(row_id, column_id)
+        self._begin_cell_edit_at(tree, row_id, column)
+
+    def _begin_cell_edit_at(self, tree: ttk.Treeview, row_id: str, column: str) -> None:
+        if column not in EDITABLE_COLUMNS or not str(row_id).isdigit():
+            return
+        bbox = tree.bbox(row_id, column)
         if not bbox:
             return
         self._cancel_cell_edit()
@@ -15702,6 +15707,8 @@ class CardPipelineApp(tk.Tk):
         self.cell_edit = (tree, row_id, column)
         editor.bind("<Return>", lambda _event: self._commit_cell_edit())
         editor.bind("<KP_Enter>", lambda _event: self._commit_cell_edit())
+        editor.bind("<Tab>", lambda _event: self._commit_cell_edit_and_move(1))
+        editor.bind("<Shift-Tab>", lambda _event: self._commit_cell_edit_and_move(-1))
         editor.bind("<Escape>", lambda _event: self._cancel_cell_edit())
         editor.bind("<FocusOut>", lambda _event: self._commit_cell_edit())
         if is_receive_card_autocomplete:
@@ -15709,6 +15716,36 @@ class CardPipelineApp(tk.Tk):
             editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
         elif is_best_company_choice:
             editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
+
+    def _adjacent_editable_cell(
+        self,
+        tree: ttk.Treeview,
+        row_id: str,
+        column: str,
+        step: int,
+    ) -> tuple[str, str] | None:
+        rows = [str(iid) for iid in tree.get_children() if str(iid).isdigit()]
+        columns = [name for name in self._tree_columns(tree) if name in EDITABLE_COLUMNS]
+        if not rows or not columns or row_id not in rows or column not in columns:
+            return None
+        cells = [(iid, name) for iid in rows for name in columns]
+        current_index = cells.index((row_id, column))
+        return cells[(current_index + step) % len(cells)]
+
+    def _commit_cell_edit_and_move(self, step: int) -> str:
+        if not self.cell_edit:
+            return "break"
+        tree, row_id, column = self.cell_edit
+        next_cell = self._adjacent_editable_cell(tree, row_id, column, step)
+        self._commit_cell_edit()
+        if next_cell is not None:
+            next_row_id, next_column = next_cell
+            if tree.exists(next_row_id):
+                tree.selection_set(next_row_id)
+                tree.focus(next_row_id)
+                tree.see(next_row_id)
+                self._begin_cell_edit_at(tree, next_row_id, next_column)
+        return "break"
 
     def _best_company_choices(self, current: object = "") -> list[str]:
         """Return the manual Best Company dropdown choices for Comp and Receive rows."""

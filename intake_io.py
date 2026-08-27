@@ -165,34 +165,88 @@ def read_simple_spreadsheet(path: Path, sheet_name: str | None = None) -> list[d
     workbook = load_workbook(path, read_only=True, data_only=True)
     try:
         sheet = workbook[sheet_name] if sheet_name else workbook[workbook.sheetnames[0]]
+        values = [tuple(row) for row in sheet.iter_rows(values_only=True)]
         rows: list[dict[str, Any]] = []
-        header_row = _simple_header_row(sheet)
-        has_header = bool(header_row)
-        headers = _header_map_for_row(sheet, header_row or 1) if has_header else {}
-        start_row = (header_row or 0) + 1 if has_header else 1
+
+        header_index: int | None = None
+        best_index: int | None = None
+        best_headers: dict[str, int] = {}
+        best_score = 0
+        for index, raw_row in enumerate(values[:10]):
+            candidate = {
+                _normalize_header(value): column + 1
+                for column, value in enumerate(raw_row)
+                if value
+            }
+            score = _simple_header_score(candidate)
+            if score > best_score:
+                best_index = index
+                best_headers = candidate
+                best_score = score
+        header_tokens = (
+            "cert",
+            "card",
+            "description",
+            "purchase",
+            "price",
+            "estimate",
+            "confidence",
+            "comp",
+            "ladder",
+            "date",
+        )
+        if best_index is not None and best_score >= 2:
+            header_index = best_index
+        elif best_index is not None and best_score >= 1:
+            joined = " ".join(clean_part(value).lower() for value in values[best_index][:8])
+            if any(token in joined for token in header_tokens):
+                header_index = best_index
+        if header_index is None and values:
+            joined = " ".join(clean_part(value).lower() for value in values[0][:8])
+            if any(token in joined for token in header_tokens[:-1]):
+                header_index = 0
+
+        has_header = header_index is not None
+        headers: dict[str, int] = {}
+        if header_index is not None:
+            headers = (
+                best_headers
+                if header_index == best_index
+                else {
+                    _normalize_header(value): column + 1
+                    for column, value in enumerate(values[header_index])
+                    if value
+                }
+            )
+        start_index = (header_index + 1) if has_header else 0
         cert_fallback = None if has_header else 1
         card_fallback = None if has_header else 2
         purchase_fallback = None if has_header else 3
         source_fallback = None if has_header else 4
-        for row_index in range(start_row, _sheet_max_row(sheet) + 1):
-            date_added = clean_part(_cell_by_header(sheet, row_index, headers, DATE_HEADERS, None))
-            item_id = clean_part(_cell_by_header(sheet, row_index, headers, ITEM_ID_HEADERS, None))
-            cert = normalize_cert(_cell_by_header(sheet, row_index, headers, CERT_HEADERS, cert_fallback))
-            grader = normalize_grader(_cell_by_header(sheet, row_index, headers, GRADER_HEADERS, None))
-            card = clean_part(_cell_by_header(sheet, row_index, headers, CARD_HEADERS, card_fallback))
-            sport = clean_part(_cell_by_header(sheet, row_index, headers, SPORT_HEADERS, None))
-            purchase_price = parse_money(_cell_by_header(sheet, row_index, headers, PURCHASE_PRICE_HEADERS, purchase_fallback))
-            card_ladder_value = parse_money(_cell_by_header(sheet, row_index, headers, CARD_LADDER_VALUE_HEADERS, None))
-            comps_average = parse_money(_cell_by_header(sheet, row_index, headers, COMPS_AVERAGE_HEADERS, None))
-            cy_value = parse_money(_cell_by_header(sheet, row_index, headers, CY_ESTIMATE_HEADERS, None))
-            cy_confidence = _cell_by_header(sheet, row_index, headers, CY_CONFIDENCE_HEADERS, None)
-            comp_details = clean_part(_cell_by_header(sheet, row_index, headers, COMP_DETAILS_HEADERS, None))
-            best_company = clean_part(_cell_by_header(sheet, row_index, headers, BEST_COMPANY_HEADERS, None))
-            estimated_payout = parse_money(_cell_by_header(sheet, row_index, headers, ESTIMATED_PAYOUT_HEADERS, None))
-            status = clean_part(_cell_by_header(sheet, row_index, headers, STATUS_HEADERS, None))
-            notes = clean_part(_cell_by_header(sheet, row_index, headers, NOTES_HEADERS, None))
-            source = clean_part(_cell_by_header(sheet, row_index, headers, SOURCE_HEADERS, source_fallback))
-            received = _is_received_value(_cell_by_header(sheet, row_index, headers, (_normalize_header(RECEIVED_HEADER),), None))
+
+        def cell(raw_row: tuple[Any, ...], aliases: tuple[str, ...], fallback_column: int | None = None) -> Any:
+            column = next((headers[alias] for alias in aliases if alias in headers), fallback_column)
+            return raw_row[column - 1] if column and column <= len(raw_row) else ""
+
+        for row_index, raw_row in enumerate(values[start_index:], start=start_index + 1):
+            date_added = clean_part(cell(raw_row, DATE_HEADERS))
+            item_id = clean_part(cell(raw_row, ITEM_ID_HEADERS))
+            cert = normalize_cert(cell(raw_row, CERT_HEADERS, cert_fallback))
+            grader = normalize_grader(cell(raw_row, GRADER_HEADERS))
+            card = clean_part(cell(raw_row, CARD_HEADERS, card_fallback))
+            sport = clean_part(cell(raw_row, SPORT_HEADERS))
+            purchase_price = parse_money(cell(raw_row, PURCHASE_PRICE_HEADERS, purchase_fallback))
+            card_ladder_value = parse_money(cell(raw_row, CARD_LADDER_VALUE_HEADERS))
+            comps_average = parse_money(cell(raw_row, COMPS_AVERAGE_HEADERS))
+            cy_value = parse_money(cell(raw_row, CY_ESTIMATE_HEADERS))
+            cy_confidence = cell(raw_row, CY_CONFIDENCE_HEADERS)
+            comp_details = clean_part(cell(raw_row, COMP_DETAILS_HEADERS))
+            best_company = clean_part(cell(raw_row, BEST_COMPANY_HEADERS))
+            estimated_payout = parse_money(cell(raw_row, ESTIMATED_PAYOUT_HEADERS))
+            status = clean_part(cell(raw_row, STATUS_HEADERS))
+            notes = clean_part(cell(raw_row, NOTES_HEADERS))
+            source = clean_part(cell(raw_row, SOURCE_HEADERS, source_fallback))
+            received = _is_received_value(cell(raw_row, (_normalize_header(RECEIVED_HEADER),)))
             if not cert and not card and purchase_price is None:
                 continue
             grader = grader or infer_grader(card)
