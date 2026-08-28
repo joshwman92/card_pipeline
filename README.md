@@ -60,6 +60,18 @@ The app starts the local Card Ladder bridge automatically when L.U.C.A.S opens.
 
 The bridge currently expects helper version `2026-08-15-generic-title-settle-v26`. If Chrome shows a debugger warning during non-PSA grader selection, that is Chrome's browser-level warning for the trusted-click fallback; the attach is scoped to the Card Ladder tab and detached after the grader click.
 
+## CourtYard Android Automation (Windows)
+
+Windows can optionally populate `CY Estimate` and `CY Confidence` through the CourtYard Android Scanner after Card Ladder finishes. It opens one Appium session for the entire comp batch, validates each CourtYard result against the Card Ladder card name, card number, grader, and grade, then closes the session when the batch ends. Results marked `NOT BUYING` leave both CY fields blank. The Android Scanner supports PSA, BGS, and CGC in this workflow; SGC rows are skipped.
+
+1. Install Android Studio, create a Google Play-enabled Android emulator named `LUCAS_Courtyard`, and install/log into CourtYard.
+2. Install Node.js and Appium, then run `appium driver install uiautomator2`.
+3. Run `install_dependencies.bat` again so the Python Appium client is installed.
+4. Set `LUCAS_CY_APPIUM_ENABLED=1` in `.env`.
+5. In Comp, enable `Include CourtYard after Card Ladder`. LUCAS starts the emulator and local Appium server on demand, waits for them, and then begins CY lookups.
+
+The default emulator profile is `LUCAS_Courtyard`, the default Appium server is `http://127.0.0.1:4723`, the default CourtYard package is `io.courtyard.app`, and the default activity is `.MainActivity`. LUCAS discovers the standard Android SDK and npm Appium locations. If the configured emulator is registered but stops responding, LUCAS restarts ADB and then performs a targeted emulator restart before giving up. Override runtime paths with `LUCAS_CY_ANDROID_SDK`, `LUCAS_CY_ANDROID_AVD`, `LUCAS_CY_APPIUM_COMMAND`, `LUCAS_CY_APPIUM_URL`, `LUCAS_CY_ANDROID_UDID`, `LUCAS_CY_APP_PACKAGE`, or `LUCAS_CY_APP_ACTIVITY` in `.env` when needed. Set `LUCAS_CY_AUTO_START=0` to require manual startup, or set `LUCAS_CY_APPIUM_ENABLED=0`/`LUCAS_DISABLE_CY_LOOKUP=1` to disable CourtYard automation. Autostarted Appium logs to `work/cardladder-bridge/appium-autostart.log`.
+
 ## Input Modes
 
 Use the `Create` tab for all card entry.

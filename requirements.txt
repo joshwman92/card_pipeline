@@ -1,4 +1,5 @@
 certifi
+Appium-Python-Client
 google-genai
 openpyxl
 pillow

@@ -18,6 +18,7 @@ from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from cardladder_ocr import extract_cl_value_from_data_url
+from cy_appium import CourtyardAndroidAdapter, NOT_BUYING_MESSAGE, SUPPORTED_GRADERS as WINDOWS_CY_GRADERS, appium_client_available
 from workbook_io import WorkbookRow
 import assignment_engine
 
@@ -314,7 +315,16 @@ class BridgeState:
             eligible_rows = [
                 row
                 for row in self.rows
-                if row.cert_number and row.grader and (requery_all or not row_has_comp_data(row))
+                if row.cert_number
+                and row.grader
+                and (
+                    requery_all
+                    or not row_has_comp_data(row)
+                    or (
+                        allow_deferred_cy
+                        and (row.cy_value is None or not str(row.cy_confidence or "").strip())
+                    )
+                )
             ]
             queue = [
                 {
@@ -471,7 +481,7 @@ class BridgeState:
             return None
         cert_number = str(row.cert_number or "").strip()
         slab_type = clean_grader(row.grader)
-        if not cert_number or slab_type not in {"PSA", "BGS", "CGC", "SGC"}:
+        if not cert_number or slab_type not in cy_supported_graders():
             debug_log(f"cy_lookup_skip row={row.excel_row} reason=missing_or_unsupported cert={cert_number} slab={slab_type}")
             return None
         return row.excel_row, cert_number, slab_type
@@ -496,8 +506,10 @@ class BridgeState:
             if generation != self.cy_lookup_generation or excel_row not in self.cy_lookup_inflight:
                 debug_log(f"cy_lookup_cancelled_before_start row={excel_row} cert={cert_number}")
                 return
+            source_row = next((candidate for candidate in self.rows if candidate.excel_row == excel_row), None)
+            profile_title = str(getattr(source_row, "card_title", "") or "")
         try:
-            result = lookup_cy_buy_price(cert_number, slab_type)
+            result = lookup_cy_buy_price(cert_number, slab_type, profile_title)
             if len(result) == 3:
                 value, confidence, message = result
             else:
@@ -514,7 +526,7 @@ class BridgeState:
             if row is not None and str(row.cert_number or "").strip() == cert_number:
                 self.updated_row_ids.add(id(row))
                 existing_status = str(row.status or "").strip()
-                is_cy_only_status = existing_status in {"CY queued", "CY unavailable", "CY OK"}
+                is_cy_only_status = existing_status in {"CY queued", "CY unavailable", "CY not buying", "CY OK"}
                 if value is not None:
                     row.cy_value = value
                     row.cy_confidence = confidence
@@ -523,8 +535,11 @@ class BridgeState:
                     row.notes = append_note(row.notes, f"CY value: ${value:,.2f}")
                     debug_log(f"cy_lookup_ok row={excel_row} cert={cert_number} value={value} confidence={confidence}")
                 elif message:
+                    if message == NOT_BUYING_MESSAGE:
+                        row.cy_value = None
+                        row.cy_confidence = None
                     if is_cy_only_status:
-                        row.status = "CY unavailable"
+                        row.status = "CY not buying" if message == NOT_BUYING_MESSAGE else "CY unavailable"
                     row.notes = append_note(row.notes, f"CY lookup: {message}")
                     debug_log(f"cy_lookup_unavailable row={excel_row} cert={cert_number} message={message}")
             should_close = self.cy_batch_running and not self.cy_lookup_inflight and not self.cy_lookup_pending and not self.cardladder_running
@@ -732,30 +747,57 @@ def normalize_keep_url(value: str) -> str:
 def cy_lookup_enabled(platform: str | None = None) -> bool:
     if os.environ.get("LUCAS_DISABLE_CY_LOOKUP", "").strip().lower() in {"1", "true", "yes"}:
         return False
-    return (platform or sys.platform) == "darwin"
+    runtime = platform or sys.platform
+    if runtime == "darwin":
+        return True
+    windows_enabled = os.environ.get("LUCAS_CY_APPIUM_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+    return runtime == "win32" and windows_enabled and appium_client_available()
 
 
-def cy_close_after_batch_enabled() -> bool:
-    return os.environ.get("LUCAS_CY_CLOSE_AFTER_BATCH", "").strip().lower() in {"1", "true", "yes"}
+def cy_supported_graders(platform: str | None = None) -> set[str]:
+    return set(WINDOWS_CY_GRADERS) if (platform or sys.platform) == "win32" else {"PSA", "BGS", "CGC", "SGC"}
 
 
-def lookup_cy_buy_price(cert_number: str, slab_type: str) -> tuple[float | None, object | None, str]:
+def cy_close_after_batch_enabled(platform: str | None = None) -> bool:
+    configured = os.environ.get("LUCAS_CY_CLOSE_AFTER_BATCH", "").strip().lower()
+    if configured:
+        return configured in {"1", "true", "yes"}
+    return (platform or sys.platform) == "win32"
+
+
+def lookup_cy_buy_price(cert_number: str, slab_type: str, profile_title: str = "") -> tuple[float | None, object | None, str]:
     cert_number = str(cert_number or "").strip()
     slab_type = clean_grader(slab_type)
     if not cert_number:
         return None, None, "missing cert number"
-    if slab_type not in {"PSA", "BGS", "CGC", "SGC"}:
+    if slab_type not in cy_supported_graders():
         return None, None, f"unsupported slab type {slab_type or 'unknown'}"
-    return None, None, "CY GUI lookup is unavailable on Windows."
+    if sys.platform != "win32":
+        return None, None, "CY GUI lookup is unavailable on this platform."
+    try:
+        with _CY_LOOKUP_LOCK:
+            return get_cy_adapter().lookup(cert_number, slab_type, profile_title)
+    except Exception as error:
+        return None, None, str(error)
 
 
 def get_cy_adapter():
-    raise RuntimeError("CY GUI lookup is unavailable on Windows.")
+    global _CY_ADAPTER
+    if sys.platform != "win32":
+        raise RuntimeError("CY GUI lookup is unavailable on this platform.")
+    with _CY_ADAPTER_LOCK:
+        if _CY_ADAPTER is None:
+            _CY_ADAPTER = CourtyardAndroidAdapter(
+                runtime_status=lambda message: debug_log(f"cy_runtime {message}")
+            )
+        return _CY_ADAPTER
 
 
 def close_cy_adapter() -> None:
+    global _CY_ADAPTER
     with _CY_ADAPTER_LOCK:
         adapter = _CY_ADAPTER
+        _CY_ADAPTER = None
     if adapter is None:
         return
     try:
@@ -845,9 +887,22 @@ def clean_grade(value) -> str:
 def build_card_title(description: str, grader: str, grade: str) -> str:
     title = clean_profile_title(description)
     parts = [title] if title else []
-    if grader and not re.search(rf"\b{re.escape(grader)}\b", title, re.I):
+    grader_present = bool(grader and re.search(rf"\b{re.escape(grader)}\b", title, re.I))
+    if grader and not grader_present:
         parts.append(grader)
-    if grade and not re.search(rf"(?<!\d){re.escape(grade)}(?!\d)", " ".join(parts)):
+    # A card number can be identical to the grade (for example, Misty's
+    # Tentacruel #10 in PSA 10). Only treat a grade as already present when it
+    # is paired with the grader, rather than matching any number in the title.
+    identity = " ".join(parts)
+    grade_present = bool(
+        grader
+        and grade
+        and (
+            re.search(rf"\b{re.escape(grader)}\s+{re.escape(grade)}(?!\d)", identity, re.I)
+            or re.search(rf"(?<!\d){re.escape(grade)}\s+{re.escape(grader)}\b", identity, re.I)
+        )
+    )
+    if grade and not grade_present:
         parts.append(grade)
     return re.sub(r"\s+", " ", " ".join(parts)).strip()
 

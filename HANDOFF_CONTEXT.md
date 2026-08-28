@@ -103,8 +103,8 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
   - `Card Ladder value`
   - `CY Estimate`
 - Assignment audit note: default `Comps` value-source assignment now correctly falls back from comps to Card Ladder value to CY Estimate. `CourtYard`, `court yard`, `CY value`, and similar aliases normalize to `CY Estimate` in both config load and Company Rules UI. Grade-bounded rules now reject rows where the grader matches but no numeric grade was parsed.
-- Windows does not run CourtYard/CY lookup automation. It only reads CY values that already exist in sheets.
-- Mac keeps CourtYard comp lookup as a Mac-only ability in the separate Mac repo.
+- Windows can optionally run CourtYard/CY lookup automation through one Appium/Android session per comp batch. It runs after Card Ladder and validates the CourtYard card name, card number, grader, and grade before accepting value/confidence. PSA, BGS, and CGC are supported; SGC is skipped because the Android Scanner has no SGC option.
+- Enable the Windows adapter with `LUCAS_CY_APPIUM_ENABLED=1`. `comp_engine/cy_runtime.py` discovers or launches the configured Android emulator and local Appium server on demand, then waits for both to become ready.
 - Company sheets now use one workbook per company with weekly tabs:
   - `COMPANY SHEETS\<Company>\<Company>.xlsx`
   - weekly tab name: `Week of YYYY-MM-DD`
@@ -152,14 +152,9 @@ Deferred future work, not for the current build: true live-anywhere mobile acces
 
 ## Platform Split
 
-Windows repo intentionally has no CourtYard automation:
+Windows CourtYard automation lives in `comp_engine/cy_appium.py`, with emulator/Appium startup in `comp_engine/cy_runtime.py`. The Comp and Inventory Recomp workflows can include CY after Card Ladder, reuse one authenticated Android/Appium session for the full batch, and write both `CY Estimate` and `CY Confidence`. The adapter requires explicit local enablement and skips SGC.
 
-- no `comp_engine/cy_automation`
-- no `lookup_cy_buy_price`
-- no `Card Ladder + CY` comp-source selector
-- no CY lookup calls during comping
-
-Windows can still read and use `CY Estimate`/`CY Confidence` from imported sheets for assignment logic.
+Windows can also read and use `CY Estimate`/`CY Confidence` from imported sheets for assignment logic when automation is disabled.
 
 ## Project Layout
 
@@ -338,5 +333,5 @@ python -c "import app; root = app.CardPipelineApp(); root.update_idletasks(); ro
 Tell a new chat:
 
 ```text
-Work in C:\Users\User\Documents\Codex\2026-06-04\card_pipeline for Windows and C:\Users\User\Documents\Codex\2026-06-13\card-pipeline-mac for Mac. Read HANDOFF_CONTEXT.md first. Current known-good Card Ladder helper is 2026-08-15-generic-title-settle-v26. Do not reintroduce blind guessed grader-option coordinates; v22 fixed CGC by opening the cert modal, avoiding blind option clicks, re-preparing the modal if synthetic selection closes it, then using trusted chrome.debugger clicks on the visible grader bar only as fallback. The debugger banner is expected during trusted fallback because Chrome owns that UI. Windows has no CourtYard automation; Mac keeps CY automation. Keep main and master in both repos pushed.
+Work in C:\Users\User\Documents\Codex\2026-06-04\card_pipeline for Windows and C:\Users\User\Documents\Codex\2026-06-13\card-pipeline-mac for Mac. Read HANDOFF_CONTEXT.md first. Current known-good Card Ladder helper is 2026-08-15-generic-title-settle-v26. Do not reintroduce blind guessed grader-option coordinates; v22 fixed CGC by opening the cert modal, avoiding blind option clicks, re-preparing the modal if synthetic selection closes it, then using trusted chrome.debugger clicks on the visible grader bar only as fallback. The debugger banner is expected during trusted fallback because Chrome owns that UI. Windows CourtYard automation uses the optional Android/Appium adapter and one session per batch. Keep main and master in both repos pushed.
 ```

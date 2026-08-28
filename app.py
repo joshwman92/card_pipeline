@@ -46,6 +46,7 @@ from bridge_server import (  # noqa: E402
     BridgeServer,
     BridgeState,
     comp_price,
+    cy_lookup_enabled,
     format_comps,
     parse_value,
     parse_formatted_comps,
@@ -866,6 +867,7 @@ class CardPipelineApp(tk.Tk):
         self.comp_strategy_label = tk.StringVar(value="Average last 5")
         self.comp_low_outlier_pct_var = tk.StringVar(value="Off")
         self.comp_scope_label = tk.StringVar(value=COMP_SCOPE_EMPTY)
+        self.comp_cy_var = tk.BooleanVar(value=cy_lookup_enabled())
         self.working_sheet_title = tk.StringVar()
         self.create_network_mode_var = tk.BooleanVar(value=bool(self.app_settings.get("network_mode")))
         self.seller_terms_seller_var = tk.StringVar()
@@ -1614,6 +1616,15 @@ class CardPipelineApp(tk.Tk):
         self.comp_low_outlier_combo.pack(side=tk.RIGHT, padx=(8, 0))
         self.comp_low_outlier_combo.bind("<<ComboboxSelected>>", self.recalculate_comp_method)
         ttk.Label(comp_options, text="Low Comp % Avg", style="Panel.TLabel").pack(side=tk.RIGHT)
+        self.comp_cy_check = ttk.Checkbutton(
+            comp_options,
+            text="Include CourtYard after Card Ladder",
+            variable=self.comp_cy_var,
+            style="Panel.TCheckbutton",
+        )
+        self.comp_cy_check.pack(side=tk.LEFT)
+        if not cy_lookup_enabled():
+            self.comp_cy_check.configure(state=tk.DISABLED)
 
         receive_controls = ttk.Frame(self.receive_tab, style="Panel.TFrame", padding=(16, 12))
         receive_controls.pack(fill=tk.X, pady=(0, 10))
@@ -6613,6 +6624,8 @@ class CardPipelineApp(tk.Tk):
         )
         cl_value_var = tk.BooleanVar(value=True)
         cl_comps_var = tk.BooleanVar(value=True)
+        cy_available = cy_lookup_enabled()
+        cy_var = tk.BooleanVar(value=cy_available)
         strategy_var = tk.StringVar(value=self.comp_strategy_label.get() or "Average last 5")
         scope_var = tk.StringVar(value=COMP_SCOPE_EMPTY)
 
@@ -6629,28 +6642,33 @@ class CardPipelineApp(tk.Tk):
         ttk.Label(frame, text=f"Filtered rows: {visible_count}   Eligible: {eligible_count}", style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 14))
         ttk.Checkbutton(frame, text="Card Ladder value", variable=cl_value_var, style="Panel.TCheckbutton").grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Checkbutton(frame, text="Card Ladder comps", variable=cl_comps_var, style="Panel.TCheckbutton").grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 10))
-        ttk.Label(frame, text="Scope", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(0, 6))
-        ttk.Combobox(frame, textvariable=scope_var, values=(COMP_SCOPE_EMPTY, COMP_SCOPE_ALL), width=24, state="readonly").grid(row=4, column=1, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Comp Method", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(0, 6))
-        ttk.Combobox(frame, textvariable=strategy_var, values=list(COMP_STRATEGY_DISPLAY.keys()), width=24, state="readonly").grid(row=5, column=1, sticky="w", pady=(0, 6))
-        ttk.Label(frame, text="Windows reads CY from sheets but does not run CY automation.", style="Muted.TLabel").grid(row=6, column=0, columnspan=2, sticky="w", pady=(4, 12))
+        cy_check = ttk.Checkbutton(frame, text="CourtYard estimate and confidence", variable=cy_var, style="Panel.TCheckbutton")
+        cy_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        if not cy_available:
+            cy_check.configure(state=tk.DISABLED)
+        ttk.Label(frame, text="Scope", style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(0, 6))
+        ttk.Combobox(frame, textvariable=scope_var, values=(COMP_SCOPE_EMPTY, COMP_SCOPE_ALL), width=24, state="readonly").grid(row=5, column=1, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Comp Method", style="Muted.TLabel").grid(row=6, column=0, sticky="w", pady=(0, 6))
+        ttk.Combobox(frame, textvariable=strategy_var, values=list(COMP_STRATEGY_DISPLAY.keys()), width=24, state="readonly").grid(row=6, column=1, sticky="w", pady=(0, 6))
+        cy_note = "CourtYard runs after Card Ladder in one Android session." if cy_available else "Enable LUCAS_CY_APPIUM_ENABLED and install the Appium Python client to use CourtYard."
+        ttk.Label(frame, text=cy_note, style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 12))
 
         def submit() -> None:
             features = {
                 "card_ladder_value": bool(cl_value_var.get()),
                 "card_ladder_comps": bool(cl_comps_var.get()),
-                "cy": False,
+                "cy": bool(cy_var.get()) and cy_available,
                 "strategy_label": strategy_var.get(),
                 "scope": scope_var.get(),
             }
-            if not features["card_ladder_value"] and not features["card_ladder_comps"]:
-                messagebox.showinfo("Choose recomp features", "Choose at least one Card Ladder field to refresh.", parent=popup)
+            if not features["card_ladder_value"] and not features["card_ladder_comps"] and not features["cy"]:
+                messagebox.showinfo("Choose recomp features", "Choose at least one field to refresh.", parent=popup)
                 return
             popup.destroy()
             self.recomp_inventory_visible_rows(features)
 
         buttons = ttk.Frame(frame, style="Panel.TFrame")
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(4, 0))
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(4, 0))
         ttk.Button(buttons, text="Cancel", command=popup.destroy, style="Soft.TButton").pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(buttons, text="Start Recomp", command=submit, style="Primary.TButton").pack(side=tk.LEFT)
         popup.bind("<Return>", lambda _event: submit())
@@ -6718,7 +6736,7 @@ class CardPipelineApp(tk.Tk):
         self.row_sources = {row.excel_row: "Inventory" for row in temp_rows}
         self.comp_sheet_sources = {}
         self.pending_comp_assignment_row_ids = set()
-        command_id = self.state.start_all_comps(requery_all=True)
+        command_id = self.state.start_all_comps(requery_all=True, allow_deferred_cy=bool(features.get("cy")))
         self._refresh_comp_table(schedule_recommendations=False)
         self.after(12000, lambda queued_command_id=command_id: self._warn_if_extension_not_checked_in(queued_command_id))
         pieces = []
@@ -6726,6 +6744,8 @@ class CardPipelineApp(tk.Tk):
             pieces.append("Card Ladder value")
         if features.get("card_ladder_comps"):
             pieces.append("Card Ladder comps")
+        if features.get("cy"):
+            pieces.append("CourtYard estimate/confidence")
         scope = str(features.get("scope") or COMP_SCOPE_EMPTY)
         self.inventory_status_var.set(f"Queued {' and '.join(pieces)} refresh for {len(temp_rows)} visible inventory card(s) ({scope}).")
         self.status_var.set(f"Inventory recomp queued as Card Ladder command #{command_id}.")
@@ -13960,10 +13980,17 @@ class CardPipelineApp(tk.Tk):
             self.status_var.set("Reload the Card Ladder Chrome extension before comping.")
             return
         requery_all = self.comp_scope_label.get() == COMP_SCOPE_ALL
+        include_cy = bool(getattr(self, "comp_cy_var", None) and self.comp_cy_var.get() and cy_lookup_enabled())
         eligible = [
             row
             for row in self.state.rows
-            if row.cert_number and row.grader and (requery_all or not row_has_comp_data(row))
+            if row.cert_number
+            and row.grader
+            and (
+                requery_all
+                or not row_has_comp_data(row)
+                or (include_cy and (row.cy_value is None or not str(row.cy_confidence or "").strip()))
+            )
         ]
         if not eligible:
             if requery_all:
@@ -13975,11 +14002,12 @@ class CardPipelineApp(tk.Tk):
             return
         self.state.set_comp_strategy(COMP_STRATEGY_DISPLAY.get(self.comp_strategy_label.get(), COMP_STRATEGY_AVERAGE), self._comp_low_outlier_pct())
         self.pending_comp_assignment_row_ids = {id(row) for row in eligible}
-        command_id = self.state.start_all_comps(requery_all=requery_all)
+        command_id = self.state.start_all_comps(requery_all=requery_all, allow_deferred_cy=include_cy)
         self.comp_output_saved = False
         self._refresh_table()
         self.after(12000, lambda queued_command_id=command_id: self._warn_if_extension_not_checked_in(queued_command_id))
-        self.status_var.set(f"Queued {len(eligible)} Card Ladder row(s) using {self.comp_scope_label.get()} with {self.comp_strategy_label.get()} as command #{command_id}.")
+        sources = "Card Ladder + CourtYard" if include_cy else "Card Ladder"
+        self.status_var.set(f"Queued {len(eligible)} {sources} row(s) using {self.comp_scope_label.get()} with {self.comp_strategy_label.get()} as command #{command_id}.")
 
     def _warn_if_extension_not_checked_in(self, command_id: int) -> None:
         extension_warning = self._cardladder_extension_warning()
@@ -16052,11 +16080,17 @@ class CardPipelineApp(tk.Tk):
         if pending_comp_refresh:
             with self.state.lock:
                 cardladder_running = self.state.cardladder_running
+                cy_running = bool(
+                    self.state.cy_batch_running
+                    or self.state.cy_lookup_inflight
+                    or self.state.cy_lookup_pending
+                )
+                comp_running = cardladder_running or cy_running
                 updated_row_ids = set(self.state.updated_row_ids)
                 self.state.updated_row_ids = set()
             if self.inventory_recomp_context:
                 changed = self._sync_inventory_recomp_results()
-                if not cardladder_running:
+                if not comp_running:
                     self._finish_inventory_recomp()
                 elif changed:
                     self.refresh_inventory_tab()
@@ -16065,7 +16099,7 @@ class CardPipelineApp(tk.Tk):
                 return
             scoped_row_ids = updated_row_ids & self.pending_comp_assignment_row_ids
             assigned = self._apply_assignment_to_comp_rows(scoped_row_ids)
-            if not cardladder_running:
+            if not comp_running:
                 self.pending_comp_assignment_row_ids = set()
             self._refresh_comp_table(schedule_recommendations=False)
             if assigned:

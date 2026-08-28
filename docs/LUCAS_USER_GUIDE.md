@@ -99,7 +99,7 @@ Each computer keeps its own local `.env`, OAuth token, identity, settings, and C
 Most normal card flow looks like this:
 
 1. **Create** a sheet from scans, manual entry, photo OCR, or an existing spreadsheet.
-2. **Comp** the rows with Card Ladder and, on Mac only, CourtYard/CY if needed.
+2. **Comp** the rows with Card Ladder and optionally CourtYard/CY when the platform adapter is configured.
 3. **Assignment** runs rules to choose best company and estimated payout.
 4. Move the sheet to **Incoming**.
 5. When cards arrive, use **Receive** to mark cards received.
@@ -181,7 +181,13 @@ The Comp tab queues rows for card-value lookup.
 Windows:
 
 - Runs Card Ladder through the Chrome extension.
-- Does not run CourtYard/CY automation.
+- Can run CourtYard/CY through the optional Android/Appium adapter after Card Ladder.
+- Starts the configured Android emulator and local Appium server on demand when they are not already running.
+- Waits for Android and Appium readiness; manually started instances are reused and left untouched.
+- Attempts an ADB reset and targeted restart when the configured CourtYard emulator is frozen.
+- Reuses one CourtYard session for the full batch and validates the returned card profile before saving CY data.
+- Leaves CY Estimate and CY Confidence blank when CourtYard marks a matched result `NOT BUYING`.
+- Supports PSA, BGS, and CGC CourtYard lookups; SGC is skipped.
 - Can still read and use CY Estimate/CY Confidence that already exists in a sheet.
 
 Mac:
@@ -593,7 +599,7 @@ Other tips:
 | Area | Windows | Mac |
 | --- | --- | --- |
 | Card Ladder | Yes | Yes |
-| CourtYard/CY automation | No | Yes |
+| CourtYard/CY automation | Yes, with Android/Appium | Yes |
 | Reads CY fields from sheets | Yes | Yes |
 | Google Keep sync action | Yes | Yes |
 | Mobile companion | No | Yes |

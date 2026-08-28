@@ -30,6 +30,8 @@ import assignment_engine
 import google_sheets_import
 import lucas_diagnostics
 import cardladder_ocr
+import bridge_server
+import cy_appium
 import shared_state
 from bridge_server import BridgeState, cert_match_key as bridge_cert_match_key, clean_profile_title as bridge_clean_profile_title, generic_profile_review_reason, keep_urls_match, normalize_result_cert as bridge_normalize_result_cert, parse_value as bridge_parse_value
 from comp_engine.workbook_io import WorkbookRow
@@ -72,6 +74,544 @@ import multi_card_extraction
 
 
 class SharedStateTests(unittest.TestCase):
+    def test_courtyard_result_description_parses_value_confidence_and_profile(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Pippi-Prism #035, Pocket Monsters Sealdass Series 2, PSA 9, $47.50, CONFIDENCE, 5"
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.card_name, "Pippi-Prism #035")
+        self.assertEqual(result.card_set, "Pocket Monsters Sealdass Series 2")
+        self.assertEqual(result.card_number, "35")
+        self.assertEqual(result.value, 47.5)
+        self.assertEqual(result.confidence, 5)
+        self.assertEqual((result.grader, result.grade), ("PSA", "9"))
+
+    def test_courtyard_result_matches_cardladder_name_number_and_grade(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Pippi-Prism #035, Pocket Monsters Sealdass Series 2, PSA 9, $47.50, CONFIDENCE, 5"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "1997 Pocket Monsters Sealdass Series 2 035 Pippi Prism PSA 9",
+            "PSA",
+        )
+
+        self.assertTrue(matched, reason)
+
+    def test_courtyard_fractional_card_number_matches_cardladder_profile(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Master Ball #99/113, EX Delta Species, CGC 10, $65.10, CONFIDENCE, 5"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2005 Pokemon EX Delta Species Master Ball 99 / 113 CGC 10",
+            "CGC",
+        )
+
+        self.assertEqual(result.card_number, "99113")
+        self.assertTrue(matched, reason)
+
+    def test_courtyard_not_buying_result_is_parsed_but_returns_no_value(self) -> None:
+        description = (
+            "Jolteon EX #209, Sv8a-Terastal Fest EX, PSA 10, "
+            "NOT BUYING, $96.60, CONFIDENCE, 5"
+        )
+        result = cy_appium.parse_result_description(description)
+        assert result is not None
+        self.assertTrue(result.not_buying)
+        self.assertEqual((result.value, result.confidence), (96.6, 5))
+
+        class FakeElement:
+            def click(self):
+                return None
+
+            def clear(self):
+                return None
+
+            def send_keys(self, _value):
+                return None
+
+            def get_attribute(self, _name):
+                return description
+
+            def is_enabled(self):
+                return True
+
+        class FakeDriver:
+            def activate_app(self, _package):
+                return None
+
+            def find_elements(self, by, _query):
+                return [FakeElement()] if by in {"accessibility", "xpath"} else []
+
+            def quit(self):
+                return None
+
+        adapter = cy_appium.CourtyardAndroidAdapter(driver_factory=FakeDriver)
+        adapter._appium_by = lambda: types.SimpleNamespace(ACCESSIBILITY_ID="accessibility", XPATH="xpath")
+
+        lookup = adapter.lookup("123", "PSA", "2024 Pokemon Jolteon EX 209 PSA 10")
+
+        self.assertEqual(lookup, (None, None, cy_appium.NOT_BUYING_MESSAGE))
+
+    def test_courtyard_not_buying_clears_existing_value_and_confidence(self) -> None:
+        bridge = BridgeState()
+        row = WorkbookRow(
+            excel_row=2,
+            cert_number="123",
+            grader="PSA",
+            card_title="2024 Pokemon Jolteon EX 209 PSA 10",
+            cy_value=96.6,
+            cy_confidence=5,
+            status="CY queued",
+        )
+        bridge.set_rows([row])
+        bridge.cy_lookup_inflight.add(2)
+        bridge.cy_batch_running = True
+        generation = bridge.cy_lookup_generation
+
+        with (
+            patch.object(
+                bridge_server,
+                "lookup_cy_buy_price",
+                return_value=(None, None, cy_appium.NOT_BUYING_MESSAGE),
+            ),
+            patch.object(bridge_server, "close_cy_adapter"),
+        ):
+            bridge._cy_lookup_worker(2, "123", "PSA", generation)
+
+        self.assertIsNone(row.cy_value)
+        self.assertIsNone(row.cy_confidence)
+        self.assertEqual(row.status, "CY not buying")
+
+    def test_courtyard_result_rejects_stale_cardladder_profile(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Pippi-Prism #035, Pocket Monsters Sealdass Series 2, PSA 9, $47.50, CONFIDENCE, 5"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2022 Panini Donruss 202 Chet Holmgren Yellow Holo Laser PSA 9",
+            "PSA",
+        )
+
+        self.assertFalse(matched)
+        self.assertIn("card name", reason)
+
+    def test_courtyard_new_result_can_match_name_set_and_grade_without_number(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Charizard, Neo Premium File 2, CGC 8, $205.00, CONFIDENCE, 4"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2000 Pokemon Neo Premium File 2 Japanese Charizard Reverse Holo CGC 8",
+            "CGC",
+            allow_missing_card_number=True,
+        )
+
+        self.assertTrue(matched, reason)
+
+    def test_courtyard_unchanged_result_still_requires_card_number(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Charizard, Neo Premium File 2, CGC 8, $205.00, CONFIDENCE, 4"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2000 Pokemon Neo Premium File 2 Japanese Charizard Reverse Holo CGC 8",
+            "CGC",
+        )
+
+        self.assertFalse(matched)
+        self.assertIn("did not contain a card number", reason)
+
+    def test_courtyard_name_matches_cardladder_abbreviated_multiword_name(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Shadow Rider Calyrex Vmax #TG30, Astral Radiance, PSA 10, $70.00, CONFIDENCE, 4"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2022 Pokemon Sword & Shield Astral Radiance #TG30 Fa / Sr Calyrex Vmax PSA 10",
+            "PSA",
+        )
+
+        self.assertTrue(matched, reason)
+
+    def test_courtyard_name_matches_cardladder_vowelless_abbreviation(self) -> None:
+        result = cy_appium.parse_result_description(
+            "Pikachu & Zekrom GX #SM248, Black Star Promo, PSA 9, $100.00, CONFIDENCE, 4"
+        )
+        assert result is not None
+
+        matched, reason = cy_appium.validate_result_profile(
+            result,
+            "2021 Pokemon Sm Black Star Promo #SM248 Fa / Pikachu & Zkrm. Gx PSA 9",
+            "PSA",
+        )
+
+        self.assertTrue(matched, reason)
+
+    def test_courtyard_changed_results_detects_duplicate_new_card(self) -> None:
+        card = "Test Card #123, Test Set, PSA 10, $20.00, CONFIDENCE, 4"
+
+        self.assertEqual(cy_appium.changed_result_descriptions([card], [card, card]), [card])
+
+    def test_card_title_keeps_grade_when_card_number_matches_grade(self) -> None:
+        title = bridge_server.build_card_title(
+            "2000 Pokemon Gym Heroes 10 Misty's Tentacruel Holo-1st Edition",
+            "PSA",
+            "10",
+        )
+
+        self.assertEqual(
+            title,
+            "2000 Pokemon Gym Heroes 10 Misty's Tentacruel Holo-1st Edition PSA 10",
+        )
+
+    def test_windows_courtyard_reuses_single_adapter_for_multiple_lookups(self) -> None:
+        class FakeAdapter:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def lookup(self, cert_number, slab_type, profile_title):
+                self.calls.append((cert_number, slab_type, profile_title))
+                return 10.0, 4, ""
+
+        adapter = FakeAdapter()
+        with (
+            patch.object(bridge_server.sys, "platform", "win32"),
+            patch.object(bridge_server, "_CY_ADAPTER", adapter),
+        ):
+            first = bridge_server.lookup_cy_buy_price("111", "PSA", "Test #123 PSA 10")
+            second = bridge_server.lookup_cy_buy_price("222", "BGS", "Other #456 BGS 9.5")
+
+        self.assertEqual(first, (10.0, 4, ""))
+        self.assertEqual(second, (10.0, 4, ""))
+        self.assertEqual(len(adapter.calls), 2)
+
+    def test_courtyard_android_adapter_keeps_one_driver_for_batch(self) -> None:
+        descriptions = [
+            "First Player #123, First Set, PSA 10, $20.00, CONFIDENCE, 4",
+            "Second Player #456, Second Set, BGS 9.5, $30.00, CONFIDENCE, 5",
+        ]
+
+        class FakeElement:
+            def __init__(self, description="", on_click=None) -> None:
+                self.description = description
+                self.on_click = on_click
+
+            def click(self) -> None:
+                if self.on_click:
+                    self.on_click()
+
+            def clear(self) -> None:
+                return None
+
+            def send_keys(self, _value) -> None:
+                return None
+
+            def get_attribute(self, _name):
+                return self.description
+
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.results = []
+                self.searches = 0
+                self.quit_count = 0
+
+            def activate_app(self, _package) -> None:
+                return None
+
+            def find_element(self, _by, label):
+                if label == "SEARCH":
+                    def add_result():
+                        if self.searches < len(descriptions):
+                            self.results.append(descriptions[self.searches])
+                            self.searches += 1
+                    return FakeElement(on_click=add_result)
+                return FakeElement()
+
+            def find_elements(self, by, query):
+                if by == "accessibility":
+                    if query == "SEARCH":
+                        def add_result():
+                            if self.searches < len(descriptions):
+                                self.results.append(descriptions[self.searches])
+                                self.searches += 1
+                        return [FakeElement(on_click=add_result)]
+                    return [FakeElement()]
+                return [FakeElement(description) for description in self.results]
+
+            def quit(self) -> None:
+                self.quit_count += 1
+
+        driver = FakeDriver()
+        factory_calls = []
+        adapter = cy_appium.CourtyardAndroidAdapter(driver_factory=lambda: factory_calls.append(True) or driver)
+        adapter._appium_by = lambda: types.SimpleNamespace(ACCESSIBILITY_ID="accessibility", XPATH="xpath")
+
+        first = adapter.lookup("111", "PSA", "First Player 123 PSA 10")
+        second = adapter.lookup("222", "BGS", "Second Player 456 BGS 9.5")
+        repeated = adapter.lookup("222", "BGS", "Second Player 456 BGS 9.5")
+        adapter.close_app()
+
+        self.assertEqual(first, (20.0, 4, ""))
+        self.assertEqual(second, (30.0, 5, ""))
+        self.assertEqual(repeated, (30.0, 5, ""))
+        self.assertEqual(len(factory_calls), 1)
+        self.assertEqual(driver.quit_count, 1)
+
+    def test_courtyard_android_adapter_immediately_rejects_new_invalid_result(self) -> None:
+        invalid = "Defender, Basic, PSA 10, $230.00, CONFIDENCE, 2"
+
+        class FakeElement:
+            def __init__(self, description="", on_click=None) -> None:
+                self.description = description
+                self.on_click = on_click
+
+            def click(self) -> None:
+                if self.on_click:
+                    self.on_click()
+
+            def clear(self) -> None:
+                return None
+
+            def send_keys(self, _value) -> None:
+                return None
+
+            def get_attribute(self, _name):
+                return self.description
+
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.results = []
+
+            def activate_app(self, _package) -> None:
+                return None
+
+            def find_elements(self, by, query):
+                if by == "accessibility":
+                    if query == "SEARCH":
+                        return [FakeElement(on_click=lambda: self.results.append(invalid))]
+                    return [FakeElement()]
+                if "Search timed out" in query:
+                    return []
+                return [FakeElement(description) for description in self.results]
+
+            def quit(self) -> None:
+                return None
+
+        driver = FakeDriver()
+        sleeps = []
+        adapter = cy_appium.CourtyardAndroidAdapter(driver_factory=lambda: driver, sleep=sleeps.append)
+        adapter._appium_by = lambda: types.SimpleNamespace(ACCESSIBILITY_ID="accessibility", XPATH="xpath")
+
+        result = adapter.lookup("144180849", "PSA", "2022 Panini Donruss #202 Chet Holmgren PSA 10")
+
+        self.assertEqual(
+            result,
+            (None, None, "Courtyard result rejected: card name 'Defender' did not match the Card Ladder profile"),
+        )
+        self.assertEqual(sleeps, [])
+
+    def test_courtyard_android_adapter_accepts_new_matching_result_without_number(self) -> None:
+        description = "Charizard, Neo Premium File 2, CGC 8, $205.00, CONFIDENCE, 4"
+
+        class FakeElement:
+            def __init__(self, value="", on_click=None) -> None:
+                self.value = value
+                self.on_click = on_click
+
+            def click(self) -> None:
+                if self.on_click:
+                    self.on_click()
+
+            def clear(self) -> None:
+                return None
+
+            def send_keys(self, _value) -> None:
+                return None
+
+            def get_attribute(self, _name):
+                return self.value
+
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.results = []
+
+            def activate_app(self, _package) -> None:
+                return None
+
+            def find_elements(self, by, query):
+                if by == "accessibility":
+                    if query == "SEARCH":
+                        return [FakeElement(on_click=lambda: self.results.append(description))]
+                    return [FakeElement()]
+                if "Search timed out" in query:
+                    return []
+                return [FakeElement(item) for item in self.results]
+
+            def quit(self) -> None:
+                return None
+
+        driver = FakeDriver()
+        adapter = cy_appium.CourtyardAndroidAdapter(driver_factory=lambda: driver)
+        adapter._appium_by = lambda: types.SimpleNamespace(ACCESSIBILITY_ID="accessibility", XPATH="xpath")
+
+        result = adapter.lookup(
+            "6151179109",
+            "CGC",
+            "2000 Pokemon Neo Premium File 2 Japanese Charizard Reverse Holo CGC 8",
+        )
+
+        self.assertEqual(result, (205.0, 4, ""))
+
+    def test_courtyard_back_to_back_numberless_results_do_not_reuse_prior_card(self) -> None:
+        descriptions = [
+            "Charizard, Neo Premium File 2, CGC 8, $205.00, CONFIDENCE, 4",
+            "Dark Charizard, Rocket Gang, CGC 8, $352.00, CONFIDENCE, 4",
+        ]
+
+        class FakeElement:
+            def __init__(self, value="", on_click=None) -> None:
+                self.value = value
+                self.on_click = on_click
+
+            def click(self) -> None:
+                if self.on_click:
+                    self.on_click()
+
+            def clear(self) -> None:
+                return None
+
+            def send_keys(self, _value) -> None:
+                return None
+
+            def get_attribute(self, _name):
+                return self.value
+
+        class FakeDriver:
+            def __init__(self) -> None:
+                self.results = []
+                self.searches = 0
+
+            def activate_app(self, _package) -> None:
+                return None
+
+            def find_elements(self, by, query):
+                if by == "accessibility":
+                    if query == "SEARCH":
+                        def add_result():
+                            self.results.append(descriptions[self.searches])
+                            self.searches += 1
+                        return [FakeElement(on_click=add_result)]
+                    return [FakeElement()]
+                if "Search timed out" in query:
+                    return []
+                return [FakeElement(item) for item in self.results]
+
+            def quit(self) -> None:
+                return None
+
+        driver = FakeDriver()
+        adapter = cy_appium.CourtyardAndroidAdapter(driver_factory=lambda: driver)
+        adapter._appium_by = lambda: types.SimpleNamespace(ACCESSIBILITY_ID="accessibility", XPATH="xpath")
+
+        first = adapter.lookup(
+            "6151179109",
+            "CGC",
+            "2000 Pokemon Neo Premium File 2 Japanese Charizard Reverse Holo CGC 8",
+        )
+        second = adapter.lookup(
+            "6151179108",
+            "CGC",
+            "1997 Pokemon Rocket Gang Japanese Dark Charizard Holo CGC 8",
+        )
+
+        self.assertEqual(first, (205.0, 4, ""))
+        self.assertEqual(second, (352.0, 4, ""))
+
+    def test_courtyard_lookup_retries_timeout_once_in_same_session(self) -> None:
+        class RetryAdapter(cy_appium.CourtyardAndroidAdapter):
+            def __init__(self) -> None:
+                self.statuses = []
+                super().__init__(runtime_status=self.statuses.append)
+                self.calls = 0
+                self.driver = object()
+
+            def _lookup_once(self, cert_number, slab_type, profile_title):
+                self.calls += 1
+                if self.calls == 1:
+                    return None, None, "Courtyard search timed out"
+                return 88.0, 4, ""
+
+        adapter = RetryAdapter()
+        original_driver = adapter.driver
+
+        result = adapter.lookup("124630840", "PSA", "1999 Pokemon Game #2 Blastoise Holo PSA 4")
+
+        self.assertEqual(result, (88.0, 4, ""))
+        self.assertEqual(adapter.calls, 2)
+        self.assertIs(adapter.driver, original_driver)
+        self.assertEqual(len(adapter.statuses), 1)
+
+    def test_courtyard_lookup_does_not_retry_terminal_result(self) -> None:
+        class TerminalAdapter(cy_appium.CourtyardAndroidAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.calls = 0
+
+            def _lookup_once(self, cert_number, slab_type, profile_title):
+                self.calls += 1
+                return None, None, cy_appium.NOT_BUYING_MESSAGE
+
+        adapter = TerminalAdapter()
+
+        result = adapter.lookup("124630840", "PSA", "1999 Pokemon Game #2 Blastoise Holo PSA 4")
+
+        self.assertEqual(result, (None, None, cy_appium.NOT_BUYING_MESSAGE))
+        self.assertEqual(adapter.calls, 1)
+
+    def test_windows_courtyard_supported_graders_exclude_sgc(self) -> None:
+        self.assertEqual(bridge_server.cy_supported_graders("win32"), {"PSA", "BGS", "CGC"})
+
+    def test_windows_courtyard_requires_explicit_opt_in_and_python_client(self) -> None:
+        with (
+            patch.dict(os.environ, {"LUCAS_CY_APPIUM_ENABLED": "1"}, clear=False),
+            patch.object(bridge_server, "appium_client_available", return_value=True),
+        ):
+            self.assertTrue(bridge_server.cy_lookup_enabled("win32"))
+        with patch.dict(os.environ, {"LUCAS_CY_APPIUM_ENABLED": "0"}, clear=False):
+            self.assertFalse(bridge_server.cy_lookup_enabled("win32"))
+
+    def test_cardladder_queue_includes_rows_missing_requested_cy_data(self) -> None:
+        bridge = BridgeState()
+        row = WorkbookRow(
+            excel_row=2,
+            cert_number="12345678",
+            grader="PSA",
+            card_title="Test Card #123 PSA 10",
+            card_ladder_comps_average=25.0,
+        )
+        bridge.set_rows([row])
+
+        bridge.start_all_comps(allow_deferred_cy=True)
+
+        self.assertIsNotNone(bridge.command)
+        self.assertEqual(bridge.command["queue"][0]["excelRow"], 2)
+
     def test_google_sheet_values_import_selected_tab_with_simple_headers(self) -> None:
         rows = read_google_sheet_values(
             [
