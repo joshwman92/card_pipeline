@@ -966,6 +966,8 @@ class CardPipelineApp(tk.Tk):
         self.inventory_cell_edit: tuple[str, str] | None = None
         self.inventory_bulk_undo_stack: list[dict[str, object]] = []
         self.inventory_filter_after_id: str | None = None
+        self.inventory_sync_running = False
+        self.inventory_sync_worker: threading.Thread | None = None
         self.inventory_sort_column = "date"
         self.inventory_sort_descending = True
         self.inventory_photo_worker: threading.Thread | None = None
@@ -2417,7 +2419,7 @@ class CardPipelineApp(tk.Tk):
 
     def _show_inventory_settings_menu(self, anchor: tk.Widget) -> None:
         menu = tk.Menu(self, tearoff=False, bg="#1f1f1f", fg="#ffffff", activebackground="#1ed760", activeforeground="#000000")
-        menu.add_command(label="Sync Received to Inventory", command=lambda: self.refresh_inventory_tab(reconcile=True, enrich=True, filtered_only=True))
+        menu.add_command(label="Sync Received to Inventory", command=self.sync_received_inventory_async)
         menu.add_command(label="Update Best Company/Payouts", command=self.update_inventory_payouts)
         menu.add_command(label="Recomp Visible Cards", command=self.open_inventory_recomp_popup)
         menu.add_separator()
@@ -3269,12 +3271,118 @@ class CardPipelineApp(tk.Tk):
                 candidates.extend(self._received_inventory_candidate_records_for_sheet(stage, path, person, company_keys, accounted_keys))
         return candidates
 
-    def _sync_received_inventory_to_ledger(self, filtered_only: bool = False) -> tuple[int, int]:
+    def _sync_received_inventory_to_ledger(
+        self,
+        filtered_only: bool = False,
+        filter_snapshot: dict[str, object] | None = None,
+    ) -> tuple[int, int]:
         records = self._received_inventory_candidate_records()
         if filtered_only:
-            records = self._filtered_inventory_records([self._normalize_inventory_record(record) for record in records])
+            normalized_records = [self._normalize_inventory_record(record) for record in records]
+            records = (
+                self._filter_inventory_records(normalized_records, filter_snapshot)
+                if filter_snapshot is not None
+                else self._filtered_inventory_records(normalized_records)
+            )
         added = self.add_inventory_records(records, refresh=False)
         return added, len(records)
+
+    def sync_received_inventory_async(self) -> None:
+        if getattr(self, "inventory_sync_running", False):
+            self.inventory_status_var.set("Received inventory sync is already running.")
+            return
+        filter_snapshot = self._inventory_filter_snapshot()
+        regex_error = str(filter_snapshot.get("company_error") or "")
+        self.inventory_company_filter_error = regex_error
+        if regex_error:
+            message = f"Invalid Best Company regex: {regex_error}"
+            self.inventory_status_var.set(message)
+            self.status_var.set(message)
+            return
+        self.inventory_sync_running = True
+        message = "Syncing received inventory: scanning source sheets..."
+        self.inventory_status_var.set(message)
+        self.status_var.set(message)
+        worker = threading.Thread(
+            target=self._sync_received_inventory_worker,
+            args=(filter_snapshot,),
+            daemon=True,
+            name="inventory-sync",
+        )
+        self.inventory_sync_worker = worker
+        worker.start()
+
+    def _sync_received_inventory_worker(self, filter_snapshot: dict[str, object]) -> None:
+        started = time.perf_counter()
+        try:
+            self._inventory_source_rows_cache = {}
+            self.events.put(("inventory_sync_progress", "Syncing received inventory: scanning source sheets..."))
+            added, candidates = self._sync_received_inventory_to_ledger(
+                filtered_only=True,
+                filter_snapshot=filter_snapshot,
+            )
+            stored_rows = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+            active_rows = [record for record in stored_rows if str(record.get("status") or "").lower() == "active"]
+            filtered_keys = {
+                str(record.get("inventory_key") or "")
+                for record in self._filter_inventory_records(active_rows, filter_snapshot)
+            }
+            total = len(filtered_keys)
+            changed = 0
+            completed = 0
+            inventory_rows: list[dict[str, object]] = []
+            if total:
+                self.events.put(("inventory_sync_progress", f"Updating assignments: 0/{total} cards..."))
+            for record in active_rows:
+                if str(record.get("inventory_key") or "") not in filtered_keys:
+                    inventory_rows.append(record)
+                    continue
+                enriched = self._enrich_inventory_record_assignment(record, force=True)
+                if enriched != record:
+                    changed += 1
+                inventory_rows.append(enriched)
+                completed += 1
+                if completed == total or completed % 10 == 0:
+                    self.events.put(
+                        ("inventory_sync_progress", f"Updating assignments: {completed}/{total} cards...")
+                    )
+            if inventory_rows != stored_rows:
+                self.events.put(("inventory_sync_progress", "Saving updated inventory..."))
+                self._save_inventory_ledger(inventory_rows)
+            self.events.put(
+                (
+                    "inventory_sync_done",
+                    {
+                        "added": added,
+                        "candidates": candidates,
+                        "visible": total,
+                        "changed": changed,
+                        "elapsed": time.perf_counter() - started,
+                    },
+                )
+            )
+        except Exception as error:
+            self.events.put(("inventory_sync_error", str(error)))
+
+    def _finish_received_inventory_sync(self, payload: dict[str, object]) -> None:
+        self.inventory_sync_running = False
+        self.inventory_sync_worker = None
+        self.refresh_inventory_tab()
+        message = (
+            f"Inventory sync complete: {int(payload.get('added') or 0)} added, "
+            f"{int(payload.get('changed') or 0)}/{int(payload.get('visible') or 0)} visible assignments updated "
+            f"in {float(payload.get('elapsed') or 0):.1f}s."
+        )
+        self.inventory_status_var.set(message)
+        self.status_var.set(message)
+
+    def _handle_received_inventory_sync_error(self, error: object) -> None:
+        self.inventory_sync_running = False
+        self.inventory_sync_worker = None
+        message = f"Inventory sync failed: {error}"
+        self.inventory_status_var.set(message)
+        self.status_var.set(message)
+        messagebox.showerror("Inventory sync failed", str(error or "Unknown error"))
 
     def _sync_received_sheet_inventory_to_ledger(self, stage: str, path: Path, person: str) -> tuple[int, int]:
         records = self._received_inventory_candidate_records_for_sheet(stage, path, person)
@@ -6864,26 +6972,60 @@ class CardPipelineApp(tk.Tk):
         return deleted
 
     def _filtered_inventory_records(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
-        person = self.inventory_person_var.get().strip().lower() if hasattr(self, "inventory_person_var") else ""
-        best_company_pattern_text = self.inventory_company_var.get().strip() if hasattr(self, "inventory_company_var") else ""
-        self.inventory_company_filter_error = ""
-        try:
-            best_company_pattern = re.compile(best_company_pattern_text, re.IGNORECASE) if best_company_pattern_text else None
-        except re.error as error:
-            self.inventory_company_filter_error = str(error)
+        filters = CardPipelineApp._inventory_filter_snapshot(self)
+        self.inventory_company_filter_error = str(filters.get("company_error") or "")
+        if self.inventory_company_filter_error:
             return []
-        sport_filters = self._inventory_sport_filter_values()
-        grader_filters = inventory_grader_filter_values(self.inventory_grader_var.get() if hasattr(self, "inventory_grader_var") else "")
-        card_year = re.sub(r"\D", "", self.inventory_year_var.get()) if hasattr(self, "inventory_year_var") else ""
-        search = self.inventory_search_var.get().strip().lower() if hasattr(self, "inventory_search_var") else ""
-        min_value = self._money_value(self.inventory_min_var.get()) if hasattr(self, "inventory_min_var") else None
-        max_value = self._money_value(self.inventory_max_var.get()) if hasattr(self, "inventory_max_var") else None
-        min_date = self._profit_record_date(self.inventory_date_min_var.get()) if hasattr(self, "inventory_date_min_var") else None
-        max_date = self._profit_record_date(self.inventory_date_max_var.get()) if hasattr(self, "inventory_date_max_var") else None
-        missing_title_only = bool(self.inventory_missing_title_var.get()) if hasattr(self, "inventory_missing_title_var") else False
-        missing_comps_only = bool(self.inventory_missing_comps_var.get()) if hasattr(self, "inventory_missing_comps_var") else False
-        missing_cl_only = bool(self.inventory_missing_cl_var.get()) if hasattr(self, "inventory_missing_cl_var") else False
-        missing_photos_only = bool(self.inventory_missing_photos_var.get()) if hasattr(self, "inventory_missing_photos_var") else False
+        return CardPipelineApp._filter_inventory_records(self, rows, filters)
+
+    def _inventory_filter_snapshot(self) -> dict[str, object]:
+        best_company_pattern_text = self.inventory_company_var.get().strip() if hasattr(self, "inventory_company_var") else ""
+        company_error = ""
+        try:
+            if best_company_pattern_text:
+                re.compile(best_company_pattern_text, re.IGNORECASE)
+        except re.error as error:
+            company_error = str(error)
+        return {
+            "person": self.inventory_person_var.get().strip().lower() if hasattr(self, "inventory_person_var") else "",
+            "best_company_pattern_text": best_company_pattern_text,
+            "company_error": company_error,
+            "sport_filters": self._inventory_sport_filter_values(),
+            "grader_filters": inventory_grader_filter_values(self.inventory_grader_var.get() if hasattr(self, "inventory_grader_var") else ""),
+            "card_year": re.sub(r"\D", "", self.inventory_year_var.get()) if hasattr(self, "inventory_year_var") else "",
+            "search": self.inventory_search_var.get().strip().lower() if hasattr(self, "inventory_search_var") else "",
+            "min_value": self._money_value(self.inventory_min_var.get()) if hasattr(self, "inventory_min_var") else None,
+            "max_value": self._money_value(self.inventory_max_var.get()) if hasattr(self, "inventory_max_var") else None,
+            "min_date": self._profit_record_date(self.inventory_date_min_var.get()) if hasattr(self, "inventory_date_min_var") else None,
+            "max_date": self._profit_record_date(self.inventory_date_max_var.get()) if hasattr(self, "inventory_date_max_var") else None,
+            "missing_title_only": bool(self.inventory_missing_title_var.get()) if hasattr(self, "inventory_missing_title_var") else False,
+            "missing_comps_only": bool(self.inventory_missing_comps_var.get()) if hasattr(self, "inventory_missing_comps_var") else False,
+            "missing_cl_only": bool(self.inventory_missing_cl_var.get()) if hasattr(self, "inventory_missing_cl_var") else False,
+            "missing_photos_only": bool(self.inventory_missing_photos_var.get()) if hasattr(self, "inventory_missing_photos_var") else False,
+        }
+
+    def _filter_inventory_records(
+        self,
+        rows: list[dict[str, object]],
+        filters: dict[str, object],
+    ) -> list[dict[str, object]]:
+        if filters.get("company_error"):
+            return []
+        person = str(filters.get("person") or "")
+        best_company_pattern_text = str(filters.get("best_company_pattern_text") or "")
+        best_company_pattern = re.compile(best_company_pattern_text, re.IGNORECASE) if best_company_pattern_text else None
+        sport_filters = set(filters.get("sport_filters") or set())
+        grader_filters = set(filters.get("grader_filters") or set())
+        card_year = str(filters.get("card_year") or "")
+        search = str(filters.get("search") or "")
+        min_value = filters.get("min_value")
+        max_value = filters.get("max_value")
+        min_date = filters.get("min_date")
+        max_date = filters.get("max_date")
+        missing_title_only = bool(filters.get("missing_title_only"))
+        missing_comps_only = bool(filters.get("missing_comps_only"))
+        missing_cl_only = bool(filters.get("missing_cl_only"))
+        missing_photos_only = bool(filters.get("missing_photos_only"))
         filtered: list[dict[str, object]] = []
         for record in rows:
             if str(record.get("status") or "").lower() != "active":
@@ -16071,6 +16213,13 @@ class CardPipelineApp(tk.Tk):
                         self.refresh_inventory_tab(enrich=enrich)
                         if message:
                             self.status_var.set(message)
+                    elif kind == "inventory_sync_progress":
+                        self.inventory_status_var.set(str(payload))
+                        self.status_var.set(str(payload))
+                    elif kind == "inventory_sync_done":
+                        self._finish_received_inventory_sync(payload)
+                    elif kind == "inventory_sync_error":
+                        self._handle_received_inventory_sync_error(payload)
                     elif kind == "incoming_index_retry_done":
                         self._apply_incoming_index_retry(payload)
                     elif kind == "incoming_index_retry_error":
