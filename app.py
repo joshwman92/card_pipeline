@@ -2756,6 +2756,7 @@ class CardPipelineApp(tk.Tk):
         source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
         cert = scan_to_cert(record.get("cert_number"))
         item_id = str(record.get("item_id") or "").strip().lower()
+        generated_item_id = bool(record.get("_generated_item_id_for_add"))
         title_identity = self._received_inventory_title_identity(record.get("card_title"))
         purchase_price = self._money_value(record.get("purchase_price"))
 
@@ -2771,6 +2772,12 @@ class CardPipelineApp(tk.Tk):
             existing_cert = scan_to_cert(existing.get("cert_number"))
             existing_item_id = str(existing.get("item_id") or "").strip().lower()
             if not cert and not existing_cert:
+                if generated_item_id:
+                    return "matching raw title already exists in the same source sheet"
+                if item_id or existing_item_id:
+                    if item_id and existing_item_id == item_id:
+                        return "matching raw item id already exists in the same source sheet"
+                    continue
                 return "matching raw title already exists in the same source sheet"
             if (cert and existing_item_id) or (item_id and existing_cert):
                 return "possible raw/cert duplicate in the same source sheet"
@@ -3169,6 +3176,7 @@ class CardPipelineApp(tk.Tk):
                 record = dict(record)
                 record["item_type"] = "Raw"
                 record["item_id"] = self._next_raw_item_id([*ledger, *by_key.values()])
+                record["_generated_item_id_for_add"] = True
                 record.pop("inventory_key", None)
             normalized = self._normalize_inventory_record(record)
             normalized = self._enrich_inventory_record_assignment(normalized)
@@ -3179,6 +3187,7 @@ class CardPipelineApp(tk.Tk):
             if reason:
                 blocked.append({"record": normalized, "reason": reason})
                 continue
+            normalized.pop("_generated_item_id_for_add", None)
             if key not in by_key:
                 ledger.append(normalized)
                 by_key[key] = normalized

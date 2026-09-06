@@ -6997,6 +6997,56 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
+    def test_add_inventory_records_allows_duplicate_raw_title_with_different_item_id(self) -> None:
+        class InventoryDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _received_inventory_title_identity = app.CardPipelineApp._received_inventory_title_identity
+            _inventory_add_protection_reason = app.CardPipelineApp._inventory_add_protection_reason
+            _load_inventory_ledger = app.CardPipelineApp._load_inventory_ledger
+            _save_inventory_ledger = app.CardPipelineApp._save_inventory_ledger
+            add_inventory_records = app.CardPipelineApp.add_inventory_records
+            _load_inventory_deleted_tombstones = lambda self: []
+            _load_profit_ledger = lambda self: []
+            _enrich_inventory_record_assignment = lambda self, record: record
+            refresh_inventory_tab = lambda self: None
+
+        with TemporaryDirectory() as tmp:
+            old_inventory = app.INVENTORY_LEDGER_PATH
+            app.INVENTORY_LEDGER_PATH = Path(tmp) / "inventory_ledger.json"
+            dummy = InventoryDummy()
+            try:
+                added = dummy.add_inventory_records(
+                    [
+                        {
+                            "assigned_person": "Mikey",
+                            "item_id": "RAW-MIKEY-20260902-112209562351",
+                            "card_title": "1998 Topps Finest Peyton Manning Rookie",
+                            "source_sheet": "chris_weaver_9_2_26.xlsx",
+                            "purchase_price": 500,
+                            "status": "Active",
+                        },
+                        {
+                            "assigned_person": "Mikey",
+                            "item_id": "RAW-MIKEY-20260902-112209562352",
+                            "card_title": "1998 Topps Finest Peyton Manning Rookie",
+                            "source_sheet": "chris_weaver_9_2_26.xlsx",
+                            "purchase_price": 500,
+                            "status": "Active",
+                        },
+                    ]
+                )
+                ledger = json.loads(app.INVENTORY_LEDGER_PATH.read_text(encoding="utf-8"))["items"]
+                self.assertEqual(added, 2)
+                self.assertEqual(len(ledger), 2)
+                self.assertEqual(
+                    {row["item_id"] for row in ledger},
+                    {"RAW-MIKEY-20260902-112209562351", "RAW-MIKEY-20260902-112209562352"},
+                )
+            finally:
+                app.INVENTORY_LEDGER_PATH = old_inventory
+
     def test_broad_received_inventory_sync_is_disabled(self) -> None:
         class InventoryDummy:
             _sync_received_inventory_to_ledger = app.CardPipelineApp._sync_received_inventory_to_ledger
@@ -8107,7 +8157,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
-    def test_received_inventory_reconcile_skips_raw_same_source_title_with_different_item_id(self) -> None:
+    def test_received_inventory_reconcile_includes_raw_same_source_title_with_different_item_id(self) -> None:
         class ReconcileDummy:
             _money_value = app.CardPipelineApp._money_value
             _inventory_record_key = app.CardPipelineApp._inventory_record_key
@@ -8167,7 +8217,9 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 )
             ]
             try:
-                self.assertEqual(dummy._received_inventory_candidate_records(), [])
+                candidates = dummy._received_inventory_candidate_records()
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0]["item_id"], "RAW-MIKEY-20260710-0015")
             finally:
                 app.RECEIVED_SHEETS_DIR = old_received
                 app.INCOMING_SHEETS_DIR = old_incoming
