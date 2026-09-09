@@ -2756,9 +2756,7 @@ class CardPipelineApp(tk.Tk):
         source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
         cert = scan_to_cert(record.get("cert_number"))
         item_id = str(record.get("item_id") or "").strip().lower()
-        generated_item_id = bool(record.get("_generated_item_id_for_add"))
         title_identity = self._received_inventory_title_identity(record.get("card_title"))
-        purchase_price = self._money_value(record.get("purchase_price"))
 
         for existing in existing_rows:
             if str(existing.get("status") or "Active").strip().lower() != "active":
@@ -2766,37 +2764,31 @@ class CardPipelineApp(tk.Tk):
             existing_source = Path(str(existing.get("source_sheet") or "")).name.strip().lower()
             if source_sheet and existing_source != source_sheet:
                 continue
+            existing_cert = scan_to_cert(existing.get("cert_number"))
+            existing_item_id = str(existing.get("item_id") or "").strip().lower()
+            if cert and existing_cert == cert:
+                return "cert already exists in active inventory"
+            if item_id and existing_item_id == item_id:
+                return "item id already exists in active inventory"
             existing_title = self._received_inventory_title_identity(existing.get("card_title"))
             if not title_identity or existing_title != title_identity:
                 continue
-            existing_cert = scan_to_cert(existing.get("cert_number"))
-            existing_item_id = str(existing.get("item_id") or "").strip().lower()
             if not cert and not existing_cert:
-                if generated_item_id:
-                    return "matching raw title already exists in the same source sheet"
                 if item_id or existing_item_id:
-                    if item_id and existing_item_id == item_id:
-                        return "matching raw item id already exists in the same source sheet"
                     continue
                 return "matching raw title already exists in the same source sheet"
-            if (cert and existing_item_id) or (item_id and existing_cert):
-                return "possible raw/cert duplicate in the same source sheet"
 
         tombstone_loader = getattr(self, "_load_inventory_deleted_tombstones", None)
         tombstones = tombstone_loader() if callable(tombstone_loader) else []
         for tombstone in tombstones:
             if not isinstance(tombstone, dict):
                 continue
-            tombstone_source = Path(str(tombstone.get("source_sheet") or "")).name.strip().lower()
             tombstone_cert = scan_to_cert(tombstone.get("cert_number"))
             tombstone_item_id = str(tombstone.get("item_id") or "").strip().lower()
-            tombstone_title = self._received_inventory_title_identity(tombstone.get("card_title"))
             if cert and tombstone_cert == cert:
                 return "cert was previously deleted from inventory"
             if item_id and tombstone_item_id == item_id:
                 return "item id was previously deleted from inventory"
-            if title_identity and tombstone_title == title_identity and (not source_sheet or not tombstone_source or tombstone_source == source_sheet):
-                return "matching title was previously deleted from inventory"
 
         profit_loader = getattr(self, "_load_profit_ledger", None)
         profit_rows = profit_loader() if callable(profit_loader) else []
@@ -2810,7 +2802,6 @@ class CardPipelineApp(tk.Tk):
                 continue
             profit_cert = scan_to_cert(profit_record.get("cert_number"))
             profit_item_id = str(profit_record.get("item_id") or "").strip().lower()
-            profit_title = self._received_inventory_title_identity(profit_record.get("card_title"))
             source_values = {
                 Path(str(profit_record.get(field) or "")).name.strip().lower()
                 for field in ("source_sheet", "original_source_sheet")
@@ -2818,22 +2809,10 @@ class CardPipelineApp(tk.Tk):
             source_values.discard("")
             same_cert = bool(cert and profit_cert == cert)
             same_item = bool(item_id and profit_item_id == item_id)
-            same_title = bool(title_identity and profit_title == title_identity)
             same_source = bool(source_sheet and source_sheet in source_values)
-            profit_purchase = self._money_value(profit_record.get("purchase_price"))
             clear_buyback = bool(same_cert and source_sheet and not same_source)
             if (same_cert or same_item) and not clear_buyback:
                 return "cert or item id was previously sold"
-            if same_title and same_source:
-                return "matching title was previously sold from the same source sheet"
-            if (
-                same_title
-                and not clear_buyback
-                and purchase_price is not None
-                and profit_purchase is not None
-                and abs(purchase_price - profit_purchase) < 0.01
-            ):
-                return "matching title and purchase price were previously sold"
         return ""
 
 
@@ -3183,7 +3162,8 @@ class CardPipelineApp(tk.Tk):
             key = str(normalized.get("inventory_key") or "")
             if not key:
                 continue
-            reason = self._inventory_add_protection_reason(normalized, protected_rows)
+            protection_reason = getattr(self, "_inventory_add_protection_reason", None)
+            reason = protection_reason(normalized, protected_rows) if callable(protection_reason) else ""
             if reason:
                 blocked.append({"record": normalized, "reason": reason})
                 continue

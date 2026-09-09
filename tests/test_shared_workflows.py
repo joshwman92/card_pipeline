@@ -6887,7 +6887,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
-    def test_add_inventory_records_blocks_raw_cert_duplicate_same_source_title(self) -> None:
+    def test_add_inventory_records_allows_raw_and_cert_same_title_with_different_ids(self) -> None:
         class InventoryDummy:
             _money_value = app.CardPipelineApp._money_value
             _inventory_record_key = app.CardPipelineApp._inventory_record_key
@@ -6933,15 +6933,16 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                             }
                         ]
                     ),
-                    0,
+                    1,
                 )
                 ledger = json.loads(app.INVENTORY_LEDGER_PATH.read_text(encoding="utf-8"))["items"]
-                self.assertEqual(len(ledger), 1)
+                self.assertEqual(len(ledger), 2)
                 self.assertEqual(ledger[0]["item_id"], "RAW-MIKEY-20260825-0001")
+                self.assertEqual(ledger[1]["cert_number"], "97182846")
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
-    def test_add_inventory_records_blocks_duplicate_raw_title_same_source(self) -> None:
+    def test_add_inventory_records_allows_duplicate_raw_title_same_source_when_ids_differ(self) -> None:
         class InventoryDummy:
             _money_value = app.CardPipelineApp._money_value
             _inventory_record_key = app.CardPipelineApp._inventory_record_key
@@ -6988,12 +6989,12 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                     ]
                 )
                 ledger = json.loads(app.INVENTORY_LEDGER_PATH.read_text(encoding="utf-8"))["items"]
-                self.assertEqual(added, 1)
-                self.assertEqual(len(ledger), 1)
-                self.assertEqual(ledger[0]["card_title"], "2024 Bowman Chrome Prospect Auto Blue")
-                self.assertTrue(ledger[0]["item_id"].startswith("RAW-TEAM-"))
-                self.assertEqual(dummy.activities[0][0], "Inventory Add Blocked")
-                self.assertEqual(dummy.activities[0][2]["blocked"][0]["reason"], "matching raw title already exists in the same source sheet")
+                self.assertEqual(added, 2)
+                self.assertEqual(len(ledger), 2)
+                self.assertEqual({record["card_title"] for record in ledger}, {"2024 Bowman Chrome Prospect Auto Blue"})
+                self.assertEqual(len({record["item_id"] for record in ledger}), 2)
+                self.assertTrue(all(record["item_id"].startswith("RAW-TEAM-") for record in ledger))
+                self.assertEqual(dummy.activities, [])
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
