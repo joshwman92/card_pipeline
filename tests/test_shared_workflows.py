@@ -6280,6 +6280,59 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             self.assertEqual(len(candidates), 1)
             self.assertEqual(candidates[0]["cert_number"], "152491672")
 
+    def test_general_sold_history_does_not_block_buyback_inventory_candidate_from_new_sheet(self) -> None:
+        class CandidateDummy:
+            _received_inventory_candidate_records_for_sheet = app.CardPipelineApp._received_inventory_candidate_records_for_sheet
+            _received_inventory_accounted_source_cert_keys = app.CardPipelineApp._received_inventory_accounted_source_cert_keys
+            _received_inventory_title_identity = app.CardPipelineApp._received_inventory_title_identity
+            _received_certs_in_workbook = app.CardPipelineApp._received_certs_in_workbook
+            _ensure_raw_item_ids_in_sheet_paths = lambda self, paths: None
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _normalize_profit_record = app.CardPipelineApp._normalize_profit_record
+            _money_value = app.CardPipelineApp._money_value
+            _profit_record_date = app.CardPipelineApp._profit_record_date
+            _profit_record_key = app.CardPipelineApp._profit_record_key
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _inventory_sport_from_value = app.CardPipelineApp._inventory_sport_from_value
+            _is_personal_lucas = lambda self: False
+
+            def _load_inventory_ledger(self):
+                return []
+
+            def _load_profit_ledger(self):
+                return [
+                    {
+                        "assigned_person": "Tyler Hamlin",
+                        "source_sheet": "Tyler Hamlin General Sold",
+                        "original_source_sheet": "TYLER_CULLMAN_THE_FLIP_2.xlsx",
+                        "cert_number": "159587172",
+                        "card_title": "2025 Panini Donruss Optic Uptown #8 Puka Nacua PSA 9",
+                        "purchase_price": 280,
+                        "sale_price": 280,
+                        "status": "Sold from inventory",
+                    }
+                ]
+
+        with TemporaryDirectory() as tmp:
+            sheet_path = Path(tmp) / "ty_show_9_19_26.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "Cards"
+            sheet.append(["Certification Number", "Company", "Sport", "Card Description", "Purchase Price", "Source", "RECEIVED"])
+            sheet.append(["159587172", "PSA", "football", "2025 Panini Donruss Optic Uptown #8 Puka Nacua PSA 9", 255, "Barcode", "X"])
+            workbook.save(sheet_path)
+
+            candidates = CandidateDummy()._received_inventory_candidate_records_for_sheet(
+                "Incoming",
+                sheet_path,
+                "Tyler Hamlin",
+                company_keys=set(),
+            )
+
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(candidates[0]["cert_number"], "159587172")
+            self.assertEqual(candidates[0]["inventory_key"], "159587172|ty_show_9_19_26.xlsx|tyler hamlin")
+
     def test_received_raw_candidates_assign_missing_item_ids_before_sync(self) -> None:
         class CandidateDummy:
             _received_inventory_candidate_records_for_sheet = app.CardPipelineApp._received_inventory_candidate_records_for_sheet
