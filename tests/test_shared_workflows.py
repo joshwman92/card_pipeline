@@ -4148,6 +4148,7 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             _marker_for_stage = app.CardPipelineApp._marker_for_stage
             _sheet_path_for_stage = app.CardPipelineApp._sheet_path_for_stage
             _move_home_sheet_to_stage = app.CardPipelineApp._move_home_sheet_to_stage
+            _unique_stage_destination = app.CardPipelineApp._unique_stage_destination
             _assign_sheet_to_seller = app.CardPipelineApp._assign_sheet_to_seller
             _active_payout_balance = app.CardPipelineApp._active_payout_balance
             _payout_sheet_status = app.CardPipelineApp._payout_sheet_status
@@ -4216,7 +4217,11 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 dummy.home_sheet_summaries = {moved_key: {"row_count": 2, "received_count": 0, "purchase_total": 123.45, "estimated_payout_total": 200.0}}
 
                 payout_items = dummy._payout_sheet_items()
-                self.assertEqual(payout_items, [])
+                self.assertEqual(len(payout_items), 1)
+                self.assertEqual(payout_items[0]["person"], "John Seller")
+                self.assertEqual(payout_items[0]["stage"], "Incoming")
+                self.assertFalse(payout_items[0]["payable"])
+                self.assertEqual(payout_items[0]["payout_balance"], 0.0)
 
                 received_key, cleanup = dummy._move_home_sheet_to_stage(moved_key, "Received")
                 self.assertEqual(received_key, "Received|Lot A.xlsx")
@@ -4389,6 +4394,9 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
                 self.seller_terms_sheet_type_var = Var("Arena Club")
                 self.applied_terms = False
 
+            def _commit_cell_edit(self):
+                pass
+
             def _seller_terms_match(self, seller, sheet_type):
                 return None
 
@@ -4403,6 +4411,40 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         with patch.object(app.messagebox, "showinfo") as showinfo:
             dummy.save_working_sheet()
         self.assertTrue(showinfo.called)
+        self.assertFalse(dummy.applied_terms)
+
+    def test_save_working_sheet_requires_network_person_and_sheet_type(self) -> None:
+        class Var:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class SaveDummy:
+            save_working_sheet = app.CardPipelineApp.save_working_sheet
+            _network_mode_enabled = app.CardPipelineApp._network_mode_enabled
+
+            def __init__(self):
+                self.intake_rows = [WorkbookRow(excel_row=2, cert_number="1", grader="PSA", card_title="Test", existing_value=10)]
+                self.working_sheet_title = Var("Network Lot")
+                self.create_network_mode_var = Var(True)
+                self.seller_terms_seller_var = Var("")
+                self.seller_terms_sheet_type_var = Var("")
+                self.applied_terms = False
+
+            def _commit_cell_edit(self):
+                pass
+
+            def apply_create_seller_terms(self, show_status=True):
+                self.applied_terms = True
+                return 0
+
+        dummy = SaveDummy()
+        with patch.object(app.messagebox, "showinfo") as showinfo:
+            dummy.save_working_sheet()
+        self.assertTrue(showinfo.called)
+        self.assertIn("Network Mode sheets need both Person and Sheet Type", showinfo.call_args.args[1])
         self.assertFalse(dummy.applied_terms)
 
     def test_seller_terms_deduction_uses_matching_value_range_per_card(self) -> None:

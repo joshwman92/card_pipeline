@@ -10948,7 +10948,7 @@ class CardPipelineApp(tk.Tk):
         seller_names = self._seller_terms_seller_names()
         realized_profit_groups = self._realized_profit_groups_by_person_sheet()
         team_profit_records = self._enrich_profit_records_with_people(self._load_profit_ledger())
-        for stage in ("Incoming", "Received"):
+        for stage in ("Working", "Incoming", "Received"):
             for name in self.home_sheet_paths.get(stage, {}):
                 key = self._home_sheet_key(stage, name)
                 marker = self.home_sheet_markers.get(key, {})
@@ -10962,15 +10962,18 @@ class CardPipelineApp(tk.Tk):
                 person = str(marker.get("assigned_person") or "").strip()
                 person_key = person.lower()
                 is_seller_payout = self._sheet_marker_is_seller_payout(marker) or bool(person_key and person_key in seller_names)
-                if not is_seller_payout or stage != "Received":
+                if not is_seller_payout:
                     continue
                 purchase_total = float(summary.get("purchase_total") or 0.0)
                 estimated_payout_total = float(summary.get("estimated_payout_total") or 0.0)
                 realized_profit_total = float(realized_profit_groups.get((person.lower(), Path(name).name.lower()), {}).get("profit") or 0.0)
                 has_live_seller_summary = "seller_payout_total" in summary or "seller_payout_pending" in summary
-                seller_payable = bool(summary.get("seller_payout_payable")) if has_live_seller_summary else True
+                seller_payable = stage == "Received" and (bool(summary.get("seller_payout_payable")) if has_live_seller_summary else True)
                 seller_pending = bool(summary.get("seller_payout_pending")) if has_live_seller_summary else False
-                if self._sheet_marker_is_seller_payout(marker) and has_live_seller_summary:
+                if stage != "Received":
+                    payout_balance = 0.0
+                    payout_basis = "Seller payout becomes payable after receive"
+                elif self._sheet_marker_is_seller_payout(marker) and has_live_seller_summary:
                     payout_balance = round(float(summary.get("seller_payout_total") or 0.0), 2)
                     value_label = str(summary.get("seller_payout_value_label") or "seller terms")
                     payout_basis = f"Seller terms from {value_label}"
@@ -15727,38 +15730,37 @@ class CardPipelineApp(tk.Tk):
         if self._network_mode_enabled() and hasattr(self, "seller_terms_seller_var"):
             seller = self.seller_terms_seller_var.get().strip()
             seller_sheet_type = self.seller_terms_sheet_type_var.get().strip() if hasattr(self, "seller_terms_sheet_type_var") else ""
-            if seller or seller_sheet_type:
-                if not seller or not seller_sheet_type:
-                    messagebox.showinfo(
-                        "Seller terms required",
-                        "Network Mode person buys need both Person and Sheet Type. Leave both blank for a normal Open Team sheet.",
+            if not seller or not seller_sheet_type:
+                messagebox.showinfo(
+                    "Seller terms required",
+                    "Network Mode sheets need both Person and Sheet Type so the sheet is automatically assigned for payouts.",
+                )
+                return
+            seller_term = self._seller_terms_match(seller, seller_sheet_type)
+            if not seller_term:
+                messagebox.showinfo(
+                    "Seller terms not found",
+                    f"No People Rules were found for {seller} / {seller_sheet_type}. Open People Rules or turn Network Mode off for a normal Open Team sheet.",
+                )
+                return
+            rate = self._money_value(seller_term.get("rate"))
+            deduction = self._money_value(seller_term.get("deduction"))
+            applicable_rows = 0
+            for row in self.intake_rows:
+                row_term, _decision = self._seller_terms_match_for_row(seller, seller_sheet_type, row)
+                seller_price = (
+                    self._seller_terms_company_price(row, seller_sheet_type, term=row_term)
+                    if row_term is not None
+                    else (
+                        self._seller_terms_company_price(row, seller_sheet_type, deduction=deduction)
+                        if deduction is not None
+                        else self._seller_terms_company_price(row, seller_sheet_type, rate=rate)
                     )
-                    return
-                seller_term = self._seller_terms_match(seller, seller_sheet_type)
-                if not seller_term:
-                    messagebox.showinfo(
-                        "Seller terms not found",
-                        f"No People Rules were found for {seller} / {seller_sheet_type}. Open People Rules or leave both fields blank.",
-                    )
-                    return
-                rate = self._money_value(seller_term.get("rate"))
-                deduction = self._money_value(seller_term.get("deduction"))
-                applicable_rows = 0
-                for row in self.intake_rows:
-                    row_term, _decision = self._seller_terms_match_for_row(seller, seller_sheet_type, row)
-                    seller_price = (
-                        self._seller_terms_company_price(row, seller_sheet_type, term=row_term)
-                        if row_term is not None
-                        else (
-                            self._seller_terms_company_price(row, seller_sheet_type, deduction=deduction)
-                            if deduction is not None
-                            else self._seller_terms_company_price(row, seller_sheet_type, rate=rate)
-                        )
-                    )
-                    if seller_price is not None:
-                        applicable_rows += 1
-                if applicable_rows <= 0:
-                    self.status_var.set(self._seller_terms_no_match_message(self.intake_rows, seller_sheet_type, deduction))
+                )
+                if seller_price is not None:
+                    applicable_rows += 1
+            if applicable_rows <= 0:
+                self.status_var.set(self._seller_terms_no_match_message(self.intake_rows, seller_sheet_type, deduction))
         self.apply_create_seller_terms(show_status=False)
         path = working_sheet_path(WORKING_SHEETS_DIR, title)
         saved_row_ids = {id(row) for row in self.intake_rows}
