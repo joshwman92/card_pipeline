@@ -309,23 +309,18 @@ class BridgeState:
         return resolver(photo_id)
 
     def start_all_comps(self, requery_all: bool = False, allow_deferred_cy: bool = False) -> int:
+        cy_lookups: list[tuple[int, str, str, int]] = []
         with self.lock:
             self.command_id += 1
-            self.cardladder_allows_cy = bool(allow_deferred_cy)
-            eligible_rows = [
-                row
-                for row in self.rows
-                if row.cert_number
-                and row.grader
-                and (
-                    requery_all
-                    or not row_has_comp_data(row)
-                    or (
-                        allow_deferred_cy
-                        and (row.cy_value is None or not str(row.cy_confidence or "").strip())
-                    )
-                )
-            ]
+            cardladder_rows: list[WorkbookRow] = []
+            cy_only_rows: list[WorkbookRow] = []
+            for row in self.rows:
+                if not row.cert_number or not row.grader:
+                    continue
+                if requery_all or not row_has_comp_data(row):
+                    cardladder_rows.append(row)
+                elif allow_deferred_cy and (row.cy_value is None or not str(row.cy_confidence or "").strip()):
+                    cy_only_rows.append(row)
             queue = [
                 {
                     "excelRow": row.excel_row,
@@ -333,27 +328,45 @@ class BridgeState:
                     "grader": row.grader,
                     "cardTitle": row.card_title,
                 }
-                for row in eligible_rows
+                for row in cardladder_rows
             ]
-            for row in eligible_rows:
+            for row in cardladder_rows:
                 row.status = "Queued"
+            for row in cy_only_rows:
+                candidate = self._cy_lookup_candidate(row, force=True)
+                if candidate is None:
+                    continue
+                row.status = "CY queued"
+                if queue:
+                    self.cy_lookup_pending.add(row.excel_row)
+                else:
+                    self.cy_lookup_inflight.add(row.excel_row)
+                    cy_lookups.append((*candidate, self.cy_lookup_generation))
+            if self.cy_lookup_pending or cy_lookups:
+                self.cy_batch_running = True
+            self.cardladder_allows_cy = bool(allow_deferred_cy and queue)
             if not queue:
                 self.command = None
                 self.cardladder_running = False
-                self.cardladder_allows_cy = False
-                debug_log(f"start_all_comps command={self.command_id} eligible=0 requery_all={requery_all} allow_deferred_cy={allow_deferred_cy}")
-                return self.command_id
-            self.command = {
-                "id": self.command_id,
-                "type": "RUN_ALL_COMPS",
-                "sources": ["cardladder"],
-                "queue": queue,
-                "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-            self.cardladder_running = True
+            else:
+                self.command = {
+                    "id": self.command_id,
+                    "type": "RUN_ALL_COMPS",
+                    "sources": ["cardladder"],
+                    "queue": queue,
+                    "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+                self.cardladder_running = True
             self.cancel_requested = False
-            debug_log(f"start_all_comps command={self.command_id} queued={len(queue)} requery_all={requery_all} allow_deferred_cy={allow_deferred_cy}")
-            return self.command_id
+            command_id = self.command_id
+            debug_log(
+                f"start_all_comps command={command_id} cardladder={len(queue)} "
+                f"cy_only={len(cy_only_rows)} pending_cy={len(self.cy_lookup_pending)} "
+                f"requery_all={requery_all} allow_deferred_cy={allow_deferred_cy}"
+            )
+        for cy_lookup in cy_lookups:
+            threading.Thread(target=self._cy_lookup_worker, args=cy_lookup, daemon=True).start()
+        return command_id
 
     def start_cy_lookups(self, rows: list[WorkbookRow], defer: bool = False) -> int:
         cy_lookups: list[tuple[int, str, str, int]] = []
@@ -473,7 +486,7 @@ class BridgeState:
         if not cy_lookup_enabled():
             debug_log(f"cy_lookup_skip row={row.excel_row} reason=disabled")
             return None
-        if row.cy_value is not None and not force:
+        if row.cy_value is not None and str(row.cy_confidence or "").strip() and not force:
             debug_log(f"cy_lookup_skip row={row.excel_row} reason=has_value")
             return None
         if row.excel_row in self.cy_lookup_inflight:

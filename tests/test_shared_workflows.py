@@ -596,7 +596,38 @@ class SharedStateTests(unittest.TestCase):
         with patch.dict(os.environ, {"LUCAS_CY_APPIUM_ENABLED": "0"}, clear=False):
             self.assertFalse(bridge_server.cy_lookup_enabled("win32"))
 
-    def test_cardladder_queue_includes_rows_missing_requested_cy_data(self) -> None:
+    def test_cy_only_row_waits_for_empty_cardladder_rows(self) -> None:
+        bridge = BridgeState()
+        cy_only = WorkbookRow(
+            excel_row=2,
+            cert_number="12345678",
+            grader="PSA",
+            card_title="Test Card #123 PSA 10",
+            card_ladder_comps_average=25.0,
+        )
+        missing_comps = WorkbookRow(excel_row=3, cert_number="87654321", grader="PSA", card_title="Missing Comps")
+        bridge.set_rows([cy_only, missing_comps])
+
+        with (
+            patch.object(bridge_server, "cy_lookup_enabled", return_value=True),
+            patch.object(bridge_server, "cy_supported_graders", return_value={"PSA"}),
+            patch.object(bridge_server.threading, "Thread") as worker_thread,
+        ):
+            bridge.start_all_comps(allow_deferred_cy=True)
+            self.assertEqual([item["excelRow"] for item in bridge.command["queue"]], [3])
+            self.assertEqual(bridge.cy_lookup_pending, {2})
+            self.assertEqual(cy_only.status, "CY queued")
+            self.assertEqual(cy_only.card_ladder_comps_average, 25.0)
+            worker_thread.assert_not_called()
+
+            bridge.finish_cardladder({})
+
+        self.assertFalse(bridge.cy_lookup_pending)
+        self.assertEqual(bridge.cy_lookup_inflight, {2})
+        worker_thread.assert_called_once()
+        self.assertEqual(missing_comps.status, "Card Ladder not found")
+
+    def test_cy_only_run_starts_without_cardladder_command(self) -> None:
         bridge = BridgeState()
         row = WorkbookRow(
             excel_row=2,
@@ -607,10 +638,18 @@ class SharedStateTests(unittest.TestCase):
         )
         bridge.set_rows([row])
 
-        bridge.start_all_comps(allow_deferred_cy=True)
+        with (
+            patch.object(bridge_server, "cy_lookup_enabled", return_value=True),
+            patch.object(bridge_server, "cy_supported_graders", return_value={"PSA"}),
+            patch.object(bridge_server.threading, "Thread") as worker_thread,
+        ):
+            bridge.start_all_comps(allow_deferred_cy=True)
 
-        self.assertIsNotNone(bridge.command)
-        self.assertEqual(bridge.command["queue"][0]["excelRow"], 2)
+        self.assertIsNone(bridge.command)
+        self.assertFalse(bridge.cardladder_running)
+        self.assertEqual(bridge.cy_lookup_inflight, {2})
+        self.assertEqual(row.status, "CY queued")
+        worker_thread.assert_called_once()
 
     def test_google_sheet_values_import_selected_tab_with_simple_headers(self) -> None:
         rows = read_google_sheet_values(
@@ -6618,6 +6657,92 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
         dummy.inventory_company_var = FieldVar("[")
         self.assertEqual(dummy._filtered_inventory_records(rows), [])
         self.assertTrue(dummy.inventory_company_filter_error)
+
+    def test_received_inventory_sync_starts_background_worker(self) -> None:
+        class FieldVar:
+            def __init__(self, value=""):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class FakeThread:
+            def __init__(self, *, target, args, daemon, name):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.name = name
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+        class InventoryDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_sport_filter_values = app.CardPipelineApp._inventory_sport_filter_values
+            _inventory_filter_snapshot = app.CardPipelineApp._inventory_filter_snapshot
+            sync_received_inventory_async = app.CardPipelineApp.sync_received_inventory_async
+            _sync_received_inventory_worker = lambda self, _filters: None
+
+        dummy = InventoryDummy()
+        dummy.inventory_sync_running = False
+        dummy.inventory_person_var = FieldVar("")
+        dummy.inventory_company_var = FieldVar("")
+        dummy.inventory_sport_var = FieldVar("")
+        dummy.inventory_status_var = FieldVar("")
+        dummy.status_var = FieldVar("")
+
+        with patch("app.threading.Thread", FakeThread):
+            dummy.sync_received_inventory_async()
+
+        self.assertTrue(dummy.inventory_sync_running)
+        self.assertTrue(dummy.inventory_sync_worker.started)
+        self.assertTrue(dummy.inventory_sync_worker.daemon)
+        self.assertEqual(dummy.inventory_sync_worker.name, "inventory-sync")
+        self.assertIn("scanning source sheets", dummy.inventory_status_var.value)
+
+    def test_received_inventory_sync_worker_reports_progress_and_completion(self) -> None:
+        class InventoryDummy:
+            _sync_received_inventory_worker = app.CardPipelineApp._sync_received_inventory_worker
+
+            def _sync_received_inventory_to_ledger(self, **_kwargs):
+                return 1, 1
+
+            def _normalize_inventory_record(self, record):
+                return dict(record)
+
+            def _load_inventory_ledger(self):
+                return [{"inventory_key": "cert:1", "status": "Active", "best_company": "Old"}]
+
+            def _filter_inventory_records(self, rows, _filters):
+                return rows
+
+            def _enrich_inventory_record_assignment(self, record, force=False):
+                updated = dict(record)
+                updated["best_company"] = "New"
+                return updated
+
+            def _save_inventory_ledger(self, rows):
+                self.saved_rows = rows
+
+        dummy = InventoryDummy()
+        dummy.events = queue.Queue()
+        dummy.saved_rows = []
+
+        dummy._sync_received_inventory_worker({})
+
+        events = []
+        while not dummy.events.empty():
+            events.append(dummy.events.get_nowait())
+        self.assertEqual(dummy.saved_rows[0]["best_company"], "New")
+        self.assertTrue(any(kind == "inventory_sync_progress" for kind, _payload in events))
+        done = next(payload for kind, payload in events if kind == "inventory_sync_done")
+        self.assertEqual(done["added"], 1)
+        self.assertEqual(done["changed"], 1)
+        self.assertEqual(done["visible"], 1)
 
     def test_best_company_dropdown_includes_configured_and_current_values(self) -> None:
         class Dummy:
