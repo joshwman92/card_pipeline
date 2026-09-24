@@ -16,7 +16,9 @@ from ebay_api import (
     EbayOAuthError,
     build_authorization_url,
     exchange_authorization_code,
+    protect_secret,
     refresh_access_token,
+    unprotect_secret,
 )
 
 
@@ -25,6 +27,8 @@ DEFAULT_STORE_PATH = Path(__file__).resolve().parent / "work" / "ebay_broker_con
 DEFAULT_ALLOWED_CALLBACK_HOSTS = ("lucas.mikeyscards.com", "team-lucas.mikeyscards.com")
 LOCAL_CALLBACK_PATH = "/ebay/broker/callback"
 HOSTED_CALLBACK_PATH = "/mobile/ebay/broker/callback"
+STATE_TTL_SECONDS = 10 * 60
+EXCHANGE_TTL_SECONDS = 5 * 60
 
 
 def broker_store_path() -> Path:
@@ -51,12 +55,16 @@ def _load_store() -> dict[str, object]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"version": 1, "connections": {}}
+        return {"version": 2, "connections": {}, "pending_states": {}, "exchange_codes": {}}
     if not isinstance(data, dict):
-        return {"version": 1, "connections": {}}
+        return {"version": 2, "connections": {}, "pending_states": {}, "exchange_codes": {}}
     if not isinstance(data.get("connections"), dict):
         data["connections"] = {}
-    data.setdefault("version", 1)
+    if not isinstance(data.get("pending_states"), dict):
+        data["pending_states"] = {}
+    if not isinstance(data.get("exchange_codes"), dict):
+        data["exchange_codes"] = {}
+    data["version"] = 2
     return data
 
 
@@ -66,6 +74,24 @@ def _save_store(data: dict[str, object]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def _token_key(value: object) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+
+def _prune_ephemeral(data: dict[str, object], now: int | None = None) -> None:
+    current = int(now or time.time())
+    for field, ttl in (("pending_states", STATE_TTL_SECONDS), ("exchange_codes", EXCHANGE_TTL_SECONDS)):
+        values = data.get(field)
+        if not isinstance(values, dict):
+            data[field] = {}
+            continue
+        data[field] = {
+            key: value
+            for key, value in values.items()
+            if isinstance(value, dict) and current - int(value.get("created_at") or 0) <= ttl
+        }
 
 
 def _encode_state(payload: dict[str, object]) -> str:
@@ -210,6 +236,12 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
         if route_path == "/token":
             self._send_token()
             return
+        if route_path == "/connection/exchange":
+            self._send_connection_exchange()
+            return
+        if route_path == "/connection/disconnect":
+            self._send_connection_disconnect()
+            return
         _send_json(self, {"ok": False, "error": "not found"}, status=404)
 
     def _send_connect(self, parsed) -> None:
@@ -220,16 +252,26 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
             return
         account = str(query.get("account", ["default"])[0] or "default").strip() or "default"
         profile = str(query.get("profile", [""])[0] or "").strip().lower()
-        state = _encode_state(
-            {
-                "kind": BROKER_STATE_KIND,
-                "nonce": secrets.token_urlsafe(16),
-                "created_at": int(time.time()),
-                "account": account,
-                "profile": profile,
-                "callback": callback,
-            }
-        )
+        state_payload = {
+            "kind": BROKER_STATE_KIND,
+            "nonce": secrets.token_urlsafe(16),
+            "created_at": int(time.time()),
+            "account": account,
+            "profile": profile,
+            "callback": callback,
+        }
+        state = _encode_state(state_payload)
+        data = _load_store()
+        _prune_ephemeral(data)
+        pending = data.setdefault("pending_states", {})
+        if not isinstance(pending, dict):
+            pending = {}
+            data["pending_states"] = pending
+        pending[_token_key(state_payload["nonce"])] = {
+            "created_at": state_payload["created_at"],
+            "callback": callback,
+        }
+        _save_store(data)
         try:
             config = EbayConfig.from_env()
             target = build_authorization_url(config, state)
@@ -245,6 +287,16 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
         callback = str(state.get("callback") or "").strip()
         if not _callback_allowed(callback):
             _send_json(self, {"ok": False, "error": "invalid saved desktop callback"}, status=400)
+            return
+        created_at = int(state.get("created_at") or 0)
+        nonce_key = _token_key(state.get("nonce"))
+        data = _load_store()
+        _prune_ephemeral(data)
+        pending = data.get("pending_states") if isinstance(data.get("pending_states"), dict) else {}
+        pending_record = pending.pop(nonce_key, None) if isinstance(pending, dict) else None
+        _save_store(data)
+        if not pending_record or int(time.time()) - created_at > STATE_TTL_SECONDS:
+            _send_json(self, {"ok": False, "error": "expired or replayed OAuth state"}, status=400)
             return
         if error:
             target = callback + "?" + urllib.parse.urlencode({"error": error, "error_description": query.get("error_description", [""])[0]})
@@ -269,24 +321,38 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
             return
         connection_token = secrets.token_urlsafe(32)
         data = _load_store()
+        _prune_ephemeral(data)
         connections = data.setdefault("connections", {})
         if not isinstance(connections, dict):
             connections = {}
             data["connections"] = connections
         account = str(state.get("account") or "default").strip() or "default"
-        connections[connection_token] = {
+        connections[_token_key(connection_token)] = {
             "account": account,
             "profile": str(state.get("profile") or "").strip(),
-            "refresh_token": refresh_token,
+            "refresh_token": protect_secret(refresh_token),
             "scopes": list(config.scopes),
             "env": config.env,
             "created_at": int(time.time()),
             "updated_at": int(time.time()),
         }
+        exchange_code = secrets.token_urlsafe(24)
+        exchange_codes = data.setdefault("exchange_codes", {})
+        if not isinstance(exchange_codes, dict):
+            exchange_codes = {}
+            data["exchange_codes"] = exchange_codes
+        exchange_codes[_token_key(exchange_code)] = {
+            "connection_token": protect_secret(connection_token),
+            "account": account,
+            "broker_url": broker_public_url(),
+            "marketplace_id": "EBAY_US",
+            "env": config.env,
+            "created_at": int(time.time()),
+        }
         _save_store(data)
         target = callback + "?" + urllib.parse.urlencode(
             {
-                "connection_token": connection_token,
+                "exchange_code": exchange_code,
                 "account": account,
                 "broker_url": broker_public_url(),
                 "marketplace_id": "EBAY_US",
@@ -304,12 +370,12 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
         connection_token = str(payload.get("connection_token") or "").strip()
         data = _load_store()
         connections = data.get("connections") if isinstance(data.get("connections"), dict) else {}
-        record = connections.get(connection_token) if isinstance(connections, dict) else {}
+        record = connections.get(_token_key(connection_token)) if isinstance(connections, dict) else {}
         if not isinstance(record, dict):
             _send_json(self, {"ok": False, "error": "unknown connection"}, status=404)
             return
         try:
-            token_result = refresh_access_token(EbayConfig.from_env(), str(record.get("refresh_token") or ""))
+            token_result = refresh_access_token(EbayConfig.from_env(), unprotect_secret(record.get("refresh_token")))
         except EbayOAuthError as error:
             _send_json(self, {"ok": False, "error": str(error)}, status=502)
             return
@@ -326,6 +392,51 @@ class EbayBrokerHandler(BaseHTTPRequestHandler):
                 "expires_in": token_result.get("expires_in"),
             },
         )
+
+    def _send_connection_exchange(self) -> None:
+        length = int(self.headers.get("content-length") or "0")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except json.JSONDecodeError:
+            _send_json(self, {"ok": False, "error": "invalid json"}, status=400)
+            return
+        code = str(payload.get("exchange_code") or "").strip()
+        data = _load_store()
+        _prune_ephemeral(data)
+        exchange_codes = data.get("exchange_codes") if isinstance(data.get("exchange_codes"), dict) else {}
+        record = exchange_codes.pop(_token_key(code), None) if code and isinstance(exchange_codes, dict) else None
+        _save_store(data)
+        if not isinstance(record, dict):
+            _send_json(self, {"ok": False, "error": "expired or replayed connection exchange"}, status=404)
+            return
+        _send_json(
+            self,
+            {
+                "ok": True,
+                "connection_token": unprotect_secret(record.get("connection_token")),
+                "account": record.get("account") or "default",
+                "broker_url": record.get("broker_url") or broker_public_url(),
+                "marketplace_id": record.get("marketplace_id") or "EBAY_US",
+                "env": record.get("env") or EbayConfig.from_env().env,
+            },
+        )
+
+    def _send_connection_disconnect(self) -> None:
+        length = int(self.headers.get("content-length") or "0")
+        try:
+            payload = json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
+        except json.JSONDecodeError:
+            _send_json(self, {"ok": False, "error": "invalid json"}, status=400)
+            return
+        token = str(payload.get("connection_token") or "").strip()
+        data = _load_store()
+        connections = data.get("connections") if isinstance(data.get("connections"), dict) else {}
+        removed = connections.pop(_token_key(token), None) if token and isinstance(connections, dict) else None
+        _save_store(data)
+        if not removed:
+            _send_json(self, {"ok": False, "error": "unknown connection"}, status=404)
+            return
+        _send_json(self, {"ok": True, "disconnected": True})
 
 
 def run(host: str = "0.0.0.0", port: int = 8788) -> None:

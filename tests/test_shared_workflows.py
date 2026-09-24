@@ -102,6 +102,7 @@ class SharedStateTests(unittest.TestCase):
                 "https://connect.lucas.example/ebay",
                 "lucas-link-secret",
                 seller_username="mikeycards",
+                environment="production",
             )
             self.assertEqual(record["connection_mode"], "broker")
             status = ebay_api.ebay_account_status(store_path)

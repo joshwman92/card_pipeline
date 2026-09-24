@@ -61,6 +61,8 @@ from assignment_config_ui import open_assignment_rules_dialog, open_people_rules
 from google_sheets_import import export_google_sheet_to_xlsx, read_google_sheet_tabs  # noqa: E402
 from lucas_diagnostics import diagnostic_json, lucas_version_label, setup_doctor_results  # noqa: E402
 from shared_state import atomic_write_json, local_identity, shared_lock  # noqa: E402
+from ebay_api import EbayConfig, disconnect_ebay_account, ebay_account_status, ebay_broker_url, ebay_token_store_path  # noqa: E402
+from ebay_listing import EbayListingDraft, EbayListingService, EbayListingStore  # noqa: E402
 
 from intake_io import (  # noqa: E402
     append_company_sheet_rows,
@@ -136,6 +138,7 @@ PLAYER_OVERRIDES_PATH = CARD_PIPELINE_DIR / "assignment_player_overrides.json"
 SELLER_TERMS_PATH = CARD_PIPELINE_DIR / "ASSIGNMENT RULES" / "seller_terms.csv"
 PERFORMANCE_LOG_PATH = CARD_PIPELINE_DIR / "lucas_performance.log"
 HOME_SUMMARY_CACHE_PATH = CARD_PIPELINE_DIR / "home_summary_cache.json"
+EBAY_LISTINGS_PATH = CARD_PIPELINE_DIR / "ebay_listings.json"
 GOOGLE_SHEET_CACHE_MAX_AGE_SECONDS = 5 * 60
 MOBILE_PAYOUT_CACHE_SECONDS = 30
 LUCAS_LOGO_PATH = ROOT / "assets" / "lucas.png"
@@ -348,7 +351,7 @@ def is_google_sheet_url(value: object) -> bool:
 
 
 def set_pipeline_root(path: Path, working_sheets_dir: Path | None = None) -> None:
-    global CARD_PIPELINE_DIR, WORKING_SHEETS_DIR, INCOMING_SHEETS_DIR, RECEIVED_SHEETS_DIR, ARCHIVED_SHEETS_DIR, COMPANY_SHEETS_DIR, SHEET_MARKERS_PATH, WEEKLY_COMPANY_SHEETS_PATH, PROFIT_LEDGER_PATH, INVENTORY_LEDGER_PATH, INVENTORY_PHOTOS_DIR, INVENTORY_PHOTO_STATE_PATH, ACTIVITY_LOG_PATH, MOBILE_ACTION_LOG_PATH, UNASSIGNED_PLAYERS_PATH, PLAYER_OVERRIDES_PATH, SELLER_TERMS_PATH, PERFORMANCE_LOG_PATH, HOME_SUMMARY_CACHE_PATH
+    global CARD_PIPELINE_DIR, WORKING_SHEETS_DIR, INCOMING_SHEETS_DIR, RECEIVED_SHEETS_DIR, ARCHIVED_SHEETS_DIR, COMPANY_SHEETS_DIR, SHEET_MARKERS_PATH, WEEKLY_COMPANY_SHEETS_PATH, PROFIT_LEDGER_PATH, INVENTORY_LEDGER_PATH, INVENTORY_PHOTOS_DIR, INVENTORY_PHOTO_STATE_PATH, ACTIVITY_LOG_PATH, MOBILE_ACTION_LOG_PATH, UNASSIGNED_PLAYERS_PATH, PLAYER_OVERRIDES_PATH, SELLER_TERMS_PATH, PERFORMANCE_LOG_PATH, HOME_SUMMARY_CACHE_PATH, EBAY_LISTINGS_PATH
     CARD_PIPELINE_DIR = Path(path).expanduser()
     WORKING_SHEETS_DIR = Path(working_sheets_dir).expanduser() if working_sheets_dir else CARD_PIPELINE_DIR / "WORKING SHEETS"
     INCOMING_SHEETS_DIR = CARD_PIPELINE_DIR / "INCOMING SHEETS"
@@ -368,6 +371,7 @@ def set_pipeline_root(path: Path, working_sheets_dir: Path | None = None) -> Non
     SELLER_TERMS_PATH = CARD_PIPELINE_DIR / "ASSIGNMENT RULES" / "seller_terms.csv"
     PERFORMANCE_LOG_PATH = CARD_PIPELINE_DIR / "lucas_performance.log"
     HOME_SUMMARY_CACHE_PATH = CARD_PIPELINE_DIR / "home_summary_cache.json"
+    EBAY_LISTINGS_PATH = CARD_PIPELINE_DIR / "ebay_listings.json"
 
 
 def set_pipeline_from_working_dir(path: Path) -> None:
@@ -846,6 +850,7 @@ class CardPipelineApp(tk.Tk):
         self.mobile_pin = ensure_mobile_pin(self.app_settings)
         self.mobile_payouts_cache: dict[str, object] = {}
         self.state = BridgeState()
+        self.state.ebay_token_store_path = str(ebay_token_store_path(ROOT / "work"))
         self.state.on_update = lambda: self.events.put("comp_refresh")
         self.state.mobile_pin_provider = lambda: self.mobile_pin
         self.state.mobile_inventory_search = self.mobile_inventory_search
@@ -985,6 +990,10 @@ class CardPipelineApp(tk.Tk):
         self.inventory_photo_worker: threading.Thread | None = None
         self.inventory_photo_client = None
         self.inventory_photo_scan_after_id: str | None = None
+        self.ebay_status_var = tk.StringVar(value="eBay is not connected.")
+        self.ebay_listing_status_var = tk.StringVar(value="No eBay listings loaded.")
+        self.ebay_tree_records: dict[str, dict[str, object]] = {}
+        self.ebay_worker_running = False
         self.profit_status_var = tk.StringVar(value="No profit ledger loaded.")
         self.profit_metric_var = tk.StringVar(value="")
         self.profit_person_var = tk.StringVar()
@@ -1479,6 +1488,7 @@ class CardPipelineApp(tk.Tk):
         self.review_tab = ttk.Frame(self.tabs, style="App.TFrame", padding=0)
         self.payouts_tab = ttk.Frame(self.tabs, style="App.TFrame", padding=0)
         self.inventory_tab = ttk.Frame(self.tabs, style="App.TFrame", padding=0)
+        self.ebay_tab = ttk.Frame(self.tabs, style="App.TFrame", padding=0)
         self.profit_tab = ttk.Frame(self.tabs, style="App.TFrame", padding=0)
         self.tabs.add(self.home_tab, text="Home")
         self.tabs.add(self.intake_tab, text="Create")
@@ -1488,6 +1498,7 @@ class CardPipelineApp(tk.Tk):
         if not self._is_personal_lucas():
             self.tabs.add(self.payouts_tab, text="Payouts/Tabs")
         self.tabs.add(self.inventory_tab, text="Inventory")
+        self.tabs.add(self.ebay_tab, text="eBay")
         self.tabs.add(self.profit_tab, text="Profit")
         for tab_attr in (
             "home_tab",
@@ -1497,6 +1508,7 @@ class CardPipelineApp(tk.Tk):
             "review_tab",
             "payouts_tab",
             "inventory_tab",
+            "ebay_tab",
             "profit_tab",
         ):
             setattr(self, tab_attr, self._make_scrollable_tab(getattr(self, tab_attr)))
@@ -1690,6 +1702,7 @@ class CardPipelineApp(tk.Tk):
         self._show_review_mode()
         self._build_payouts_tab()
         self._build_inventory_tab()
+        self._build_ebay_tab()
         self._build_profit_tab()
 
         bottom = ttk.Frame(self, style="App.TFrame", padding=(16, 0, 16, 14))
@@ -2237,6 +2250,324 @@ class CardPipelineApp(tk.Tk):
         self.inventory_tree.bind("<Control-Z>", self._undo_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<Command-z>", self._undo_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<Command-Z>", self._undo_inventory_bulk_edit, add="+")
+
+    def _ebay_listing_store(self) -> EbayListingStore:
+        return EbayListingStore(EBAY_LISTINGS_PATH, self.lucas_identity)
+
+    def _ebay_listing_service(self) -> EbayListingService:
+        return EbayListingService(
+            self._ebay_listing_store(),
+            token_store=self.state.ebay_store_path(),
+            config=EbayConfig.from_env(),
+            image_resolver=lambda value: self._resolve_inventory_photo_path(value),
+        )
+
+    def _build_ebay_tab(self) -> None:
+        controls = ttk.Frame(self.ebay_tab, style="Panel.TFrame", padding=(16, 12))
+        controls.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(controls, text="eBay Listings", style="Panel.TLabel", font=("Segoe UI Semibold", 13)).grid(row=0, column=0, sticky="w")
+        ttk.Label(controls, textvariable=self.ebay_status_var, style="Muted.TLabel").grid(row=0, column=1, columnspan=7, sticky="w", padx=(18, 0))
+        actions = ttk.Frame(controls, style="Panel.TFrame")
+        actions.grid(row=1, column=0, columnspan=8, sticky="w", pady=(10, 0))
+        ttk.Button(actions, text="Connect eBay", command=self.connect_ebay, style="Primary.TButton").pack(side=tk.LEFT)
+        ttk.Button(actions, text="Disconnect", command=self.disconnect_ebay, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Load Seller Setup", command=self.load_ebay_seller_setup, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Refresh", command=self.refresh_ebay_tab, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Reconcile", command=self.reconcile_ebay_listings, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Open Listing", command=self.open_selected_ebay_listing, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Withdraw", command=self.withdraw_selected_ebay_listing, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Republish", command=self.republish_selected_ebay_listing, style="Soft.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(controls, textvariable=self.ebay_listing_status_var, style="Muted.TLabel").grid(row=2, column=0, columnspan=8, sticky="w", pady=(8, 0))
+        controls.columnconfigure(7, weight=1)
+
+        columns = ("title", "sku", "listing_id", "price", "status", "environment", "updated")
+        self.ebay_tree = ttk.Treeview(self.ebay_tab, columns=columns, show="headings", height=22, selectmode="browse")
+        headings = {
+            "title": "Card",
+            "sku": "SKU",
+            "listing_id": "Listing ID",
+            "price": "Price",
+            "status": "Status",
+            "environment": "Environment",
+            "updated": "Updated",
+        }
+        widths = {"title": 360, "sku": 190, "listing_id": 130, "price": 90, "status": 110, "environment": 100, "updated": 150}
+        for column in columns:
+            self.ebay_tree.heading(column, text=headings[column], anchor=tk.W)
+            self.ebay_tree.column(column, width=widths[column], minwidth=70, anchor=tk.W)
+        y_scroll = ttk.Scrollbar(self.ebay_tab, orient=tk.VERTICAL, command=self.ebay_tree.yview)
+        self.ebay_tree.configure(yscrollcommand=y_scroll.set)
+        self.ebay_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.ebay_tree.bind("<Double-1>", lambda _event: self.open_selected_ebay_listing(), add="+")
+        self.refresh_ebay_tab()
+
+    def connect_ebay(self) -> None:
+        if not self.bridge.started:
+            messagebox.showerror("eBay connection unavailable", "The local LUCAS bridge is not running, so it cannot receive the OAuth callback.")
+            return
+        callback = f"http://127.0.0.1:{self.bridge.port}/ebay/broker/callback"
+        params = urllib.parse.urlencode(
+            {
+                "callback": callback,
+                "account": "default",
+                "profile": "personal" if self._is_personal_lucas() else "team",
+            }
+        )
+        url = f"{ebay_broker_url()}/connect?{params}"
+        webbrowser.open(url)
+        self.ebay_status_var.set("Finish signing in on eBay, then click Refresh.")
+
+    def refresh_ebay_tab(self) -> None:
+        config = EbayConfig.from_env()
+        status = ebay_account_status(self.state.ebay_store_path())
+        accounts = list(status.get("accounts") or [])
+        if accounts:
+            account = accounts[0]
+            seller = str(account.get("seller_username") or account.get("account") or "default")
+            storage = str(account.get("credential_storage") or "unknown")
+            self.ebay_status_var.set(f"Connected: {seller} | {config.env.upper()} | credentials: {storage}")
+        else:
+            self.ebay_status_var.set(f"Not connected | {config.env.upper()} | broker: {ebay_broker_url()}")
+        if not hasattr(self, "ebay_tree"):
+            return
+        self.ebay_tree.delete(*self.ebay_tree.get_children())
+        self.ebay_tree_records = {}
+        rows = self._ebay_listing_store().all()
+        for index, record in enumerate(rows, start=1):
+            iid = str(record.get("listing_key") or index)
+            updated = int(record.get("updated_at") or 0)
+            updated_text = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated)) if updated else ""
+            self.ebay_tree.insert(
+                "",
+                tk.END,
+                iid=iid,
+                values=(
+                    record.get("title") or record.get("inventory_id") or "",
+                    record.get("sku") or "",
+                    record.get("listing_id") or "",
+                    format_money(float(record.get("price") or 0)),
+                    record.get("status") or "",
+                    config.env.upper(),
+                    updated_text,
+                ),
+            )
+            self.ebay_tree_records[iid] = record
+        self.ebay_listing_status_var.set(f"{len(rows)} Lucas-created eBay listing record(s).")
+
+    def disconnect_ebay(self) -> None:
+        if not messagebox.askyesno("Disconnect eBay?", "Disconnect the local LUCAS eBay account? Existing listing records will be retained, but eBay actions will require reconnecting."):
+            return
+        self._start_ebay_worker("disconnect", lambda: {"disconnected": disconnect_ebay_account(self.state.ebay_store_path())})
+
+    def _selected_ebay_listing(self) -> dict[str, object] | None:
+        if not hasattr(self, "ebay_tree") or not self.ebay_tree.selection():
+            messagebox.showinfo("Select an eBay listing", "Select one eBay listing first.")
+            return None
+        return self.ebay_tree_records.get(self.ebay_tree.selection()[0])
+
+    def open_selected_ebay_listing(self) -> None:
+        record = self._selected_ebay_listing()
+        if not record:
+            return
+        url = str(record.get("listing_url") or "").strip()
+        if not url:
+            messagebox.showinfo("Listing not published", "This offer does not have a published listing URL yet.")
+            return
+        webbrowser.open(url)
+
+    def _start_ebay_worker(self, action: str, work) -> None:
+        if self.ebay_worker_running:
+            messagebox.showinfo("eBay action running", "Wait for the current eBay action to finish.")
+            return
+        self.ebay_worker_running = True
+        self.ebay_listing_status_var.set(f"eBay {action} running...")
+
+        def worker() -> None:
+            try:
+                result = work()
+                self.events.put((f"ebay_{action}_done", result))
+            except Exception as error:
+                self.events.put(("ebay_action_error", {"action": action, "error": str(error)}))
+
+        threading.Thread(target=worker, daemon=True, name=f"ebay-{action}").start()
+
+    def load_ebay_seller_setup(self) -> None:
+        self._start_ebay_worker("setup", lambda: self._ebay_listing_service().discover_seller_setup())
+
+    def _show_ebay_setup_picker(self, result: dict[str, object]) -> None:
+        popup = tk.Toplevel(self)
+        popup.title("eBay Seller Setup")
+        popup.transient(self)
+        popup.grab_set()
+        frame = ttk.Frame(popup, style="Panel.TFrame", padding=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Choose existing eBay seller settings", style="Panel.TLabel", font=("Segoe UI Semibold", 13)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        definitions = (
+            ("Payment policy", "payment_policies", "paymentPolicyId", "payment_policy_id"),
+            ("Fulfillment policy", "fulfillment_policies", "fulfillmentPolicyId", "fulfillment_policy_id"),
+            ("Return policy", "return_policies", "returnPolicyId", "return_policy_id"),
+            ("Inventory location", "locations", "merchantLocationKey", "merchant_location_key"),
+        )
+        selections: dict[str, tuple[tk.StringVar, dict[str, str]]] = {}
+        for row, (label, source, id_field, setting_field) in enumerate(definitions, start=1):
+            choices: dict[str, str] = {}
+            for item in result.get(source, []) or []:
+                if not isinstance(item, dict):
+                    continue
+                identifier = str(item.get(id_field) or "").strip()
+                if not identifier:
+                    continue
+                name = str(item.get("name") or item.get("locationName") or identifier).strip()
+                choices[f"{name} ({identifier})"] = identifier
+            variable = tk.StringVar(value=next(iter(choices), ""))
+            selections[setting_field] = (variable, choices)
+            ttk.Label(frame, text=label, style="Muted.TLabel").grid(row=row, column=0, sticky="w", pady=(0, 8))
+            ttk.Combobox(frame, textvariable=variable, values=list(choices), state="readonly", width=58).grid(row=row, column=1, sticky="ew", pady=(0, 8))
+
+        def save() -> None:
+            ebay_defaults = dict(self.app_settings.get("ebay_defaults") or {})
+            for key, (variable, choices) in selections.items():
+                ebay_defaults[key] = choices.get(variable.get(), "")
+            ebay_defaults["marketplace_id"] = "EBAY_US"
+            ebay_defaults["currency"] = "USD"
+            self.app_settings["ebay_defaults"] = ebay_defaults
+            save_app_settings(self.app_settings)
+            popup.destroy()
+            self.ebay_listing_status_var.set("Saved eBay policies and inventory location for listing drafts.")
+
+        ttk.Button(frame, text="Save", command=save, style="Primary.TButton").grid(row=6, column=1, sticky="e", pady=(8, 0))
+        frame.columnconfigure(1, weight=1)
+
+    def open_ebay_listing_draft(self) -> None:
+        if not hasattr(self, "inventory_tree") or len(self.inventory_tree.selection()) != 1:
+            messagebox.showinfo("List on eBay", "Select exactly one active inventory card first.")
+            return
+        record = self.inventory_tree_records.get(self.inventory_tree.selection()[0])
+        if not record or str(record.get("status") or "").lower() != "active":
+            messagebox.showinfo("List on eBay", "Only an active inventory card can be listed.")
+            return
+        defaults = dict(self.app_settings.get("ebay_defaults") or {})
+        defaults["image_paths"] = [str(path) for path in self._inventory_photo_paths_for_record(record)]
+        draft = EbayListingDraft.from_inventory(record, defaults)
+        popup = tk.Toplevel(self)
+        popup.title("List on eBay")
+        popup.geometry("780x760")
+        popup.transient(self)
+        popup.grab_set()
+        frame = ttk.Frame(popup, style="Panel.TFrame", padding=18)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="Prepare eBay listing", style="Panel.TLabel", font=("Segoe UI Semibold", 13)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        fields = {
+            "title": tk.StringVar(value=draft.title),
+            "price": tk.StringVar(value=f"{draft.price:.2f}" if draft.price else ""),
+            "category_id": tk.StringVar(value=draft.category_id),
+            "payment_policy_id": tk.StringVar(value=draft.payment_policy_id),
+            "fulfillment_policy_id": tk.StringVar(value=draft.fulfillment_policy_id),
+            "return_policy_id": tk.StringVar(value=draft.return_policy_id),
+            "merchant_location_key": tk.StringVar(value=draft.merchant_location_key),
+        }
+        labels = (
+            ("Title", "title"),
+            ("Price (USD)", "price"),
+            ("Leaf category ID", "category_id"),
+            ("Payment policy ID", "payment_policy_id"),
+            ("Fulfillment policy ID", "fulfillment_policy_id"),
+            ("Return policy ID", "return_policy_id"),
+            ("Merchant location key", "merchant_location_key"),
+        )
+        for row_index, (label, key) in enumerate(labels, start=1):
+            ttk.Label(frame, text=label, style="Muted.TLabel").grid(row=row_index, column=0, sticky="nw", pady=(0, 7))
+            ttk.Entry(frame, textvariable=fields[key], width=68).grid(row=row_index, column=1, sticky="ew", pady=(0, 7))
+        ttk.Label(frame, text=f"Condition: {draft.condition} | SKU: {draft.sku}", style="Muted.TLabel").grid(row=8, column=0, columnspan=2, sticky="w", pady=(2, 8))
+        ttk.Label(frame, text="Description", style="Muted.TLabel").grid(row=9, column=0, sticky="nw")
+        description = tk.Text(frame, height=6, bg="#111111", fg="#f5f5f5", insertbackground="#ffffff", relief=tk.FLAT, wrap=tk.WORD)
+        description.grid(row=9, column=1, sticky="nsew", pady=(0, 8))
+        description.insert("1.0", draft.description)
+        ttk.Label(frame, text="Item specifics (JSON)", style="Muted.TLabel").grid(row=10, column=0, sticky="nw")
+        aspects = tk.Text(frame, height=6, bg="#111111", fg="#f5f5f5", insertbackground="#ffffff", relief=tk.FLAT, wrap=tk.WORD)
+        aspects.grid(row=10, column=1, sticky="nsew", pady=(0, 8))
+        aspects.insert("1.0", json.dumps(draft.aspects, indent=2))
+        photos = "\n".join(draft.image_paths) or "No linked photos"
+        ttk.Label(frame, text=f"Photos ({len(draft.image_paths)}): {photos}", style="Muted.TLabel", wraplength=700).grid(row=11, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        warning = "SANDBOX: no live listing will be created." if EbayConfig.from_env().env == "sandbox" else "PRODUCTION: publishing can incur fees and create a live listing."
+        ttk.Label(frame, text=warning, style="Muted.TLabel").grid(row=12, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        def prepare() -> None:
+            try:
+                parsed_aspects = json.loads(aspects.get("1.0", tk.END).strip() or "{}")
+                price = float(fields["price"].get().replace("$", "").replace(",", ""))
+                listing_draft = EbayListingDraft(
+                    inventory_id=draft.inventory_id,
+                    sku=draft.sku,
+                    title=fields["title"].get().strip(),
+                    description=description.get("1.0", tk.END).strip(),
+                    category_id=fields["category_id"].get().strip(),
+                    price=price,
+                    payment_policy_id=fields["payment_policy_id"].get().strip(),
+                    fulfillment_policy_id=fields["fulfillment_policy_id"].get().strip(),
+                    return_policy_id=fields["return_policy_id"].get().strip(),
+                    merchant_location_key=fields["merchant_location_key"].get().strip(),
+                    condition=draft.condition,
+                    condition_descriptors=draft.condition_descriptors,
+                    aspects=parsed_aspects,
+                    image_paths=draft.image_paths,
+                    marketplace_id=draft.marketplace_id,
+                    currency=draft.currency,
+                    account=draft.account,
+                )
+            except (ValueError, json.JSONDecodeError) as error:
+                messagebox.showerror("Invalid eBay draft", str(error), parent=popup)
+                return
+            validation = listing_draft.validate()
+            if validation:
+                messagebox.showerror("Invalid eBay draft", "\n".join(validation), parent=popup)
+                return
+            popup.destroy()
+            self._start_ebay_worker("prepare", lambda: self._ebay_listing_service().prepare(listing_draft))
+
+        ttk.Button(frame, text="Prepare & Review Fees", command=prepare, style="Primary.TButton").grid(row=13, column=1, sticky="e")
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(9, weight=1)
+        frame.rowconfigure(10, weight=1)
+
+    def _finish_ebay_prepare(self, record: dict[str, object]) -> None:
+        self.ebay_worker_running = False
+        self.refresh_ebay_tab()
+        fees = record.get("fees") or {}
+        fee_note = json.dumps(fees, indent=2) if fees else f"Fee estimate unavailable: {record.get('fee_error') or 'no fee details returned'}"
+        environment = EbayConfig.from_env().env.upper()
+        confirm = messagebox.askyesno(
+            "Publish eBay listing?",
+            f"Offer {record.get('offer_id')} is prepared in {environment}.\n\nPrice: {format_money(float(record.get('price') or 0))}\n\nFee estimate (not guaranteed):\n{fee_note[:2500]}\n\nPublish now?",
+        )
+        if confirm:
+            inventory_id = str(record.get("inventory_id") or "")
+            self._start_ebay_worker("publish", lambda: self._ebay_listing_service().publish(inventory_id))
+        else:
+            self.ebay_listing_status_var.set("Offer prepared but not published. You can safely prepare it again later.")
+
+    def reconcile_ebay_listings(self) -> None:
+        self._start_ebay_worker("reconcile", lambda: self._ebay_listing_service().reconcile())
+
+    def withdraw_selected_ebay_listing(self) -> None:
+        record = self._selected_ebay_listing()
+        if not record:
+            return
+        if not messagebox.askyesno("Withdraw eBay listing?", f"Withdraw listing {record.get('listing_id') or record.get('offer_id')}? The offer will remain available for republishing."):
+            return
+        inventory_id = str(record.get("inventory_id") or "")
+        self._start_ebay_worker("withdraw", lambda: self._ebay_listing_service().withdraw(inventory_id))
+
+    def republish_selected_ebay_listing(self) -> None:
+        record = self._selected_ebay_listing()
+        if not record:
+            return
+        if not messagebox.askyesno("Republish eBay listing?", f"Republish offer {record.get('offer_id')} using its saved settings?"):
+            return
+        inventory_id = str(record.get("inventory_id") or "")
+        self._start_ebay_worker("republish", lambda: self._ebay_listing_service().republish(inventory_id))
         self.refresh_inventory_tab()
 
     def open_inventory_filters_popup(self) -> None:
@@ -6835,6 +7166,7 @@ class CardPipelineApp(tk.Tk):
             menu.add_command(label="Explain Assignment", command=self.explain_selected_inventory_assignment)
         if len(active_records) == 1 and len(records) == 1:
             menu.add_command(label="Attach Photo...", command=self.attach_photo_to_selected_inventory_row)
+            menu.add_command(label="List on eBay...", command=self.open_ebay_listing_draft)
         if self._inventory_photo_paths_for_record(clicked_record):
             menu.add_separator()
 
@@ -17722,6 +18054,24 @@ class CardPipelineApp(tk.Tk):
                         self._apply_incoming_index_retry(payload)
                     elif kind == "incoming_index_retry_error":
                         self._handle_incoming_index_retry_error(payload)
+                    elif kind == "ebay_setup_done":
+                        self.ebay_worker_running = False
+                        self._show_ebay_setup_picker(payload)
+                        self.refresh_ebay_tab()
+                    elif kind == "ebay_prepare_done":
+                        self._finish_ebay_prepare(payload)
+                    elif kind in {"ebay_publish_done", "ebay_withdraw_done", "ebay_republish_done", "ebay_reconcile_done", "ebay_disconnect_done"}:
+                        self.ebay_worker_running = False
+                        self.refresh_ebay_tab()
+                        action = kind.removeprefix("ebay_").removesuffix("_done")
+                        self.ebay_listing_status_var.set(f"eBay {action} completed.")
+                    elif kind == "ebay_action_error":
+                        self.ebay_worker_running = False
+                        self.refresh_ebay_tab()
+                        action = str(payload.get("action") or "action")
+                        error = str(payload.get("error") or "Unknown error")
+                        self.ebay_listing_status_var.set(f"eBay {action} failed: {error}")
+                        messagebox.showerror(f"eBay {action} failed", error)
         except queue.Empty:
             pass
         if pending_comp_refresh:

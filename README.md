@@ -129,6 +129,12 @@ python -m unittest discover -s tests -v
 
 The tests cover shared-folder locks, atomic JSON writes, marker merging, Google Sheet cache export/discovery, company-sheet append deduping, assignment recommendation behavior, unassigned-player capture, photo OCR recovery behavior, and profit ledger/person grouping.
 
+## eBay Sandbox Trial
+
+The **eBay** tab can connect a Sandbox seller through the local L.U.C.A.S broker, load existing seller policies and an inventory location, prepare fixed-price quantity-one listings from Inventory cards, upload linked photos to eBay Picture Services, review fee estimates, publish after confirmation, reconcile status, withdraw, and republish. Production publishing is locked by default.
+
+See [docs/EBAY_DESKTOP_TRIAL.md](docs/EBAY_DESKTOP_TRIAL.md) for prerequisites and the local trial walkthrough.
+
 ## Included Photo Tool
 
 The photo OCR helper used by L.U.C.A.S is bundled in `photo_tool`. It uses the same project `.env`, so there is no separate photo-tool setup or private machine path required.

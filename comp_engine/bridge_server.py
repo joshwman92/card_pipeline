@@ -22,7 +22,7 @@ from cardladder_ocr import extract_cl_value_from_data_url
 from cy_appium import CourtyardAndroidAdapter, NOT_BUYING_MESSAGE, SUPPORTED_GRADERS as WINDOWS_CY_GRADERS, appium_client_available
 from workbook_io import WorkbookRow
 import assignment_engine
-from ebay_api import EbayOAuthError, ebay_account_status, ebay_broker_url, ebay_token_store_path, save_ebay_broker_account
+from ebay_api import EbayOAuthError, ebay_account_status, ebay_broker_url, ebay_token_store_path, exchange_broker_code, save_ebay_broker_account
 
 BRIDGE_VERSION = "2026-07-21-cardladder-visible-cert-partial-v25"
 EXPECTED_CARDLADDER_EXTENSION_VERSION = "2026-08-15-generic-title-settle-v26"
@@ -1621,18 +1621,13 @@ code {{ color: #f8fafc; }}
                         status=400,
                     )
                     return
-                token = str(
-                    query.get("connection_token", [""])[0]
-                    or query.get("lucas_connection_token", [""])[0]
-                    or query.get("token", [""])[0]
-                    or ""
-                ).strip()
-                if not token:
+                exchange_code = str(query.get("exchange_code", [""])[0] or "").strip()
+                if not exchange_code:
                     self._send_page(
                         "Missing eBay Connection",
                         """
 <h1>Missing eBay Connection</h1>
-<p>The LUCAS eBay service returned to this app, but did not include a connection token. Try Connect eBay again.</p>
+<p>The LUCAS eBay service returned to this app, but did not include a connection exchange code. Try Connect eBay again.</p>
 """,
                         status=400,
                     )
@@ -1640,9 +1635,22 @@ code {{ color: #f8fafc; }}
                 account = str(query.get("account", ["default"])[0] or "default").strip() or "default"
                 seller_username = str(query.get("seller_username", [""])[0] or query.get("seller", [""])[0] or "").strip()
                 marketplace_id = str(query.get("marketplace_id", ["EBAY_US"])[0] or "EBAY_US").strip() or "EBAY_US"
-                broker = str(query.get("broker_url", [""])[0] or ebay_broker_url()).strip().rstrip("/")
+                broker = ebay_broker_url()
                 try:
-                    save_ebay_broker_account(state.ebay_store_path(), account, broker, token, seller_username=seller_username, marketplace_id=marketplace_id)
+                    exchanged = exchange_broker_code(broker, exchange_code)
+                    connection_token = str(exchanged.get("connection_token") or "").strip()
+                    account = str(exchanged.get("account") or account).strip() or "default"
+                    marketplace_id = str(exchanged.get("marketplace_id") or marketplace_id).strip() or "EBAY_US"
+                    environment = str(exchanged.get("env") or "sandbox").strip().lower()
+                    save_ebay_broker_account(
+                        state.ebay_store_path(),
+                        account,
+                        broker,
+                        connection_token,
+                        seller_username=seller_username,
+                        marketplace_id=marketplace_id,
+                        environment=environment,
+                    )
                 except EbayOAuthError as error:
                     self._send_page(
                         "eBay Connection Failed",
