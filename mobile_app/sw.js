@@ -1,7 +1,7 @@
 const swPath = new URL(self.location.href).pathname;
 const profileMatch = swPath.match(/^\/mobile\/(team|personal)\//);
 const APP_BASE = profileMatch ? `/mobile/${profileMatch[1]}` : "/mobile";
-const CACHE_NAME = `lucas-mobile-shell-v23-${profileMatch ? profileMatch[1] : "default"}`;
+const CACHE_NAME = `lucas-mobile-shell-v26-${profileMatch ? profileMatch[1] : "default"}`;
 const APP_SHELL = [
   APP_BASE,
   `${APP_BASE}/`,
@@ -33,10 +33,14 @@ const OFFLINE_HTML = `<!doctype html>
   </body>
 </html>`;
 
+function fetchFresh(input) {
+  return fetch(input, { cache: "reload" });
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then((cache) => Promise.all(APP_SHELL.map((url) => fetch(url).then((response) => {
+      .then((cache) => Promise.all(APP_SHELL.map((url) => fetchFresh(url).then((response) => {
         if (response.ok) {
           return cache.put(url, response);
         }
@@ -64,7 +68,7 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(
-    fetch(request).then((response) => {
+    fetchFresh(request).then((response) => {
       const copy = response.clone();
       caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
       return response;

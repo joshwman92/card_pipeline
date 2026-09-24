@@ -34,6 +34,7 @@
         <nav class="tabs" aria-label="Inventory actions">
           <button class="tab active" data-view="search" type="button">Inventory</button>
           <button class="tab" data-view="add" type="button">Add</button>
+          <button class="tab" data-view="photos" type="button">Photos</button>
           <button class="tab" data-view="trade" type="button">Trade</button>
           <button class="tab" data-view="expense" type="button">Expense</button>
           <button class="tab" data-view="profit" type="button">Profit</button>
@@ -46,7 +47,10 @@
             <select id="personFilter"></select>
           </label>
           <div class="searchRow">
-            <input id="searchInput" placeholder="Cert number or card description">
+            <div class="searchInputWrap">
+              <input id="searchInput" placeholder="Cert number or card description">
+              <button id="clearSearchInput" class="clearSearchButton hidden" type="button" aria-label="Clear inventory search">x</button>
+            </div>
             <label class="fileButton" for="photoSearchInput">Scan Photo</label>
             <input id="photoSearchInput" class="fileInput" type="file" accept="image/*" capture="environment">
           </div>
@@ -110,6 +114,23 @@
           <div id="addStatus" class="status"></div>
         </section>
 
+        <section id="photosView" class="view hidden">
+          <section class="panel inlinePanel">
+            <h2>Attach Photos</h2>
+            <div class="grid">
+              <label class="personControl">Person<select id="photoUploadPerson"></select></label>
+            </div>
+            <div class="buttonRow">
+              <label class="fileButton" for="photoUploadInput">Take Photos</label>
+              <label class="fileButton" for="photoUploadGalleryInput">Choose Photos</label>
+            </div>
+            <input id="photoUploadInput" class="fileInput" type="file" accept="image/*" capture="environment">
+            <input id="photoUploadGalleryInput" class="fileInput" type="file" accept="image/*" multiple>
+            <div id="photoUploadStatus" class="status"></div>
+          </section>
+          <div id="photoUploadList" class="results compact"></div>
+        </section>
+
         <section id="expenseView" class="view hidden">
           <div class="grid">
             <label class="personControl">Person<select id="expensePerson"></select></label>
@@ -164,7 +185,12 @@
             <label class="personControl">Person<select id="profitPerson"></select></label>
             <label>Period<select id="profitPeriod"></select></label>
             <label>Graph<select id="profitGraph"></select></label>
-            <label>Sold Search<input id="profitSearch" type="search" placeholder="Title or cert"></label>
+            <label>Sold Search
+              <div class="searchInputWrap">
+                <input id="profitSearch" type="search" placeholder="Title or cert">
+                <button id="clearProfitSearch" class="clearSearchButton hidden" type="button" aria-label="Clear profit search">x</button>
+              </div>
+            </label>
           </div>
           <div id="profitCards" class="metricGrid"></div>
           <svg id="profitChart" class="chart" role="img" aria-label="Profit graph"></svg>

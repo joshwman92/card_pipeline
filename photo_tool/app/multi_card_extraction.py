@@ -164,6 +164,21 @@ CROP_CARD_PROMPT = (
     "confidence must be one of: high, medium, low."
 )
 
+SINGLE_CARD_PROMPT = (
+    "You are reading one photo uploaded for inventory entry. First decide how many slabs are intended inventory subjects. "
+    "If there is one dominant foreground, centered, held, or close-up slab, treat that as exactly one intended slab even if other cards/slabs are visible in the background. Read that main slab carefully. "
+    "If multiple slabs are deliberately arranged as the subject of the photo, such as a row/grid/group shot with no single dominant foreground slab, return visible_card_count and leave inventory fields blank; a separate crop pass will read each slab. "
+    "Ignore hands, background objects, table texture, price stickers, sticky notes, marker writing, app overlays, and background cards/slabs that are not the main intended subject. "
+    "Read only visible or nearly certain text from the slab label/card. Do not guess missing fields. "
+    "Read grading company, certification number, player or subject, year, set, card number, parallel, subset, grade, broad category, and raw label/card text. "
+    "Preserve descriptor lines and attributes such as REFRACTOR, SILVER, AUTO, ROOKIE, qualifiers, variations, insert names, or other label details in attributes. "
+    "Supported grading companies include PSA, BGS, CGC, SGC, TAG, and unknown. Use unknown when uncertain. "
+    "Normalize cert_number to digits only when possible. Preserve leading zeros on BGS certs. "
+    "For BGS/Beckett slabs, grade must be the overall slab grade from the main grade box only. Never use subgrades as grade. "
+    "Return JSON only with this exact shape: "
+    '{"mode": "single_photo", "visible_card_count": int, "is_graded_slab": bool, "grading_company": str, "cert_number": str, "player": str, "year": str, "set": str, "card_number": str, "parallel": str, "subset": str, "attributes": str, "grade": str, "category": str, "confidence": str, "label_text": str}. '
+    "confidence must be one of: high, medium, low."
+)
 CERT_ONLY_PROMPT = (
     "You are verifying the certification number on one cropped graded trading card slab. "
     "Only read the main/central slab label in this crop. Ignore neighboring labels, handwritten prices, sticky notes, price stickers, and marker writing. "
@@ -543,6 +558,136 @@ def _identify_crop_sync(gclient: genai.Client, crop_b64: str) -> dict:
         result["is_graded_slab"] = True
     return _normalize_display_text(result)
 
+
+
+
+def _identify_single_photo_sync(gclient: genai.Client, image_b64: str) -> dict:
+    image_bytes, mime_type = _prepare_image(image_b64, max_width=2200)
+    response = _generate_with_retry(gclient, image_bytes, mime_type, SINGLE_CARD_PROMPT)
+    result = _parse_model_json(response.text.strip(), "cy")
+    try:
+        visible_count = int(float(result.get("visible_card_count", 0) or 0))
+    except (TypeError, ValueError):
+        visible_count = 0
+    result["visible_card_count"] = max(0, visible_count)
+    cert = "".join(ch for ch in str(result.get("cert_number", "") or "").strip() if ch.isdigit())
+    result["cert_number"] = cert
+    result["confidence"] = str(result.get("confidence", "low") or "low").strip().lower()
+    result["card_number"] = str(result.get("card_number", "") or "").strip()
+    result["parallel"] = str(result.get("parallel", "") or "").strip()
+    result["subset"] = str(result.get("subset", "") or "").strip()
+    result["attributes"] = _normalize_attributes(str(result.get("attributes", "") or ""))
+    result["label_text"] = str(result.get("label_text", "") or "").strip()
+    result["category"] = normalize_sport(str(result.get("category", "") or ""), str(result.get("player", "") or ""), result["label_text"])
+
+    company = str(result.get("grading_company", "unknown") or "unknown").strip().upper()
+    label_upper = result["label_text"].upper()
+    if company not in {"PSA", "BGS", "CGC", "SGC", "TAG"}:
+        if "PSA" in label_upper:
+            company = "PSA"
+        elif "BGS" in label_upper or "BECKETT" in label_upper:
+            company = "BGS"
+        elif "CGC" in label_upper:
+            company = "CGC"
+        elif "SGC" in label_upper:
+            company = "SGC"
+        elif "TAG" in label_upper:
+            company = "TAG"
+        else:
+            company = "unknown"
+    result["grading_company"] = company
+    result["grade"] = normalize_grade(str(result.get("grade", "") or ""), company, result["label_text"])
+    if result["visible_card_count"] == 1:
+        _verify_crop_cert(gclient, image_b64, result)
+    if result.get("is_graded_slab") is False and any(result.get(key) for key in ("grading_company", "player", "grade", "label_text")):
+        result["is_graded_slab"] = True
+    result["position"] = result.get("position") or "single"
+    result["detection_confidence"] = "high" if result["visible_card_count"] == 1 else "low"
+    return _normalize_display_text(result)
+
+
+def _is_single_photo_read(card: dict | None) -> bool:
+    if not card:
+        return False
+    try:
+        return int(card.get("visible_card_count", 0) or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _region_area(bbox: list[int]) -> int:
+    x1, y1, x2, y2 = bbox
+    return max(x2 - x1, 0) * max(y2 - y1, 0)
+
+
+def _region_center_is_inside(inner: list[int], outer: list[int]) -> bool:
+    x1, y1, x2, y2 = inner
+    ox1, oy1, ox2, oy2 = outer
+    cx = (x1 + x2) / 2
+    cy = (y1 + y2) / 2
+    return ox1 <= cx <= ox2 and oy1 <= cy <= oy2
+
+
+def _region_is_slab_body_candidate(bbox: list[int]) -> bool:
+    x1, y1, x2, y2 = bbox
+    width = x2 - x1
+    height = y2 - y1
+    area = width * height
+    return width >= 70 and height >= 160 and area >= 30000
+
+
+def _regions_show_distinct_slab_bodies(regions: list[dict]) -> bool:
+    boxes = [
+        region.get("bbox")
+        for region in regions
+        if isinstance(region.get("bbox"), list)
+        and len(region.get("bbox")) == 4
+        and _region_is_slab_body_candidate(region.get("bbox"))
+    ]
+    if len(boxes) < 2:
+        return False
+    boxes = sorted(boxes, key=_region_area, reverse=True)
+    kept: list[list[int]] = []
+    for box in boxes:
+        duplicate = False
+        for existing in kept:
+            if _bbox_iou(box, existing) > 0.08:
+                duplicate = True
+                break
+            if _region_center_is_inside(box, existing) or _region_center_is_inside(existing, box):
+                duplicate = True
+                break
+        if not duplicate:
+            kept.append(box)
+        if len(kept) >= 2:
+            return True
+    return False
+
+
+def _regions_look_like_one_slab(regions: list[dict]) -> bool:
+    return not _regions_show_distinct_slab_bodies(regions)
+
+
+def _single_photo_read_can_short_circuit(card: dict | None, regions: list[dict]) -> bool:
+    if not _is_single_photo_read(card):
+        return False
+    if _card_has_inventory_or_detected_slab(card) and _card_read_score(card) >= 60:
+        return True
+    if len(regions) > 1 and not _regions_look_like_one_slab(regions):
+        return False
+    if not regions:
+        return _card_has_inventory_or_detected_slab(card)
+    return _card_has_inventory_or_detected_slab(card) and _card_read_score(card) >= 20
+
+
+def _choose_single_region_read(single_card: dict | None, crop_card: dict) -> dict:
+    if not _is_single_photo_read(single_card):
+        return crop_card
+    single_score = _card_read_score(single_card)
+    crop_score = _card_read_score(crop_card)
+    if single_score >= max(20, crop_score):
+        return single_card
+    return crop_card
 
 def _verify_crop_cert(gclient: genai.Client, crop_b64: str, result: dict) -> None:
     cert = str(result.get("cert_number", "") or "")
@@ -930,10 +1075,47 @@ def _is_same_subject_card(a: dict, b: dict) -> bool:
     return bool((set_a and set_a == set_b) or (year_a and year_a == year_b) or (category_a and category_a == category_b))
 
 
+GENERIC_FRAGMENT_LABELS = {
+    "AUTO",
+    "AUTOGRAPH",
+    "CARD",
+    "GEM MINT",
+    "MINT",
+    "PRIZM",
+    "REFRACTOR",
+    "ROOKIE",
+    "SILVER",
+}
+
+
+def _useful_label_text(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip().upper())
+    if not text or text in GENERIC_FRAGMENT_LABELS:
+        return ""
+    if len(text) < 6:
+        return ""
+    return text
+
+
 def _card_has_inventory_or_detected_slab(card: dict) -> bool:
-    if any(card.get(key) for key in ("cert_number", "player", "year", "set", "card_number", "parallel", "subset", "grade", "label_text")):
+    if card.get("cert_number"):
         return True
-    return bool(card.get("is_graded_slab") or card.get("detection_confidence") or card.get("error"))
+    confidence = str(card.get("confidence") or "").strip().lower()
+    position = str(card.get("position") or "").strip().lower()
+    if confidence == "low" or "background" in position:
+        return False
+    identity_fields = ["player", "year", "set", "card_number", "parallel", "subset", "attributes", "grade"]
+    identity_count = sum(1 for key in identity_fields if str(card.get(key) or "").strip())
+    company = str(card.get("grading_company") or "").strip().lower()
+    has_company = bool(company and company != "unknown")
+    if identity_count >= 2:
+        return True
+    if identity_count >= 1 and has_company:
+        return True
+    label_text = _useful_label_text(card.get("label_text"))
+    if label_text and has_company:
+        return True
+    return False
 
 
 def _dedupe_card_results(cards: list[dict]) -> list[dict]:
@@ -955,9 +1137,28 @@ def identify_cards_sync(gclient: genai.Client, image_b64: str, progress_callback
     image_bytes, mime_type = _prepare_image(image_b64)
     logging.info(f"[multi resize] {time.time() - t0:.2f}s ({len(image_bytes) // 1024}KB)")
 
+    single_card = None
+    try:
+        if progress_callback:
+            progress_callback("Checking for single-slab photo read...")
+        t_single = time.time()
+        single_card = _identify_single_photo_sync(gclient, image_b64)
+        logging.info(f"[single photo gemini] {time.time() - t_single:.2f}s count={single_card.get('visible_card_count')}")
+    except (ModelQuotaExceeded, TemporaryModelUnavailable):
+        raise
+    except Exception as error:
+        logging.info(f"[single photo skipped] {str(error)[:160]}")
+
     t1 = time.time()
     regions = _detect_regions_sync(gclient, image_bytes, mime_type)
     logging.info(f"[region gemini] {time.time() - t1:.2f}s")
+    if _single_photo_read_can_short_circuit(single_card, regions):
+        if progress_callback:
+            progress_callback("Detected one slab; using whole-photo OCR read.")
+        single_card["card_index"] = 1
+        single_card["position"] = single_card.get("position") or "single"
+        logging.info("[single photo selected] one visible slab")
+        return [single_card]
     if regions:
         if progress_callback:
             progress_callback(f"Detected {len(regions)} card(s); reading labels with {min(PHOTO_OCR_CROP_WORKERS, len(regions))} worker(s)...")
@@ -976,6 +1177,8 @@ def identify_cards_sync(gclient: genai.Client, image_b64: str, progress_callback
                 completed += 1
                 try:
                     card = future.result()
+                    if len(regions) == 1:
+                        card = _choose_single_region_read(single_card, card)
                     card["card_index"] = region["card_index"]
                     card["position"] = region["position"]
                     card["detection_confidence"] = region["detection_confidence"]
@@ -1004,6 +1207,14 @@ def identify_cards_sync(gclient: genai.Client, image_b64: str, progress_callback
                 if progress_callback:
                     progress_callback(f"Read {completed}/{len(regions)} detected card label(s)...")
         cards = [cards_by_index[index] for index in sorted(cards_by_index)]
+        if _is_single_photo_read(single_card) and _regions_look_like_one_slab(regions):
+            candidates = [card for card in [single_card, *cards] if card and _card_has_inventory_or_detected_slab(card)]
+            if candidates:
+                best_card = max(candidates, key=_card_read_score)
+                best_card["card_index"] = 1
+                best_card["position"] = best_card.get("position") or "single"
+                logging.info(f"[single photo collapsed crops] {len(cards)} crop result(s) -> 1 card")
+                return [best_card]
         logging.info(f"[multi identified via crops] {len(cards)} card(s)")
         return _dedupe_card_results(cards)
 

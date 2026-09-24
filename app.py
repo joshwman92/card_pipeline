@@ -137,6 +137,7 @@ SELLER_TERMS_PATH = CARD_PIPELINE_DIR / "ASSIGNMENT RULES" / "seller_terms.csv"
 PERFORMANCE_LOG_PATH = CARD_PIPELINE_DIR / "lucas_performance.log"
 HOME_SUMMARY_CACHE_PATH = CARD_PIPELINE_DIR / "home_summary_cache.json"
 GOOGLE_SHEET_CACHE_MAX_AGE_SECONDS = 5 * 60
+MOBILE_PAYOUT_CACHE_SECONDS = 30
 LUCAS_LOGO_PATH = ROOT / "assets" / "lucas.png"
 MIKEYS_CARDS_LOGO_PATH = ROOT / "assets" / "mikeys_cards_logo.png"
 CARDLADDER_EXTENSION_DIR = ROOT / "cardladder-autocomp" / "extension"
@@ -163,10 +164,13 @@ PROFIT_PERIOD_OPTIONS = ("5 Days", "Week", "Last 30 Days", "Calendar Month", "Ye
 PROFIT_GRAPH_OPTIONS = ("Overall Profit", "Generated Profit", "Profit to Sales Ratio", "Daily Trend", "Profit by Company")
 PROFIT_PLOT_OPTIONS = ("Overall", "By Sport")
 PROFIT_BREAKDOWN_OPTIONS = ("Day", "Month")
+PAYOUT_SUMMARY_VIEW_OPTIONS = ("Total", "Per Sheet")
 DEFAULT_PROFIT_BREAKDOWN = "Month"
 DEFAULT_PROFIT_PERIOD = "Calendar Month"
 DEFAULT_PROFIT_GRAPH = "Overall Profit"
 DEFAULT_PROFIT_PLOT = "Overall"
+DEFAULT_PROFIT_OWNER_VIEW = "Full Profit"
+DEFAULT_PAYOUT_SUMMARY_VIEW = "Total"
 PROFIT_SPORT_COLORS = {
     "Football": "#3b82f6",
     "Baseball": "#ef4444",
@@ -527,6 +531,7 @@ INVENTORY_TABLE_COLUMNS = (
     "cy_confidence",
     "company",
     "payout",
+    "delta",
     "paid_with",
     "source",
     "status",
@@ -619,6 +624,7 @@ INVENTORY_HEADINGS = {
     "status": "Status",
     "photos": "Photos",
     "notes": "Notes",
+    "delta": "Delta %",
 }
 
 INVENTORY_COLUMN_WIDTHS = {
@@ -642,6 +648,7 @@ INVENTORY_COLUMN_WIDTHS = {
     "status": 110,
     "photos": 80,
     "notes": 240,
+    "delta": 100,
 }
 
 INVENTORY_EDIT_COLUMN_FIELDS = {
@@ -837,6 +844,7 @@ class CardPipelineApp(tk.Tk):
         self.lucas_identity = local_identity(SETTINGS_PATH)
         self.app_settings = load_app_settings()
         self.mobile_pin = ensure_mobile_pin(self.app_settings)
+        self.mobile_payouts_cache: dict[str, object] = {}
         self.state = BridgeState()
         self.state.on_update = lambda: self.events.put("comp_refresh")
         self.state.mobile_pin_provider = lambda: self.mobile_pin
@@ -845,6 +853,7 @@ class CardPipelineApp(tk.Tk):
         self.state.mobile_inventory_mark_sold = self.mobile_inventory_mark_sold
         self.state.mobile_inventory_trade = self.mobile_inventory_trade
         self.state.mobile_card_identify = self.mobile_card_identify
+        self.state.mobile_photo_upload = self.mobile_photo_upload
         self.state.mobile_profit_summary = self.mobile_profit_summary
         self.state.mobile_profit_refund = self.mobile_profit_refund
         self.state.mobile_expense_add = self.mobile_expense_add
@@ -864,9 +873,9 @@ class CardPipelineApp(tk.Tk):
         self.input_mode = tk.StringVar(value="Barcode Scanner")
         self.review_mode = tk.StringVar(value="Automatic Receive")
         self.review_input_mode = tk.StringVar(value="Barcode Scanner")
-        self.comp_strategy_label = tk.StringVar(value="Average last 5")
+        self.comp_strategy_label = tk.StringVar(value="Date weighted")
         self.comp_low_outlier_pct_var = tk.StringVar(value="Off")
-        self.comp_scope_label = tk.StringVar(value=COMP_SCOPE_EMPTY)
+        self.comp_scope_label = tk.StringVar(value=COMP_SCOPE_ALL)
         self.comp_cy_var = tk.BooleanVar(value=cy_lookup_enabled())
         self.working_sheet_title = tk.StringVar()
         self.create_network_mode_var = tk.BooleanVar(value=bool(self.app_settings.get("network_mode")))
@@ -934,11 +943,14 @@ class CardPipelineApp(tk.Tk):
         self.home_selected_sheet_key = ""
         self.home_person_var = tk.StringVar()
         self.home_sheet_sort_var = tk.StringVar(value="Date Created")
+        self.home_sheet_search_var = tk.StringVar()
         self.home_incoming_volume_sort_column = "sheet"
         self.home_incoming_volume_sort_descending = False
         self.payout_person_var = tk.StringVar()
+        self.payout_summary_view_var = tk.StringVar(value=DEFAULT_PAYOUT_SUMMARY_VIEW)
         self.payout_status_var = tk.StringVar(value="No unpaid sheets loaded.")
         self.payout_summary_people: dict[str, str] = {}
+        self.payout_summary_item_keys: dict[str, list[str]] = {}
         self.payout_detail_keys: dict[str, str] = {}
         self.inventory_status_var = tk.StringVar(value="No inventory loaded.")
         self.inventory_metric_var = tk.StringVar(value="")
@@ -962,7 +974,7 @@ class CardPipelineApp(tk.Tk):
         self.inventory_tree_records: dict[str, dict[str, object]] = {}
         self.inventory_recomp_context: dict[str, object] | None = None
         self.inventory_bulk_cell: tuple[str, str] | None = None
-        self.inventory_cell_editor: ttk.Entry | None = None
+        self.inventory_cell_editor: ttk.Entry | ttk.Combobox | None = None
         self.inventory_cell_edit: tuple[str, str] | None = None
         self.inventory_bulk_undo_stack: list[dict[str, object]] = []
         self.inventory_filter_after_id: str | None = None
@@ -1839,6 +1851,11 @@ class CardPipelineApp(tk.Tk):
         )
         self.home_sheet_sort_combo.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
         self.home_sheet_sort_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_home_sheet_list(), add="+")
+        search_row = ttk.Frame(sheet_panel, style="Panel.TFrame")
+        search_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(search_row, text="Search", style="Muted.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(search_row, textvariable=self.home_sheet_search_var, width=18).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 0))
+        self.home_sheet_search_var.trace_add("write", lambda *_args: self._on_home_sheet_search_changed())
         self.home_sheet_list = tk.Listbox(
             sheet_panel,
             width=1,
@@ -1994,7 +2011,7 @@ class CardPipelineApp(tk.Tk):
         return ""
 
     def _record_sort_value(self, record: dict[str, object], column: str, table: str, mode: str = "") -> tuple[bool, object]:
-        money_columns = {"purchase", "sale", "profit", "amount", "payout", "card_ladder", "comps", "cy_estimate", "volume"}
+        money_columns = {"purchase", "sale", "profit", "amount", "payout", "card_ladder", "comps", "cy_estimate", "volume", "delta"}
         int_columns = {"cards", "received"}
         if table == "home_incoming_volume":
             raw = record.get(column)
@@ -2020,7 +2037,10 @@ class CardPipelineApp(tk.Tk):
                 "photos": "photo_count",
                 "notes": "notes",
             }
-            raw = inventory_display_notes(record) if column == "notes" else record.get(field_map.get(column, column))
+            if column == "delta":
+                raw = self._inventory_cl_comp_delta(record)
+            else:
+                raw = inventory_display_notes(record) if column == "notes" else record.get(field_map.get(column, column))
         elif table == "profit_sheet":
             raw = record.get(column)
         else:
@@ -2076,8 +2096,19 @@ class CardPipelineApp(tk.Tk):
         self.payout_person_combo.grid(row=0, column=1, sticky="w", padx=(8, 10))
         self._bind_person_autocomplete(self.payout_person_combo, refresh_callback=self.refresh_payouts_tab)
         self.payout_person_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_payouts_tab(), add="+")
-        controls.columnconfigure(2, weight=1)
-        ttk.Label(controls, textvariable=self.payout_status_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text="View", style="Muted.TLabel").grid(row=0, column=2, sticky="e", padx=(4, 6))
+        self.payout_summary_view_combo = ttk.Combobox(
+            controls,
+            textvariable=self.payout_summary_view_var,
+            values=PAYOUT_SUMMARY_VIEW_OPTIONS,
+            width=10,
+            state="readonly",
+        )
+        self.payout_summary_view_combo.grid(row=0, column=3, sticky="w", padx=(0, 10))
+        self.payout_summary_view_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_payouts_tab(), add="+")
+        ttk.Button(controls, text="Refresh Payouts", command=self.refresh_payouts_from_disk, style="Soft.TButton").grid(row=0, column=4, sticky="w")
+        controls.columnconfigure(5, weight=1)
+        ttk.Label(controls, textvariable=self.payout_status_var, style="Muted.TLabel").grid(row=1, column=0, columnspan=5, sticky="w", pady=(10, 0))
 
         payout_split = tk.PanedWindow(
             self.payouts_tab,
@@ -2095,9 +2126,10 @@ class CardPipelineApp(tk.Tk):
         ttk.Label(summary_panel, text="Active Balances", style="Panel.TLabel").pack(anchor=tk.W)
         self.payout_summary_tree = self._build_home_tree(
             summary_panel,
-            columns=("person", "sheets", "cards", "expenses", "total_net_profit", "unpaid_net_profit", "balance"),
+            columns=("person", "sheet", "sheets", "cards", "expenses", "total_net_profit", "unpaid_net_profit", "balance"),
             headings={
                 "person": "Person",
+                "sheet": "Sheet",
                 "sheets": "Sheets",
                 "cards": "Cards",
                 "expenses": "Expenses",
@@ -2105,7 +2137,7 @@ class CardPipelineApp(tk.Tk):
                 "unpaid_net_profit": "Unpaid Net Profit",
                 "balance": "Balance Owed",
             },
-            widths={"person": 180, "sheets": 65, "cards": 65, "expenses": 100, "total_net_profit": 120, "unpaid_net_profit": 125, "balance": 120},
+            widths={"person": 160, "sheet": 220, "sheets": 65, "cards": 65, "expenses": 100, "total_net_profit": 120, "unpaid_net_profit": 125, "balance": 120},
             height=18,
         )
         self.payout_summary_tree.tag_configure("total_divider", background="#1f1f1f", foreground="#ffffff", font=("Segoe UI Semibold", 10))
@@ -2193,8 +2225,8 @@ class CardPipelineApp(tk.Tk):
         self.inventory_tree.configure(selectmode="extended")
         self._configure_sortable_tree_headings(self.inventory_tree, INVENTORY_HEADINGS, "inventory")
         self._bind_context_menu(self.inventory_tree, self._show_inventory_context_menu)
-        self.inventory_tree.bind("<Button-1>", self._begin_inventory_cell_edit_from_click, add="+")
-        self.inventory_tree.bind("<Double-1>", self._begin_inventory_bulk_edit, add="+")
+        self.inventory_tree.bind("<Button-1>", self._inventory_bulk_click, add="+")
+        self.inventory_tree.bind("<Double-1>", self._begin_inventory_cell_edit_from_click, add="+")
         self.inventory_tree.bind("<Return>", self._begin_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<F2>", self._begin_inventory_bulk_edit, add="+")
         self.inventory_tree.bind("<Up>", lambda event: self._move_inventory_bulk_cell(-1, 0), add="+")
@@ -2597,7 +2629,31 @@ class CardPipelineApp(tk.Tk):
 
     def _save_inventory_ledger(self, rows: list[dict[str, object]]) -> None:
         INVENTORY_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_json(INVENTORY_LEDGER_PATH, {"items": rows})
+        rows_to_save = [item for item in rows if isinstance(item, dict)]
+        remove_sold = getattr(self, "_active_inventory_rows_excluding_sold_profit", None)
+        if callable(remove_sold):
+            rows_to_save, removed = remove_sold(rows_to_save)
+            if removed:
+                append_activity = getattr(self, "_append_activity", None)
+                if callable(append_activity):
+                    append_activity(
+                        "Inventory Save Blocked",
+                        "Removed {} sold card(s) from active inventory before saving.".format(len(removed)),
+                        {
+                            "removed_count": len(removed),
+                            "removed": [
+                                {
+                                    "inventory_key": record.get("inventory_key") or "",
+                                    "item_id": record.get("item_id") or "",
+                                    "cert_number": record.get("cert_number") or "",
+                                    "card_title": record.get("card_title") or "",
+                                    "source_sheet": record.get("source_sheet") or "",
+                                }
+                                for record in removed[:20]
+                            ],
+                        },
+                    )
+        atomic_write_json(INVENTORY_LEDGER_PATH, {"items": rows_to_save})
 
     def _load_activity_log(self) -> list[dict[str, object]]:
         if not ACTIVITY_LOG_PATH.exists():
@@ -2697,6 +2753,149 @@ class CardPipelineApp(tk.Tk):
             str(record.get(field) or "").strip().lower()
             for field in ("cert_number", "source_sheet", "assigned_person")
         )
+
+
+    def _inventory_identity_keys(self, record: dict[str, object]) -> set[str]:
+        keys: set[str] = set()
+        cert = scan_to_cert(record.get("cert_number"))
+        if cert:
+            keys.add(f"cert:{cert}")
+        item_id = str(record.get("item_id") or "").strip().lower()
+        if item_id:
+            keys.add(f"item:{item_id}")
+        return keys
+
+    def _sold_inventory_identity_keys(self, record: dict[str, object]) -> set[str]:
+        if str(record.get("record_type") or "").strip().lower() == "expense":
+            return set()
+        if self._money_value(record.get("sale_price")) is None:
+            return set()
+        return self._inventory_identity_keys(record)
+
+    def _active_inventory_rows_excluding_sold_profit(
+        self,
+        rows: list[dict[str, object]],
+    ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+        profit_loader = getattr(self, "_load_profit_ledger", None)
+        if not callable(profit_loader):
+            return rows, []
+        sold_records = [record for record in profit_loader() if isinstance(record, dict)]
+        if not sold_records:
+            return rows, []
+        kept: list[dict[str, object]] = []
+        removed: list[dict[str, object]] = []
+        for record in rows:
+            if str(record.get("status") or "Active").strip().lower() != "active":
+                kept.append(record)
+                continue
+            if any(self._profit_record_blocks_inventory_row(record, sold_record) for sold_record in sold_records):
+                removed.append(record)
+            else:
+                kept.append(record)
+        return kept, removed
+
+    def _profit_record_blocks_inventory_row(self, inventory_record: dict[str, object], profit_record: dict[str, object]) -> bool:
+        if str(profit_record.get("record_type") or "").strip().lower() == "expense":
+            return False
+        if self._money_value(profit_record.get("sale_price")) is None:
+            return False
+
+        inventory_date = self._profit_record_date(inventory_record.get("date_added"))
+        sold_date = self._profit_record_date(profit_record.get("date_added") or profit_record.get("ledger_added_at"))
+        if inventory_date is not None and sold_date is not None and inventory_date > sold_date:
+            return False
+
+        inventory_key = str(inventory_record.get("inventory_key") or "").strip().lower()
+        profit_key = str(profit_record.get("inventory_key") or "").strip().lower()
+        if inventory_key and profit_key and inventory_key == profit_key:
+            return True
+
+        inventory_source = Path(str(inventory_record.get("source_sheet") or "")).name.strip().lower()
+        profit_sources = {
+            Path(str(profit_record.get(field) or "")).name.strip().lower()
+            for field in ("source_sheet", "original_source_sheet")
+        }
+        profit_sources.discard("")
+
+        inventory_item_id = str(inventory_record.get("item_id") or "").strip().lower()
+        profit_item_id = str(profit_record.get("item_id") or "").strip().lower()
+        if inventory_item_id and profit_item_id and inventory_item_id == profit_item_id:
+            if inventory_source and profit_sources:
+                return inventory_source in profit_sources
+            return not inventory_source or not profit_sources
+
+        inventory_cert = scan_to_cert(inventory_record.get("cert_number"))
+        profit_cert = scan_to_cert(profit_record.get("cert_number"))
+        if not inventory_cert or inventory_cert != profit_cert:
+            return False
+
+        if inventory_source and profit_sources:
+            return inventory_source in profit_sources
+        return not inventory_source or not profit_sources
+
+    def _inventory_add_protection_reason(self, record: dict[str, object], existing_rows: list[dict[str, object]]) -> str:
+        source_sheet = Path(str(record.get("source_sheet") or "")).name.strip().lower()
+        cert = scan_to_cert(record.get("cert_number"))
+        item_id = str(record.get("item_id") or "").strip().lower()
+        title_identity = self._received_inventory_title_identity(record.get("card_title"))
+
+        for existing in existing_rows:
+            if str(existing.get("status") or "Active").strip().lower() != "active":
+                continue
+            existing_source = Path(str(existing.get("source_sheet") or "")).name.strip().lower()
+            if source_sheet and existing_source != source_sheet:
+                continue
+            existing_cert = scan_to_cert(existing.get("cert_number"))
+            existing_item_id = str(existing.get("item_id") or "").strip().lower()
+            if cert and existing_cert == cert:
+                return "cert already exists in active inventory"
+            if item_id and existing_item_id == item_id:
+                return "item id already exists in active inventory"
+            existing_title = self._received_inventory_title_identity(existing.get("card_title"))
+            if not title_identity or existing_title != title_identity:
+                continue
+            if not cert and not existing_cert:
+                if item_id or existing_item_id:
+                    continue
+                return "matching raw title already exists in the same source sheet"
+
+        tombstone_loader = getattr(self, "_load_inventory_deleted_tombstones", None)
+        tombstones = tombstone_loader() if callable(tombstone_loader) else []
+        for tombstone in tombstones:
+            if not isinstance(tombstone, dict):
+                continue
+            tombstone_cert = scan_to_cert(tombstone.get("cert_number"))
+            tombstone_item_id = str(tombstone.get("item_id") or "").strip().lower()
+            if cert and tombstone_cert == cert:
+                return "cert was previously deleted from inventory"
+            if item_id and tombstone_item_id == item_id:
+                return "item id was previously deleted from inventory"
+
+        profit_loader = getattr(self, "_load_profit_ledger", None)
+        profit_rows = profit_loader() if callable(profit_loader) else []
+        for raw_profit_record in profit_rows:
+            if not isinstance(raw_profit_record, dict):
+                continue
+            profit_record = raw_profit_record
+            if str(profit_record.get("record_type") or "").strip().lower() == "expense":
+                continue
+            if self._money_value(profit_record.get("sale_price")) is None:
+                continue
+            profit_cert = scan_to_cert(profit_record.get("cert_number"))
+            profit_item_id = str(profit_record.get("item_id") or "").strip().lower()
+            source_values = {
+                Path(str(profit_record.get(field) or "")).name.strip().lower()
+                for field in ("source_sheet", "original_source_sheet")
+            }
+            source_values.discard("")
+            same_cert = bool(cert and profit_cert == cert)
+            same_item = bool(item_id and profit_item_id == item_id)
+            same_source = bool(source_sheet and source_sheet in source_values)
+            clear_buyback = bool(same_cert and source_sheet and not same_source)
+            if (same_cert or same_item) and not clear_buyback:
+                return "cert or item id was previously sold"
+        return ""
+
 
     def _raw_item_id_namespace(self) -> str:
         return "MIKEY" if self._is_personal_lucas() else "TEAM"
@@ -2869,11 +3068,11 @@ class CardPipelineApp(tk.Tk):
                         continue
                     headers = self._workbook_header_lookup(sheet)
                     headers, item_id_col = self._ensure_workbook_item_id_column(sheet, headers)
-                    cert_col = next((headers.get(name) for name in ("certificationnumber", "certnumber", "cert", "certification")), None)
-                    card_col = next((headers.get(name) for name in ("carddescription", "card", "cardtitle", "title", "description")), None)
-                    grader_col = next((headers.get(name) for name in ("company", "grader", "gradingcompany")), None)
-                    sport_col = next((headers.get(name) for name in ("sport", "category")), None)
-                    purchase_col = next((headers.get(name) for name in ("purchaseprice", "purchase", "cost", "buyprice")), None)
+                    cert_col = next((headers.get(name) for name in ("certificationnumber", "certnumber", "cert", "certification") if headers.get(name)), None)
+                    card_col = next((headers.get(name) for name in ("carddescription", "card", "cardtitle", "title", "description") if headers.get(name)), None)
+                    grader_col = next((headers.get(name) for name in ("company", "grader", "gradingcompany") if headers.get(name)), None)
+                    sport_col = next((headers.get(name) for name in ("sport", "category") if headers.get(name)), None)
+                    purchase_col = next((headers.get(name) for name in ("purchaseprice", "purchase", "cost", "buyprice") if headers.get(name)), None)
                     for row_index in range(2, sheet.max_row + 1):
                         item_id = str(sheet.cell(row_index, item_id_col).value or "").strip()
                         cert = scan_to_cert(sheet.cell(row_index, cert_col).value if cert_col else "")
@@ -2938,10 +3137,10 @@ class CardPipelineApp(tk.Tk):
         for folder in folders:
             try:
                 folder.mkdir(parents=True, exist_ok=True)
-                paths.extend(sorted(folder.glob("*.xlsx"), key=lambda path: path.name.lower()))
+                available_paths.extend(sorted(folder.glob("*.xlsx"), key=lambda path: path.name.lower()))
             except Exception:
                 continue
-        return self._ensure_raw_item_ids_in_sheet_paths(paths)
+        return self._ensure_raw_item_ids_in_sheet_paths(available_paths)
 
     def _normalize_inventory_record(self, record: dict[str, object]) -> dict[str, object]:
         normalized = dict(record)
@@ -3029,26 +3228,45 @@ class CardPipelineApp(tk.Tk):
             return 0
         ledger = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
         by_key = {str(record.get("inventory_key") or ""): record for record in ledger}
+        protected_rows = list(ledger)
+        blocked: list[dict[str, object]] = []
         added = 0
         for record in records:
             if not str(record.get("cert_number") or "").strip() and not str(record.get("item_id") or "").strip():
                 record = dict(record)
                 record["item_type"] = "Raw"
                 record["item_id"] = self._next_raw_item_id([*ledger, *by_key.values()])
+                record["_generated_item_id_for_add"] = True
                 record.pop("inventory_key", None)
             normalized = self._normalize_inventory_record(record)
             normalized = self._enrich_inventory_record_assignment(normalized)
             key = str(normalized.get("inventory_key") or "")
             if not key:
                 continue
+            protection_reason = getattr(self, "_inventory_add_protection_reason", None)
+            reason = protection_reason(normalized, protected_rows) if callable(protection_reason) else ""
+            if reason:
+                blocked.append({"record": normalized, "reason": reason})
+                continue
+            normalized.pop("_generated_item_id_for_add", None)
             if key not in by_key:
                 ledger.append(normalized)
                 by_key[key] = normalized
+                protected_rows.append(normalized)
                 added += 1
             else:
                 existing = by_key[key]
                 existing.update(normalized)
                 existing["status"] = "Active"
+                protected_rows.append(existing)
+        if blocked:
+            append_activity = getattr(self, "_append_activity", None)
+            if callable(append_activity):
+                append_activity(
+                    "Inventory Add Blocked",
+                    "Blocked {} duplicate or previously removed inventory add(s).".format(len(blocked)),
+                    {"blocked_count": len(blocked), "blocked": blocked},
+                )
         self._save_inventory_ledger(ledger)
         if refresh:
             self.refresh_inventory_tab()
@@ -3159,7 +3377,7 @@ class CardPipelineApp(tk.Tk):
             if item_id:
                 keys.add(("", f"item:{item_id}"))
             title_identity = CardPipelineApp._received_inventory_title_identity(self, record.get("card_title"))
-            if source_sheet and not cert and title_identity:
+            if source_sheet and not cert and not item_id and title_identity:
                 keys.add((source_sheet, f"title:{title_identity}"))
         for record in [self._normalize_profit_record(row) for row in self._load_profit_ledger()]:
             cert = scan_to_cert(record.get("cert_number"))
@@ -3167,15 +3385,11 @@ class CardPipelineApp(tk.Tk):
                 source_sheet = Path(str(source_value or "")).name.strip().lower()
                 if source_sheet and cert:
                     keys.add((source_sheet, cert))
-                if cert:
-                    keys.add(("", cert))
                 item_id = str(record.get("item_id") or "").strip().lower()
                 if source_sheet and item_id:
                     keys.add((source_sheet, f"item:{item_id}"))
-                if item_id:
-                    keys.add(("", f"item:{item_id}"))
                 title_identity = CardPipelineApp._received_inventory_title_identity(self, record.get("card_title"))
-                if source_sheet and not cert and title_identity:
+                if source_sheet and not cert and not item_id and title_identity:
                     keys.add((source_sheet, f"title:{title_identity}"))
         return keys
 
@@ -3187,9 +3401,13 @@ class CardPipelineApp(tk.Tk):
         company_keys: set[tuple[str, str]] | None = None,
         accounted_keys: set[tuple[str, str]] | None = None,
     ) -> list[dict[str, object]]:
-        assigned_person = str(person or "").strip()
-        if not assigned_person or not path.exists():
+        assigned_person = str(person or "").strip() or "Unassigned"
+        if not path.exists():
             return []
+        try:
+            self._ensure_raw_item_ids_in_sheet_paths([path])
+        except Exception:
+            pass
         received_certs = None if stage == "Received" else self._received_certs_in_workbook(path)
         try:
             rows = read_simple_spreadsheet(path)
@@ -3223,7 +3441,7 @@ class CardPipelineApp(tk.Tk):
                 continue
             if ("", row_identity) in accounted_keys:
                 continue
-            if not cert and title_identity and (path.name.lower(), f"title:{title_identity}") in accounted_keys:
+            if not cert and not item_id and title_identity and (path.name.lower(), f"title:{title_identity}") in accounted_keys:
                 continue
             sport = CardPipelineApp._inventory_sport_from_value(self, row.get("sport") or row.get("category"), card_title)
             item_type = "Graded" if cert else "Raw"
@@ -4837,9 +5055,20 @@ class CardPipelineApp(tk.Tk):
                 except Exception:
                     self.home_sheet_summaries.setdefault(key, {"name": path.name, "row_count": 0, "received_count": 0, "purchase_total": 0.0, "all_received": stage == "Received"})
 
+    def _invalidate_mobile_payouts_cache(self) -> None:
+        self.mobile_payouts_cache = {}
+
     def mobile_payouts(self, payload: dict) -> dict:
-        self._refresh_payout_state_from_disk()
         needle = str(payload.get("person") or "").strip().lower()
+        cache_key = needle
+        now = time.monotonic()
+        cached = getattr(self, "mobile_payouts_cache", {}).get(cache_key) if isinstance(getattr(self, "mobile_payouts_cache", None), dict) else None
+        if isinstance(cached, dict) and now - float(cached.get("created_at") or 0.0) < MOBILE_PAYOUT_CACHE_SECONDS:
+            response = copy.deepcopy(cached.get("response") or {})
+            if response:
+                response["cached"] = True
+                return response
+        self._refresh_payout_state_from_disk()
         balances: dict[str, dict[str, float | int]] = {}
         details: list[dict[str, object]] = []
         for item in self._payout_sheet_items():
@@ -4868,7 +5097,10 @@ class CardPipelineApp(tk.Tk):
             for person, values in sorted(balances.items(), key=lambda pair: (-float(pair[1]["balance"]), pair[0].lower()))
         ]
         total_balance = sum(float(item["balance"]) for item in summary)
-        return {"ok": True, "people": self._known_people(), "summary": summary, "details": details, "totals": {"balance": round(total_balance, 2), "balance_display": format_money(total_balance), "sheets": sum(int(item["sheets"]) for item in summary), "cards": sum(int(item["cards"]) for item in summary)}}
+        response = {"ok": True, "people": self._known_people(), "summary": summary, "details": details, "totals": {"balance": round(total_balance, 2), "balance_display": format_money(total_balance), "sheets": sum(int(item["sheets"]) for item in summary), "cards": sum(int(item["cards"]) for item in summary)}}
+        self.mobile_payouts_cache = getattr(self, "mobile_payouts_cache", {}) if isinstance(getattr(self, "mobile_payouts_cache", None), dict) else {}
+        self.mobile_payouts_cache[cache_key] = {"created_at": now, "response": copy.deepcopy(response)}
+        return response
 
     def _mobile_image_parts(self, image: str) -> tuple[str, str, bytes]:
         match = re.match(r"^data:([^;]+);base64,(.*)$", image, re.S)
@@ -4879,6 +5111,210 @@ class CardPipelineApp(tk.Tk):
             mime_type = "image/jpeg"
             image_b64 = image
         return mime_type, image_b64, base64.b64decode(image_b64)
+
+    def _mobile_photo_upload_images(self, payload: dict) -> list[dict[str, object]]:
+        images = payload.get("images")
+        if isinstance(images, list):
+            return [item for item in images if isinstance(item, dict)]
+        image = str(payload.get("image") or "").strip()
+        if not image:
+            return []
+        return [{"image": image, "name": payload.get("name") or payload.get("filename") or "mobile-photo.jpg"}]
+
+    def _mobile_photo_upload_owner(self, payload: dict) -> tuple[str, str]:
+        profile = "personal" if self._is_personal_lucas() else "team"
+        person = str(payload.get("assigned_person") or payload.get("person") or "").strip()
+        if profile == "personal" and not person:
+            person = self._personal_default_person()
+        elif profile == "team":
+            person = self._canonical_person_choice(person) or person
+        return profile, person or "Unassigned"
+
+    def _mobile_photo_upload_folder(self, payload: dict) -> Path:
+        profile, person = self._mobile_photo_upload_owner(payload)
+        person_slug = re.sub(r"[^a-z0-9]+", "-", safe_filename(person).strip().lower()).strip("-") or "unassigned"
+        now = datetime.now()
+        return INVENTORY_PHOTOS_DIR / "mobile" / profile / person_slug / now.strftime("%Y") / now.strftime("%m")
+
+    def _mobile_photo_title_match_key(self, title_hint: str, records: list[dict[str, object]]) -> str:
+        token_source = getattr(self, "_match_text_tokens", None)
+        hint_tokens = token_source(title_hint) if callable(token_source) else set(re.findall(r"[a-z0-9]+", title_hint.lower()))
+        if len(hint_tokens) < 2:
+            return ""
+        scored: list[tuple[float, str]] = []
+        hint_compact = re.sub(r"[^a-z0-9]+", "", title_hint.lower())
+        for record in records:
+            key = str(record.get("inventory_key") or "")
+            title = str(record.get("card_title") or record.get("title") or "")
+            if not key or not title:
+                continue
+            title_tokens = token_source(title) if callable(token_source) else set(re.findall(r"[a-z0-9]+", title.lower()))
+            overlap = hint_tokens & title_tokens
+            if len(overlap) < 2:
+                continue
+            title_compact = re.sub(r"[^a-z0-9]+", "", title.lower())
+            ratio = difflib.SequenceMatcher(None, hint_compact, title_compact).ratio()
+            score = len(overlap) + ratio
+            scored.append((score, key))
+        if not scored:
+            return ""
+        scored.sort(reverse=True)
+        best_score, best_key = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        return best_key if best_score >= 3.0 and best_score >= second_score + 0.5 else ""
+
+    def _mobile_photo_upload_match_keys(self, payload: dict) -> set[str]:
+        cert = scan_to_cert(payload.get("cert_number") or payload.get("cert") or "")
+        item_id = str(payload.get("item_id") or "").strip().lower()
+        title_hint = str(payload.get("card_title") or payload.get("title") or payload.get("hint") or "").strip()
+        _profile, owner = self._mobile_photo_upload_owner(payload)
+        owner_lower = owner.strip().lower()
+        rows = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+        active_records = [record for record in rows if str(record.get("status") or "").lower() == "active"]
+        if owner_lower and owner_lower != "unassigned":
+            owner_records = [record for record in active_records if str(record.get("assigned_person") or "").strip().lower() == owner_lower]
+            if owner_records:
+                active_records = owner_records
+        matched: set[str] = set()
+        if cert:
+            for record in active_records:
+                if scan_to_cert(record.get("cert_number")) == cert:
+                    key = str(record.get("inventory_key") or "")
+                    if key:
+                        matched.add(key)
+            return matched
+        if item_id:
+            for record in active_records:
+                if str(record.get("item_id") or "").strip().lower() == item_id:
+                    key = str(record.get("inventory_key") or "")
+                    if key:
+                        matched.add(key)
+            return matched
+        if title_hint:
+            best_key = self._mobile_photo_title_match_key(title_hint, active_records)
+            if best_key:
+                matched.add(best_key)
+        return matched
+
+    def _record_mobile_photo_upload_state(self, photo_paths: list[Path], linked_keys: set[str], status: str) -> None:
+        state = self._load_inventory_photo_state()
+        photos = state.setdefault("photos", {})
+        if not isinstance(photos, dict):
+            photos = {}
+            state["photos"] = photos
+        saved_at = datetime.now().isoformat(timespec="seconds")
+        for path in photo_paths:
+            try:
+                stat = path.stat()
+                sha = self._inventory_photo_file_hash(path)
+                relative = self._inventory_photo_storage_value(path)
+            except Exception:
+                continue
+            photos[sha] = {
+                **(photos.get(sha) if isinstance(photos.get(sha), dict) else {}),
+                "path": str(path),
+                "relative_path": relative,
+                "filename": path.name,
+                "size": stat.st_size,
+                "modified": int(stat.st_mtime),
+                "sha256": sha,
+                "cards": [],
+                "certs": [],
+                "linked_keys": sorted(linked_keys),
+                "status": status,
+                "source": "mobile_upload",
+                "last_seen": saved_at,
+            }
+        self._save_inventory_photo_state(state)
+
+    def _queue_mobile_photo_scan(self, photo_paths: list[Path] | None = None) -> bool:
+        if genai is None or identify_cards_sync is None:
+            return False
+        worker = getattr(self, "inventory_photo_worker", None)
+        if worker and worker.is_alive():
+            return True
+        if hasattr(self, "_load_photo_env"):
+            self._load_photo_env()
+        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        if not api_key:
+            return False
+        try:
+            self.inventory_photo_client = genai.Client(api_key=api_key)
+        except Exception:
+            return False
+        if photo_paths:
+            self._prepared_inventory_photo_scan_paths = sorted([Path(path) for path in photo_paths], key=lambda item: str(item).lower())
+        self.inventory_photo_worker = threading.Thread(target=self._inventory_photo_scan_worker, args=(INVENTORY_PHOTOS_DIR,), daemon=True)
+        self.inventory_photo_worker.start()
+        return True
+
+    def mobile_photo_upload(self, payload: dict) -> dict:
+        upload_items = self._mobile_photo_upload_images(payload)
+        if not upload_items:
+            return {"ok": False, "error": "Take or choose at least one photo."}
+        if len(upload_items) > 12:
+            return {"ok": False, "error": "Upload 12 photos or fewer at a time."}
+        destination_folder = self._mobile_photo_upload_folder(payload)
+        destination_folder.mkdir(parents=True, exist_ok=True)
+        saved_paths: list[Path] = []
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        client_id = re.sub(r"[^A-Za-z0-9_-]+", "-", str(payload.get("client_id") or payload.get("clientId") or "mobile")).strip("-")[:40] or "mobile"
+        for index, item in enumerate(upload_items, start=1):
+            image = str(item.get("image") or "").strip()
+            if not image:
+                continue
+            try:
+                mime_type, _image_b64, image_bytes = self._mobile_image_parts(image)
+            except Exception as error:
+                return {"ok": False, "error": f"Could not read photo {index}: {error}"}
+            if not str(mime_type or "").startswith("image/"):
+                return {"ok": False, "error": f"Photo {index} is not an image."}
+            if len(image_bytes) > 12 * 1024 * 1024:
+                return {"ok": False, "error": f"Photo {index} is too large. Retake it closer or choose a smaller image."}
+            original = str(item.get("name") or item.get("filename") or f"photo-{index}.jpg")
+            safe_stem = safe_filename(Path(original).stem or f"photo-{index}")[:90] or f"photo-{index}"
+            extension = ".png" if "png" in mime_type.lower() else ".webp" if "webp" in mime_type.lower() else ".jpg"
+            path = destination_folder / f"[{timestamp}]-Mobile-{client_id}-[{index}]-[{safe_stem}]{extension}"
+            suffix = 1
+            while path.exists():
+                suffix += 1
+                path = destination_folder / f"[{timestamp}]-Mobile-{client_id}-[{index}-{suffix}]-[{safe_stem}]{extension}"
+            temp_path = path.with_name(f".{path.name}.tmp")
+            try:
+                temp_path.write_bytes(image_bytes)
+                temp_path.replace(path)
+            except OSError as error:
+                return {"ok": False, "error": f"Could not save photo {index}: {error}"}
+            saved_paths.append(path)
+        if not saved_paths:
+            return {"ok": False, "error": "No usable photos were uploaded."}
+        matched_keys = self._mobile_photo_upload_match_keys(payload)
+        linked = 0
+        if matched_keys:
+            for path in saved_paths:
+                linked += self._link_inventory_photo_to_keys(matched_keys, path)
+            self._record_mobile_photo_upload_state(saved_paths, matched_keys, "linked" if linked else "saved")
+        else:
+            self._record_mobile_photo_upload_state(saved_paths, set(), "pending_scan")
+        scan_started = False if matched_keys else self._queue_mobile_photo_scan(saved_paths)
+        if linked:
+            self.events.put(("inventory_refresh", {"enrich": False}))
+        status = "linked" if linked else "saved"
+        message = (
+            f"Uploaded {len(saved_paths)} photo(s) and linked them to inventory."
+            if linked
+            else f"Uploaded {len(saved_paths)} photo(s). Photo matching {'started' if scan_started else 'will run when photo OCR is available'}."
+        )
+        return {
+            "ok": True,
+            "saved": len(saved_paths),
+            "linked": linked,
+            "status": status,
+            "scan_started": scan_started,
+            "folder": str(destination_folder),
+            "files": [path.name for path in saved_paths],
+            "message": message,
+        }
 
     def _parse_mobile_quick_card_response(self, raw: str) -> dict:
         text = str(raw or "").strip()
@@ -5023,6 +5459,7 @@ class CardPipelineApp(tk.Tk):
             return path.read_bytes(), content_type
         except OSError:
             return None
+
 
     def _desktop_trade_payload(
         self,
@@ -5460,7 +5897,12 @@ class CardPipelineApp(tk.Tk):
             vars_by_field[field] = var
             ttk.Label(frame, text=label, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 8))
             width = 46 if field == "card_title" else 24
-            ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+            if field == "assigned_person":
+                person_combo = ttk.Combobox(frame, textvariable=var, values=self._known_people(), width=width, state="readonly")
+                person_combo.configure(postcommand=lambda widget=person_combo: widget.configure(values=self._known_people()))
+                person_combo.grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+            else:
+                ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
         status_var = tk.StringVar(value="Status changes use Mark Sold, Move, or Delete.")
         status_row = 2 + (len(fields) + 1) // 2
         ttk.Label(frame, textvariable=status_var, style="Muted.TLabel").grid(row=status_row, column=0, columnspan=4, sticky="w", pady=(4, 14))
@@ -5471,6 +5913,13 @@ class CardPipelineApp(tk.Tk):
                 raw = vars_by_field[field].get().strip()
                 if field in {"item_type", "item_id"}:
                     updates[field] = normalized.get(field) or raw
+                    continue
+                if field == "assigned_person":
+                    person = self._canonical_person_choice(raw)
+                    if not person:
+                        status_var.set("Choose an available person.")
+                        return
+                    updates[field] = person
                     continue
                 if field in money_fields:
                     if not raw:
@@ -5656,6 +6105,8 @@ class CardPipelineApp(tk.Tk):
             self._set_inventory_bulk_cell(row_id, column)
 
     def _begin_inventory_cell_edit_from_click(self, event: tk.Event) -> str | None:
+        if self.inventory_cell_editor is not None and self.inventory_cell_edit is not None:
+            self._commit_inventory_bulk_edit(0, 0, reopen=False)
         column_id = self.inventory_tree.identify_column(event.x)
         row_id = self.inventory_tree.identify_row(event.y)
         if not row_id or not column_id:
@@ -5726,9 +6177,17 @@ class CardPipelineApp(tk.Tk):
             return "break"
         self._destroy_inventory_cell_editor()
         x, y, width, height = bbox
-        editor = ttk.Entry(self.inventory_tree)
-        editor.insert(0, self.inventory_tree.set(iid, column))
-        editor.select_range(0, tk.END)
+        current_value = self.inventory_tree.set(iid, column)
+        if column == "person":
+            people = self._known_people()
+            editor = ttk.Combobox(self.inventory_tree, values=people, state="readonly")
+            editor.set(current_value if current_value in people else "")
+            editor.configure(postcommand=lambda widget=editor: widget.configure(values=self._known_people()))
+            editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_inventory_bulk_edit(0, 0, reopen=False), add="+")
+        else:
+            editor = ttk.Entry(self.inventory_tree)
+            editor.insert(0, current_value)
+            editor.select_range(0, tk.END)
         editor.place(x=x, y=y, width=width, height=height)
         editor.focus_set()
         self.inventory_cell_editor = editor
@@ -5791,6 +6250,12 @@ class CardPipelineApp(tk.Tk):
         field = INVENTORY_EDIT_COLUMN_FIELDS.get(column)
         if not field:
             return {}
+        if column == "person":
+            person = self._canonical_person_choice(raw)
+            if not person:
+                self.inventory_status_var.set("Choose an available person.")
+                return None
+            return {field: person}
         if column in INVENTORY_EDIT_MONEY_COLUMNS:
             if not raw:
                 return {field: None}
@@ -5802,6 +6267,7 @@ class CardPipelineApp(tk.Tk):
         return {field: raw}
 
     def _refresh_inventory_tree_row(self, iid: str, record: dict[str, object]) -> None:
+        delta = self._format_inventory_cl_comp_delta(record)
         values = {
             "date": record.get("date_added") or "",
             "type": record.get("item_type") or "",
@@ -5822,6 +6288,7 @@ class CardPipelineApp(tk.Tk):
             "status": record.get("status") or "",
             "photos": str(len(record.get("photo_paths") or [])),
             "notes": inventory_display_notes(record),
+            "delta": delta,
         }
         for column, value in values.items():
             if column in self.inventory_tree["columns"]:
@@ -6352,6 +6819,13 @@ class CardPipelineApp(tk.Tk):
             self.inventory_tree.focus(row_id)
         records = [self.inventory_tree_records.get(iid) for iid in self.inventory_tree.selection()]
         active_records = [record for record in records if record and str(record.get("status") or "").lower() == "active"]
+        clicked_record = self.inventory_tree_records.get(row_id)
+
+        def run_for_clicked_row(command) -> None:
+            self.inventory_tree.selection_set(row_id)
+            self.inventory_tree.focus(row_id)
+            command()
+
         menu = tk.Menu(self, tearoff=False, bg="#1f1f1f", fg="#ffffff", activebackground="#1ed760", activeforeground="#000000")
         menu.add_command(label="Copy Cell", command=lambda row=row_id, column=column_id: self.copy_inventory_cell_value(row, column))
         menu.add_command(label="Copy Row", command=lambda row=row_id: self.copy_inventory_row_values(row))
@@ -6361,11 +6835,14 @@ class CardPipelineApp(tk.Tk):
             menu.add_command(label="Explain Assignment", command=self.explain_selected_inventory_assignment)
         if len(active_records) == 1 and len(records) == 1:
             menu.add_command(label="Attach Photo...", command=self.attach_photo_to_selected_inventory_row)
-        if len(records) == 1 and self._inventory_photo_paths_for_record(records[0]):
+        if self._inventory_photo_paths_for_record(clicked_record):
             menu.add_separator()
-            menu.add_command(label="Open Photo", command=self.open_selected_inventory_photo)
-            menu.add_command(label="Export Copy to Desktop", command=self.export_selected_inventory_photos_to_desktop)
-            menu.add_command(label="Open Photo Folder", command=self.open_selected_inventory_photo_folder)
+
+            menu.add_command(label="Open Photo", command=lambda: run_for_clicked_row(self.open_selected_inventory_photo))
+            menu.add_command(label="Export Copy to Desktop", command=lambda: run_for_clicked_row(self.export_selected_inventory_photos_to_desktop))
+            menu.add_command(label="Open Photo Folder", command=lambda: run_for_clicked_row(self.open_selected_inventory_photo_folder))
+            menu.add_command(label="Detach Photo...", command=lambda: run_for_clicked_row(self.detach_photo_from_selected_inventory_row))
+
         if len(active_records) == 1 and len(records) == 1:
             menu.add_command(label="Mark Sold", command=self.mark_selected_inventory_sold)
         if records and all(self._inventory_record_can_move_to_company_sheet(record) for record in records):
@@ -6511,6 +6988,95 @@ class CardPipelineApp(tk.Tk):
         shutil.copy2(source_path, destination)
         return destination
 
+    def _choose_unattached_inventory_photos(self, max_count: int = MAX_INVENTORY_PHOTOS_PER_CARD) -> list[Path]:
+        available = self._inventory_unattached_photo_paths()
+        if not available:
+            messagebox.showinfo("No unattached photos", "No unattached inventory photos are available. Add photos to the Inventory Photo Folder, then scan or try again.")
+            return []
+        popup = tk.Toplevel(self)
+        popup.title("Attach Unattached Inventory Photos")
+        popup.configure(bg="#121212")
+        popup.geometry("860x500")
+        popup.transient(self)
+        popup.grab_set()
+        frame = ttk.Frame(popup, style="Panel.TFrame", padding=(16, 14))
+        frame.pack(fill=tk.BOTH, expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        title = "Unattached Photos" if max_count >= MAX_INVENTORY_PHOTOS_PER_CARD else f"Unattached Photos ({max_count} slot(s) left)"
+        ttk.Label(frame, text=title, style="Section.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        search_var = tk.StringVar()
+        search = ttk.Entry(frame, textvariable=search_var)
+        search.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        columns = ("filename", "folder", "modified")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="extended")
+        tree.grid(row=2, column=0, sticky="nsew")
+        y_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        y_scroll.grid(row=2, column=1, sticky="ns")
+        tree.configure(yscrollcommand=y_scroll.set)
+        headings = {"filename": "File", "folder": "Folder", "modified": "Modified"}
+        widths = {"filename": 320, "folder": 380, "modified": 140}
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="w", stretch=column != "modified")
+        path_by_iid: dict[str, Path] = {}
+        selected_paths: list[Path] = []
+
+        def row_text(path: Path) -> str:
+            return f"{path.name} {path.parent}".lower()
+
+        searchable = [(path, row_text(path)) for path in available]
+
+        def render() -> None:
+            query = search_var.get().strip().lower()
+            tree.delete(*tree.get_children())
+            path_by_iid.clear()
+            for index, (path, text) in enumerate(searchable):
+                if query and query not in text:
+                    continue
+                try:
+                    modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %I:%M %p")
+                except Exception:
+                    modified = ""
+                iid = f"photo-{index}"
+                path_by_iid[iid] = path
+                tree.insert("", tk.END, iid=iid, values=(path.name, str(path.parent), modified))
+
+        def attach() -> None:
+            selected_paths[:] = [path_by_iid[iid] for iid in tree.selection() if iid in path_by_iid]
+            if not selected_paths:
+                messagebox.showinfo("Choose photo", "Select one or more unattached photos to attach.")
+                return
+            if len(selected_paths) > max_count:
+                messagebox.showinfo("Too many photos", f"Select up to {max_count} photo(s) for this card.")
+                return
+            popup.destroy()
+
+        def close() -> None:
+            selected_paths.clear()
+            popup.destroy()
+
+        search_var.trace_add("write", lambda *_: render())
+        buttons = ttk.Frame(frame, style="Panel.TFrame")
+        buttons.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        buttons.columnconfigure(0, weight=1)
+        ttk.Button(buttons, text="Cancel", command=close, style="Soft.TButton").grid(row=0, column=1, padx=(0, 8))
+        ttk.Button(buttons, text="Attach Selected", command=attach, style="Primary.TButton").grid(row=0, column=2)
+        tree.bind("<Double-1>", lambda _event: attach())
+        popup.protocol("WM_DELETE_WINDOW", close)
+        render()
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0])
+            tree.focus(first[0])
+        search.focus_set()
+        popup.update_idletasks()
+        x = self.winfo_rootx() + max(50, (self.winfo_width() - popup.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(50, (self.winfo_height() - popup.winfo_height()) // 2)
+        popup.geometry(f"+{x}+{y}")
+        self.wait_window(popup)
+        return selected_paths
+
     def attach_photo_to_selected_inventory_row(self) -> None:
         if not hasattr(self, "inventory_tree"):
             return
@@ -6521,13 +7087,12 @@ class CardPipelineApp(tk.Tk):
             messagebox.showinfo("Choose one card", "Select one active inventory row to attach photo(s).")
             return
         iid, record = active_selected[0]
-        paths = filedialog.askopenfilenames(
-            title="Attach Inventory Photo",
-            filetypes=[
-                ("Image files", "*.jpg *.jpeg *.png *.webp *.heic *.heif"),
-                ("All files", "*.*"),
-            ],
-        )
+        existing_paths = [str(value or "").strip() for value in (record.get("photo_paths") or []) if str(value or "").strip()]
+        remaining_slots = MAX_INVENTORY_PHOTOS_PER_CARD - len(existing_paths)
+        if remaining_slots <= 0:
+            messagebox.showinfo("Photo limit reached", f"This inventory row already has {MAX_INVENTORY_PHOTOS_PER_CARD} photo(s). Detach one before adding another.")
+            return
+        paths = self._choose_unattached_inventory_photos(max_count=remaining_slots)
         if not paths:
             return
         copied_paths: list[Path] = []
@@ -6540,10 +7105,11 @@ class CardPipelineApp(tk.Tk):
         if not copied_paths:
             self._show_copyable_error("Attach photo failed", "\n".join(errors) or "No photo files were attached.")
             return
-        existing_paths = list(record.get("photo_paths") or [])
         existing_set = set(existing_paths)
         added = 0
         for copied_path in copied_paths:
+            if len(existing_paths) >= MAX_INVENTORY_PHOTOS_PER_CARD:
+                break
             path_text = self._inventory_photo_storage_value(copied_path)
             if path_text not in existing_set:
                 existing_paths.append(path_text)
@@ -6652,6 +7218,7 @@ class CardPipelineApp(tk.Tk):
             card_ladder = self._money_value(record.get("card_ladder_value"))
             comps = self._money_value(record.get("card_ladder_comps_average"))
             cy_value = self._money_value(record.get("cy_value"))
+            delta = self._format_inventory_cl_comp_delta(record)
             if purchase is not None:
                 total_purchase += purchase
             if value is not None:
@@ -6677,6 +7244,7 @@ class CardPipelineApp(tk.Tk):
                 "status": record.get("status") or "",
                 "photos": str(len(record.get("photo_paths") or [])),
                 "notes": inventory_display_notes(record),
+                "delta": delta,
             }
             tree_columns = self.inventory_tree["columns"] if hasattr(self.inventory_tree, "__getitem__") else INVENTORY_TABLE_COLUMNS
             iid = self.inventory_tree.insert(
@@ -6734,7 +7302,7 @@ class CardPipelineApp(tk.Tk):
         cl_comps_var = tk.BooleanVar(value=True)
         cy_available = cy_lookup_enabled()
         cy_var = tk.BooleanVar(value=cy_available)
-        strategy_var = tk.StringVar(value=self.comp_strategy_label.get() or "Average last 5")
+        strategy_var = tk.StringVar(value=self.comp_strategy_label.get() or "Date weighted")
         scope_var = tk.StringVar(value=COMP_SCOPE_EMPTY)
 
         popup = tk.Toplevel(self)
@@ -6837,7 +7405,7 @@ class CardPipelineApp(tk.Tk):
             "total": len(temp_rows),
             "changed": 0,
         }
-        strategy_label = str(features.get("strategy_label") or self.comp_strategy_label.get() or "Average last 5")
+        strategy_label = str(features.get("strategy_label") or self.comp_strategy_label.get() or "Date weighted")
         self.comp_strategy_label.set(strategy_label)
         self.state.set_comp_strategy(COMP_STRATEGY_DISPLAY.get(strategy_label, COMP_STRATEGY_AVERAGE), self._comp_low_outlier_pct())
         self.state.set_rows(temp_rows)
@@ -7095,6 +7663,17 @@ class CardPipelineApp(tk.Tk):
         value = self._money_value(raw_value)
         return value is None or value <= 0
 
+    def _inventory_cl_comp_delta(self, record: dict[str, object]) -> float | None:
+        card_ladder = self._money_value(record.get("card_ladder_value"))
+        comps = self._money_value(record.get("card_ladder_comps_average"))
+        if card_ladder is None or comps is None or comps <= 0:
+            return None
+        return round(((card_ladder - comps) / comps) * 100, 2)
+
+    def _format_inventory_cl_comp_delta(self, record: dict[str, object]) -> str:
+        delta = self._inventory_cl_comp_delta(record)
+        return "" if delta is None else f"{delta:.2f}%"
+
     def _inventory_sport_filter_values(self) -> set[str]:
         if not hasattr(self, "inventory_sport_var"):
             return set()
@@ -7132,9 +7711,10 @@ class CardPipelineApp(tk.Tk):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Inventory"
-        headers = ["Date Added", "Type", "Item ID", "Person", "Sport", "Certification Number", "Grader", "Card Description", "Purchase Price", "Paid With", "Card Ladder", "Comps", "CY Estimate", "CY Confidence", "Best Company", "Estimated Payout", "Source Sheet", "Source", "Status", "Photos", "Photo Paths", "Notes"]
+        headers = ["Date Added", "Type", "Item ID", "Person", "Sport", "Certification Number", "Grader", "Card Description", "Purchase Price", "Paid With", "Card Ladder", "Comps", "CY Estimate", "CY Confidence", "Best Company", "Estimated Payout", "Source Sheet", "Source", "Status", "Photos", "Photo Paths", "Notes", "Delta %"]
         sheet.append(headers)
         for record in rows:
+            delta = self._inventory_cl_comp_delta(record)
             sheet.append([
                 record.get("date_added") or "",
                 record.get("item_type") or "",
@@ -7158,10 +7738,15 @@ class CardPipelineApp(tk.Tk):
                 len(record.get("photo_paths") or []),
                 "; ".join(str(path) for path in (record.get("photo_paths") or [])),
                 inventory_display_notes(record),
+                None if delta is None else delta / 100,
             ])
+        delta_column = sheet.max_column
+        for column_cells in sheet.iter_cols(min_col=delta_column, max_col=delta_column, min_row=2, max_row=sheet.max_row):
+            for value_cell in column_cells:
+                value_cell.number_format = "0.00%"
         sheet.auto_filter.ref = sheet.dimensions
         sheet.freeze_panes = "A2"
-        for index, width in enumerate([14, 12, 22, 18, 14, 22, 12, 60, 16, 18, 16, 16, 16, 14, 20, 16, 28, 24, 14, 10, 45, 36], start=1):
+        for index, width in enumerate([14, 12, 22, 18, 14, 22, 12, 60, 16, 18, 16, 16, 16, 14, 20, 16, 28, 24, 14, 10, 45, 36, 16], start=1):
             sheet.column_dimensions[sheet.cell(1, index).column_letter].width = width
         workbook.save(path)
         self.status_var.set(f"Exported inventory: {path}")
@@ -7366,6 +7951,12 @@ class CardPipelineApp(tk.Tk):
 
     def _filtered_profit_records(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
         needle = self.profit_person_var.get().strip().lower() if hasattr(self, "profit_person_var") else ""
+        if needle == "my profit" and not self._is_personal_lucas():
+            needle = ""
+        if needle and not self._is_personal_lucas():
+            allowed_people = [person.lower() for person in self._profit_filter_people(self._known_people())]
+            if allowed_people and not any(needle in person for person in allowed_people):
+                return []
         search = self.profit_search_var.get().strip().lower() if hasattr(self, "profit_search_var") else ""
         period = self.profit_period_var.get().strip() if hasattr(self, "profit_period_var") else "Total"
         period_start, period_end = self._profit_period_bounds(period)
@@ -7386,6 +7977,22 @@ class CardPipelineApp(tk.Tk):
                     continue
             filtered.append(record)
         return filtered
+
+    def _profit_rows_for_owner_view(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        if self._is_personal_lucas() or self._profit_owner_view_label() != "My Profit":
+            return rows
+        seller_names = self._seller_terms_seller_names()
+        adjusted: list[dict[str, object]] = []
+        for record in rows:
+            normalized = dict(record)
+            profit = self._money_value(normalized.get("profit"))
+            person = str(normalized.get("assigned_person") or "").strip()
+            source_sheet = str(normalized.get("source_sheet") or "").strip()
+            if profit is not None and person and person.lower() != "unassigned" and not self._source_sheet_is_seller_payout(source_sheet, person, seller_names):
+                share = self._team_balance_share_for_person(person)
+                normalized["profit"] = round(float(profit) * (1.0 - share), 2)
+            adjusted.append(normalized)
+        return adjusted
 
     def _profit_record_date(self, value: object):
         text = str(value or "").strip()
@@ -7439,6 +8046,16 @@ class CardPipelineApp(tk.Tk):
         breakdown = self.profit_breakdown_var.get().strip() if hasattr(self, "profit_breakdown_var") else DEFAULT_PROFIT_BREAKDOWN
         return breakdown if breakdown in PROFIT_BREAKDOWN_OPTIONS else DEFAULT_PROFIT_BREAKDOWN
 
+    def _profit_owner_view_label(self) -> str:
+        person = self.profit_person_var.get().strip().lower() if hasattr(self, "profit_person_var") else ""
+        if not self._is_personal_lucas() and person == "my profit":
+            return "My Profit"
+        return DEFAULT_PROFIT_OWNER_VIEW
+
+    def _payout_summary_view_label(self) -> str:
+        view = self.payout_summary_view_var.get().strip() if hasattr(self, "payout_summary_view_var") else DEFAULT_PAYOUT_SUMMARY_VIEW
+        return view if view in PAYOUT_SUMMARY_VIEW_OPTIONS else DEFAULT_PAYOUT_SUMMARY_VIEW
+
     def _profit_monthly_breakdown(self) -> bool:
         return self._profit_breakdown_label() == "Month" and self._profit_period_label() in {"Year", "YTD", "Total"}
 
@@ -7447,7 +8064,10 @@ class CardPipelineApp(tk.Tk):
         plot_suffix = " by Sport" if plot_label == "By Sport" and self._profit_graph_label() != "Profit by Company" else ""
         period = self._profit_period_label()
         breakdown_suffix = f" by {self._profit_breakdown_label()}" if period in {"Year", "YTD", "Total"} else ""
-        return f"{self._profit_graph_label()}{plot_suffix} ({period}{breakdown_suffix})"
+        is_personal = bool(getattr(self, "_is_personal_lucas", lambda: False)())
+        owner_view = self._profit_owner_view_label() if hasattr(self, "_profit_owner_view_label") else DEFAULT_PROFIT_OWNER_VIEW
+        owner_prefix = "My " if not is_personal and owner_view == "My Profit" else ""
+        return f"{owner_prefix}{self._profit_graph_label()}{plot_suffix} ({period}{breakdown_suffix})"
 
     def _profit_sport_label(self, record: dict[str, object]) -> str:
         def display_sport(value: str) -> str:
@@ -8110,9 +8730,9 @@ class CardPipelineApp(tk.Tk):
                 continue
             ttk.Label(frame, text=label, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 8))
             if field == "assigned_person":
-                person_combo = ttk.Combobox(frame, textvariable=var, width=24)
+                person_combo = ttk.Combobox(frame, textvariable=var, values=self._known_people(), width=24, state="readonly")
+                person_combo.configure(postcommand=lambda widget=person_combo: widget.configure(values=self._known_people()))
                 person_combo.grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
-                self._bind_person_autocomplete(person_combo)
             elif field == "expense_type":
                 ttk.Combobox(frame, textvariable=var, values=EXPENSE_CATEGORY_OPTIONS, width=22, state="readonly").grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
             elif field == "related_type":
@@ -8184,6 +8804,238 @@ class CardPipelineApp(tk.Tk):
         popup.geometry(f"+{x}+{y}")
         self.wait_window(popup)
         return result or None
+
+    def _sold_profit_edit_row_dialog(self, record: dict[str, object]) -> dict[str, object] | None:
+        normalized = self._normalize_profit_record(record)
+        if str(normalized.get("record_type") or "").strip().lower() == "expense":
+            return None
+        personal_inventory = self._is_personal_lucas()
+        fields = [
+            ("date_added", "Sold Date"),
+            ("assigned_person", "Person"),
+            ("company", "Company"),
+            ("card_title", "Card"),
+            ("cert_number", "Cert"),
+            ("item_id", "Item ID"),
+            ("purchase_price", "Purchase"),
+            ("sale_price", "Sale Price"),
+            ("source_sheet", "Source Sheet"),
+            ("weekly_sheet_name", "Sold Sheet"),
+            ("notes", "Notes"),
+        ]
+        popup = tk.Toplevel(self)
+        popup.title("Edit Sold Item")
+        popup.geometry("820x500")
+        popup.minsize(680, 390)
+        popup.transient(self)
+        popup.grab_set()
+        popup.configure(bg="#121212")
+        result: dict[str, object] = {}
+        vars_by_field: dict[str, tk.StringVar] = {}
+
+        frame = self._scrollable_popup_frame(popup, style_name="Panel.TFrame", bg="#121212", padding=(18, 16))
+        ttk.Label(frame, text="Edit Sold Item", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 2))
+        ttk.Label(frame, text=str(normalized.get("ledger_added_at") or normalized.get("ledger_key") or "Profit sold-card row"), style="Muted.TLabel").grid(row=1, column=0, columnspan=4, sticky="w", pady=(0, 14))
+        for index, (field, label) in enumerate(fields):
+            row = 2 + index // 2
+            col = 0 if index % 2 == 0 else 2
+            value = normalized.get(field)
+            text = "" if value is None else f"{value:.2f}" if field in {"purchase_price", "sale_price"} and isinstance(value, (int, float)) else str(value)
+            var = tk.StringVar(value=text)
+            vars_by_field[field] = var
+            if personal_inventory and field == "assigned_person":
+                continue
+            ttk.Label(frame, text=label, style="Panel.TLabel").grid(row=row, column=col, sticky="w", padx=(0, 8), pady=(0, 8))
+            if field == "assigned_person":
+                person_combo = ttk.Combobox(frame, textvariable=var, width=24)
+                person_combo.grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+                self._bind_person_autocomplete(person_combo)
+            else:
+                width = 54 if field in {"card_title", "source_sheet", "weekly_sheet_name", "notes"} else 24
+                ttk.Entry(frame, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="ew", padx=(0, 14), pady=(0, 8))
+
+        status_var = tk.StringVar(value="Edits update this sold-card row in the profit ledger.")
+        status_row = 2 + (len(fields) + 1) // 2
+        ttk.Label(frame, textvariable=status_var, style="Muted.TLabel").grid(row=status_row, column=0, columnspan=4, sticky="w", pady=(4, 14))
+
+        def submit() -> None:
+            person = vars_by_field["assigned_person"].get().strip()
+            if personal_inventory:
+                person = self._personal_default_person()
+            person_choice = self._canonical_person_choice(person)
+            if person_choice is None:
+                status_var.set("Choose an existing person.")
+                return
+            sold_date = vars_by_field["date_added"].get().strip()
+            if self._profit_record_date(sold_date) is None:
+                status_var.set("Enter the sold date as YYYY-MM-DD.")
+                return
+            purchase = self._money_value(vars_by_field["purchase_price"].get())
+            sale = self._money_value(vars_by_field["sale_price"].get())
+            if purchase is None or purchase < 0:
+                status_var.set("Enter a purchase amount of 0 or more.")
+                return
+            if sale is None or sale < 0:
+                status_var.set("Enter a sale price of 0 or more.")
+                return
+            card_title = vars_by_field["card_title"].get().strip()
+            if not card_title:
+                status_var.set("Enter the card title.")
+                return
+            cert_number = vars_by_field["cert_number"].get().strip()
+            item_id = vars_by_field["item_id"].get().strip()
+            if not (cert_number or item_id):
+                status_var.set("Enter either a cert number or item ID.")
+                return
+            result.update(
+                {
+                    "date_added": sold_date[:10],
+                    "assigned_person": person_choice,
+                    "company": vars_by_field["company"].get().strip(),
+                    "card_title": card_title,
+                    "cert_number": cert_number,
+                    "item_id": item_id,
+                    "purchase_price": float(purchase),
+                    "sale_price": float(sale),
+                    "source_sheet": vars_by_field["source_sheet"].get().strip(),
+                    "weekly_sheet_name": vars_by_field["weekly_sheet_name"].get().strip(),
+                    "notes": vars_by_field["notes"].get().strip(),
+                }
+            )
+            popup.destroy()
+
+        buttons = ttk.Frame(frame, style="Panel.TFrame")
+        buttons.grid(row=status_row + 1, column=0, columnspan=4, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=popup.destroy, style="Soft.TButton").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="Save Changes", command=submit, style="Primary.TButton").pack(side=tk.LEFT)
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+        popup.bind("<Return>", lambda _event: submit())
+        popup.bind("<Escape>", lambda _event: popup.destroy())
+        popup.update_idletasks()
+        x = self.winfo_rootx() + max(80, (self.winfo_width() - popup.winfo_width()) // 2)
+        y = self.winfo_rooty() + max(80, (self.winfo_height() - popup.winfo_height()) // 2)
+        popup.geometry(f"+{x}+{y}")
+        self.wait_window(popup)
+        return result or None
+
+    def _migrate_sold_card_payout_marker(
+        self,
+        original_record: dict[str, object],
+        updated_record: dict[str, object],
+        previous_ledger_keys: set[str],
+    ) -> None:
+        markers = getattr(self, "home_sheet_markers", None)
+        if not isinstance(markers, dict):
+            return
+        new_person = str(updated_record.get("assigned_person") or "").strip()
+        if not new_person:
+            return
+        new_key = self._sold_card_payout_key(new_person, updated_record)
+        old_people = {
+            str(original_record.get("assigned_person") or "").strip(),
+            str(updated_record.get("assigned_person") or "").strip(),
+        }
+        old_people.discard("")
+        old_ledger_keys = {
+            str(key).strip()
+            for key in previous_ledger_keys
+            if str(key).strip()
+        }
+        original_key = str(original_record.get("ledger_key") or self._profit_record_key(original_record) or "").strip()
+        if original_key:
+            old_ledger_keys.add(original_key)
+        if not old_people or not old_ledger_keys:
+            return
+        marker_changed = False
+        for old_person in sorted(old_people):
+            for old_ledger_key in sorted(old_ledger_keys):
+                old_key = self._home_sheet_key("SoldCard", f"{old_person}|{old_ledger_key}")
+                if old_key == new_key or old_key not in markers:
+                    continue
+                marker = dict(markers.get(old_key) or {})
+                marker.setdefault("assigned_person", new_person)
+                if new_key not in markers:
+                    markers[new_key] = marker
+                markers.pop(old_key, None)
+                marker_changed = True
+        if marker_changed and hasattr(self, "_save_sheet_markers"):
+            self._save_sheet_markers()
+
+    def _update_profit_sold_record(self, original_record: dict[str, object], updates: dict[str, object]) -> dict[str, object] | None:
+        original = self._normalize_profit_record(original_record)
+        if str(original.get("record_type") or "").strip().lower() == "expense":
+            return None
+        original_key = str(original.get("ledger_key") or self._profit_record_key(original) or "").strip().lower()
+        original_previous_keys = {
+            str(key).strip().lower()
+            for key in (original.get("previous_ledger_keys") or [])
+            if str(key).strip()
+        }
+        if original_key:
+            original_previous_keys.add(original_key)
+        with shared_lock(CARD_PIPELINE_DIR, "profit-sold-edit", self.lucas_identity):
+            ledger = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
+            for index, record in enumerate(ledger):
+                if str(record.get("record_type") or "").strip().lower() == "expense":
+                    continue
+                record_key = str(record.get("ledger_key") or self._profit_record_key(record) or "").strip().lower()
+                record_previous_keys = {
+                    str(key).strip().lower()
+                    for key in (record.get("previous_ledger_keys") or [])
+                    if str(key).strip()
+                }
+                searchable_record_keys = set(record_previous_keys)
+                if record_key:
+                    searchable_record_keys.add(record_key)
+                key_matches = bool(original_key and original_key in searchable_record_keys)
+                previous_key_matches = bool(original_previous_keys and searchable_record_keys & original_previous_keys)
+                if not (key_matches or previous_key_matches):
+                    continue
+                merged = dict(record)
+                merged.update(updates)
+                merged.pop("record_type", None)
+                merged["ledger_added_at"] = str(record.get("ledger_added_at") or original.get("ledger_added_at") or "").strip()
+                if not merged["ledger_added_at"]:
+                    merged["ledger_added_at"] = datetime.now().isoformat(timespec="microseconds")
+                previous_keys = set(searchable_record_keys) | original_previous_keys
+                if original_key:
+                    previous_keys.add(original_key)
+                merged["previous_ledger_keys"] = sorted(previous_keys)
+                merged["recorded_by"] = self.lucas_identity.get("display_name", "")
+                merged["recorded_machine"] = self.lucas_identity.get("machine", "")
+                normalized = self._normalize_profit_record(merged)
+                ledger[index] = normalized
+                self._save_profit_ledger(ledger)
+                self._migrate_sold_card_payout_marker(record, normalized, previous_keys)
+                return normalized
+        return None
+
+    def edit_selected_profit_sold_item(self) -> None:
+        if not hasattr(self, "profit_tree"):
+            return
+        selected = list(self.profit_tree.selection())
+        records = [self.profit_tree_records.get(iid) for iid in selected if self.profit_tree_records.get(iid)]
+        if len(records) != 1:
+            messagebox.showinfo("Choose one sold item", "Select one sold-card row to edit.")
+            return
+        record = self._normalize_profit_record(records[0])
+        if str(record.get("record_type") or "").strip().lower() == "expense":
+            messagebox.showinfo("Sold item required", "Use Edit Expense for expense rows.")
+            return
+        updates = self._sold_profit_edit_row_dialog(record)
+        if not updates:
+            return
+        updated = self._update_profit_sold_record(record, updates)
+        self.refresh_profit_tab()
+        if hasattr(self, "refresh_payouts_tab"):
+            self.refresh_payouts_tab()
+        if updated:
+            sale = self._money_value(updated.get("sale_price")) or 0.0
+            self.status_var.set(f"Edited sold item: {updated.get('card_title') or 'sold card'} for {format_money(sale)}.")
+            self._append_activity("Sold Item Edit", f"Edited sold item: {updated.get('card_title') or 'sold card'} for {format_money(sale)}.", {"ledger_key": updated.get("ledger_key"), "sale_price": sale})
+        else:
+            messagebox.showinfo("Sold item not found", "That sold-card row could not be found in the profit ledger.")
 
     def _update_profit_expense_record(self, original_record: dict[str, object], updates: dict[str, object]) -> dict[str, object] | None:
         original = self._normalize_profit_record(original_record)
@@ -8388,6 +9240,8 @@ class CardPipelineApp(tk.Tk):
         sold_cards = [record for record in records if str(record.get("record_type") or "").strip().lower() != "expense"]
         menu = tk.Menu(self, tearoff=0)
         if sold_cards and len(sold_cards) == len(records):
+            if len(sold_cards) == 1:
+                menu.add_command(label="Edit Sold Item", command=self.edit_selected_profit_sold_item)
             menu.add_command(label="Refund to Inventory", command=self.refund_selected_profit_to_inventory)
         if expenses and len(expenses) == len(records):
             if len(expenses) == 1:
@@ -8518,12 +9372,13 @@ class CardPipelineApp(tk.Tk):
             ),
             reverse=True,
         )
-        self.filtered_profit_rows = self._filtered_profit_records(self.profit_rows)
+        display_profit_rows = self._profit_rows_for_owner_view(self.profit_rows)
+        self.filtered_profit_rows = self._filtered_profit_records(display_profit_rows)
         if not hasattr(self, "profit_tree"):
             record_performance_event(
                 "profit.refresh",
                 perf_start,
-                f"rows={len(self.profit_rows)} filtered={len(self.filtered_profit_rows)} backfilled={backfilled} tree=missing",
+                f"rows={len(display_profit_rows)} filtered={len(self.filtered_profit_rows)} backfilled={backfilled} tree=missing",
             )
             return
         self._refresh_person_combo_values()
@@ -8672,7 +9527,8 @@ class CardPipelineApp(tk.Tk):
         if pruned_duplicates:
             cleanup_parts.append(f"removed {pruned_duplicates} duplicate row(s)")
         cleanup_suffix = f" | {'; '.join(cleanup_parts)}" if cleanup_parts else ""
-        self.profit_status_var.set(f"Loaded {display_count}/{len(self.profit_rows)} profit row(s) from {PROFIT_LEDGER_PATH.name}{filter_suffix}{search_suffix}{period_suffix}{suffix}{backfill_suffix}{sync_suffix}{cleanup_suffix}.")
+        owner_view_suffix = " | Person: My Profit" if self._profit_owner_view_label() == "My Profit" and not self._is_personal_lucas() else ""
+        self.profit_status_var.set(f"Loaded {display_count}/{len(display_profit_rows)} profit row(s) from {PROFIT_LEDGER_PATH.name}{filter_suffix}{search_suffix}{period_suffix}{owner_view_suffix}{suffix}{backfill_suffix}{sync_suffix}{cleanup_suffix}.")
         self._draw_profit_chart()
         record_performance_event(
             "profit.refresh",
@@ -9008,6 +9864,10 @@ class CardPipelineApp(tk.Tk):
         self.refresh_inventory_tab()
         self.refresh_profit_tab()
 
+    def _on_home_sheet_search_changed(self) -> None:
+        self._refresh_home_sheet_list()
+        self._refresh_home_metrics()
+
     def _home_person_filter(self) -> str:
         return self.home_person_var.get().strip().lower() if hasattr(self, "home_person_var") else ""
 
@@ -9019,11 +9879,32 @@ class CardPipelineApp(tk.Tk):
         person = str(marker.get("assigned_person") or "Unassigned").strip().lower()
         return needle in person
 
+    def _home_sheet_matches_search_filter(self, kind: str, name: str) -> bool:
+        needle = self.home_sheet_search_var.get().strip().lower() if hasattr(self, "home_sheet_search_var") else ""
+        if not needle:
+            return True
+        key = self._home_sheet_key(kind, name)
+        marker = self.home_sheet_markers.get(key, {})
+        summary = self.home_sheet_summaries.get(key, {})
+        searchable = " ".join(
+            str(value or "")
+            for value in (
+                name,
+                kind,
+                marker.get("assigned_person"),
+                marker.get("tracking_number"),
+                summary.get("status"),
+                summary.get("seller_payout_warning"),
+            )
+        ).lower()
+        return all(part in searchable for part in needle.split())
+
     def _filtered_home_sheet_names(self, kind: str) -> list[str]:
         names = [
             name
             for name in self.home_sheet_paths.get(kind, {})
             if self._home_sheet_matches_person_filter(self._home_sheet_key(kind, name))
+            and self._home_sheet_matches_search_filter(kind, name)
         ]
         sorter = getattr(self, "_sorted_home_sheet_names", None)
         return sorter(kind, names) if callable(sorter) else sorted(names, key=lambda name: name.lower())
@@ -9188,6 +10069,30 @@ class CardPipelineApp(tk.Tk):
             self.home_summary_cache[key] = {"mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "summary": dict(summary)}
         return summary
 
+    def _home_summary_cache_entry(self, path: Path) -> tuple[dict[str, object] | None, bool]:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None, False
+        key = self._home_summary_cache_key(path)
+        with self.home_summary_cache_lock:
+            cached = self.home_summary_cache.get(key)
+            if not cached or not isinstance(cached.get("summary"), dict):
+                return None, False
+            fresh = cached.get("mtime_ns") == stat.st_mtime_ns and cached.get("size") == stat.st_size
+            return dict(cached.get("summary") or {}), bool(fresh)
+
+    def _home_summary_placeholder(self, path: Path) -> dict[str, object]:
+        return {
+            "name": path.name,
+            "row_count": 0,
+            "received_count": 0,
+            "purchase_total": 0.0,
+            "all_received": False,
+            "partially_received": False,
+            "status": "Loading summary",
+        }
+
     def _prune_home_summary_cache(self, live_paths: list[Path]) -> None:
         live_keys = {self._home_summary_cache_key(path) for path in live_paths}
         with self.home_summary_cache_lock:
@@ -9207,29 +10112,88 @@ class CardPipelineApp(tk.Tk):
         if source_key and cert_key:
             index.setdefault(source_key, set()).add(cert_key)
 
+    def _add_accounted_row_identity(
+        self,
+        index: dict[str, set[str]],
+        source_sheet: object,
+        cert: object = '',
+        item_id: object = '',
+        card_title: object = '',
+    ) -> None:
+        source_key = self._accounted_source_key(source_sheet)
+        if not source_key:
+            return
+        cert_key = scan_to_cert(cert)
+        if cert_key:
+            index.setdefault(source_key, set()).add(cert_key)
+            return
+        item_key = str(item_id or '').strip().lower()
+        if item_key:
+            index.setdefault(source_key, set()).add(f'item:{item_key}')
+            return
+        title_key = self._received_inventory_title_identity(card_title)
+        if title_key:
+            index.setdefault(source_key, set()).add(f'title:{title_key}')
+
     def _accounted_sheet_cert_index(self) -> dict[str, set[str]]:
         index: dict[str, set[str]] = {}
         for record in [self._normalize_inventory_record(row) for row in self._load_inventory_ledger()]:
-            self._add_accounted_cert(index, record.get("source_sheet"), record.get("cert_number"))
+            self._add_accounted_row_identity(index, record.get('source_sheet'), record.get('cert_number'), record.get('item_id'), record.get('card_title'))
         for record in [self._normalize_profit_record(row) for row in self._load_profit_ledger()]:
-            self._add_accounted_cert(index, record.get("source_sheet"), record.get("cert_number"))
-            self._add_accounted_cert(index, record.get("original_source_sheet"), record.get("cert_number"))
+            self._add_accounted_row_identity(index, record.get('source_sheet'), record.get('cert_number'), record.get('item_id'), record.get('card_title'))
+            self._add_accounted_row_identity(index, record.get('original_source_sheet'), record.get('cert_number'), record.get('item_id'), record.get('card_title'))
         for entry in self._load_activity_log():
-            if str(entry.get("action") or "").strip().lower() != "inventory sold":
+            if str(entry.get('action') or '').strip().lower() != 'inventory sold':
                 continue
-            details = entry.get("details") if isinstance(entry.get("details"), dict) else {}
-            inventory_key = str(details.get("inventory_key") or "")
-            parts = inventory_key.split("|")
+            details = entry.get('details') if isinstance(entry.get('details'), dict) else {}
+            inventory_key = str(details.get('inventory_key') or '')
+            parts = inventory_key.split(chr(124))
             if len(parts) >= 2:
                 self._add_accounted_cert(index, parts[1], parts[0])
         return index
 
     def _sheet_cert_set(self, path: Path) -> set[str]:
-        return {
-            scan_to_cert(row.get("cert_number"))
-            for row in read_simple_spreadsheet(path)
-            if scan_to_cert(row.get("cert_number"))
-        }
+        return {identity for identity, _row_ref in self._sheet_accounting_identities(path)}
+
+    def _sheet_accounting_identities(self, path: Path) -> set[tuple[str, object]]:
+        identities: set[tuple[str, object]] = set()
+        for row in read_simple_spreadsheet(path):
+            cert = scan_to_cert(row.get('cert_number'))
+            row_ref = None
+            workbook_sheet = str(row.get('workbook_sheet') or '').strip()
+            try:
+                workbook_row = int(row.get('workbook_row') or 0)
+            except (TypeError, ValueError):
+                workbook_row = 0
+            if workbook_sheet and workbook_row > 0:
+                row_ref = (path.name, workbook_sheet, workbook_row)
+            if cert:
+                identities.add((cert, None))
+                continue
+            item_id = str(row.get('item_id') or '').strip().lower()
+            if item_id:
+                identities.add((f'item:{item_id}', row_ref))
+                continue
+            title_identity = self._received_inventory_title_identity(row.get('card_title'))
+            if title_identity:
+                identities.add((f'title:{title_identity}', row_ref))
+        return identities
+
+    def _sheet_unaccounted_identity_count(self, path: Path) -> int:
+        if not path.exists():
+            return 0
+        sheet_identities = {identity for identity, _row_ref in self._sheet_accounting_identities(path)}
+        if not sheet_identities:
+            return 0
+        accounted = self._accounted_sheet_cert_index().get(self._accounted_source_key(path.name), set())
+        return len(sheet_identities - accounted)
+
+    def _assert_sheet_inventory_accounted_for_received(self, path: Path) -> None:
+        missing_count = self._sheet_unaccounted_identity_count(path)
+        if missing_count:
+            raise RuntimeError(
+                f"Cannot move {path.name} to Received: {missing_count} row(s) are not in inventory, company sheets, or sold ledgers yet."
+            )
 
     def _reconcile_accounted_home_sheets(self) -> dict[str, list[str]]:
         result: dict[str, list[str]] = {"moved": [], "warnings": [], "notices": []}
@@ -9243,31 +10207,30 @@ class CardPipelineApp(tk.Tk):
                 continue
             for path in sorted(directory.glob("*.xlsx"), key=lambda item: item.name.lower()):
                 source_key = self._accounted_source_key(path.name)
-                accounted_certs = accounted.get(source_key, set())
-                if not accounted_certs:
+                accounted_identities = accounted.get(source_key, set())
+                if not accounted_identities:
                     continue
                 try:
-                    sheet_certs = self._sheet_cert_set(path)
+                    sheet_identity_refs = self._sheet_accounting_identities(path)
                 except Exception as error:
                     result["warnings"].append(f"{path.name}: could not inspect duplicate/accounted rows ({error})")
                     continue
-                if not sheet_certs:
+                sheet_identities = {identity for identity, _row_ref in sheet_identity_refs}
+                if not sheet_identities:
                     continue
-                matched = sheet_certs & accounted_certs
+                matched = sheet_identities & accounted_identities
                 if not matched:
                     continue
-                missing = sheet_certs - accounted_certs
+                missing = sheet_identities - accounted_identities
                 if missing:
                     result["notices"].append(
-                        f"{path.name}: {len(matched)}/{len(sheet_certs)} cert(s) already exist in inventory/company/sold ledgers; {len(missing)} still unaccounted."
+                        f"{path.name}: {len(matched)}/{len(sheet_identities)} row(s) already exist in inventory/company/sold ledgers; {len(missing)} still unaccounted."
                     )
                     continue
-                destination = RECEIVED_SHEETS_DIR / path.name
-                if destination.exists():
-                    result["warnings"].append(f"{path.name}: all rows accounted, but RECEIVED SHEETS already has that file name.")
-                    continue
                 try:
-                    mark_result = mark_received_in_workbooks([path], sheet_certs)
+                    raw_row_refs = {row_ref for identity, row_ref in sheet_identity_refs if identity in matched and row_ref}
+                    certs_to_mark = {identity for identity in sheet_identities if scan_to_cert(identity)}
+                    mark_result = mark_received_in_workbooks([path], certs_to_mark, raw_row_refs)
                     mark_errors = list(mark_result.get("errors") or [])
                     if mark_errors:
                         result["warnings"].append(f"{path.name}: all rows accounted, but receive marks could not be written: {mark_errors[0]}")
@@ -9285,7 +10248,7 @@ class CardPipelineApp(tk.Tk):
                     self._append_activity(
                         "Sheet Reconcile",
                         f"Moved fully accounted sheet {path.name} from {stage} to Received.",
-                        {"sheet": path.name, "from": stage, "to": "Received", "accounted_certs": len(sheet_certs)},
+                        {"sheet": path.name, "from": stage, "to": "Received", "accounted_rows": len(sheet_identities)},
                     )
                     result["moved"].append(path.name)
                 except Exception as error:
@@ -9628,28 +10591,58 @@ class CardPipelineApp(tk.Tk):
 
         summaries_start = time.perf_counter()
         live_summary_paths: list[Path] = []
+        stale_summary_paths: list[tuple[str, Path]] = []
         for kind, paths in (("Incoming", incoming_paths), ("Working", working_paths), ("Received", received_paths)):
             live_summary_paths.extend(paths)
             for path in paths:
                 key = self._home_sheet_key(kind, path.name)
+                cached_summary, fresh = self._home_summary_cache_entry(path)
+                summary = cached_summary if cached_summary is not None else self._home_summary_placeholder(path)
+                if not fresh:
+                    stale_summary_paths.append((key, path))
+                summary = self._enrich_home_seller_payout_summary(path, self.home_sheet_markers.get(key, {}), summary)
+                payload["home_summaries"][key] = summary
+        record_performance_event(
+            "startup.home_summaries.cached",
+            summaries_start,
+            f"summaries={len(payload['home_summaries'])} stale={len(stale_summary_paths)}",
+        )
+
+        payload["perf_elapsed"] = time.perf_counter() - perf_start
+        payload["home_summary_stale_count"] = len(stale_summary_paths)
+        self.events.put(("startup_refresh", dict(payload)))
+
+        if stale_summary_paths:
+            refresh_start = time.perf_counter()
+            refreshed_summaries: dict[str, dict[str, object]] = {}
+            for key, path in stale_summary_paths:
                 try:
                     summary = self._summarize_home_workbook_cached(path)
                 except Exception as error:
                     errors.append(f"{path.name}: {error}")
-                    summary = {"name": path.name, "row_count": 0, "received_count": 0, "purchase_total": 0.0, "all_received": False, "partially_received": False}
+                    summary = self._home_summary_placeholder(path)
                 summary = self._enrich_home_seller_payout_summary(path, self.home_sheet_markers.get(key, {}), summary)
-                payload["home_summaries"][key] = summary
+                refreshed_summaries[key] = summary
+            self.events.put(
+                (
+                    "home_summary_refresh",
+                    {
+                        "home_summaries": refreshed_summaries,
+                        "errors": list(errors),
+                        "refreshed_count": len(refreshed_summaries),
+                        "perf_elapsed": time.perf_counter() - refresh_start,
+                    },
+                )
+            )
         self._prune_home_summary_cache(live_summary_paths)
-        record_performance_event("startup.home_summaries", summaries_start, f"summaries={len(payload['home_summaries'])}")
+        record_performance_event("startup.home_summaries", summaries_start, f"summaries={len(payload['home_summaries'])} stale={len(stale_summary_paths)}")
 
-        payload["perf_elapsed"] = time.perf_counter() - perf_start
         record_performance_event(
             "startup.worker",
             perf_start,
             f"incoming={len(incoming_paths)} working={len(working_paths)} received={len(received_paths)} certs={len(index)} errors={len(errors)}",
             force=True,
         )
-        self.events.put(("startup_refresh", payload))
 
     def _apply_startup_refresh(self, payload: dict[str, object]) -> None:
         perf_start = time.perf_counter()
@@ -9694,6 +10687,10 @@ class CardPipelineApp(tk.Tk):
             self.status_var.set(f"Startup sheet refresh finished with {len(errors)} issue(s).")
         elif refreshed_google_sheets:
             self.status_var.set(f"Sheet lists loaded. Refreshed {refreshed_google_sheets} Google Sheet cache(s).")
+        elif int(payload.get("home_summary_stale_count") or 0):
+            self.status_var.set(
+                f"Sheet lists loaded from cache. Refreshing {int(payload.get('home_summary_stale_count') or 0)} changed/missing summaries in background."
+            )
         elif self._seller_warning_count("Working"):
             count = self._seller_warning_count("Working")
             self.status_var.set(f"Sheet lists loaded. {count} working seller sheet(s) need values.")
@@ -9705,6 +10702,27 @@ class CardPipelineApp(tk.Tk):
             "startup.apply",
             perf_start,
             f"worker_elapsed={float(payload.get('perf_elapsed') or 0):.3f}s home_summaries={len(self.home_sheet_summaries)} incoming_index={len(self.incoming_cert_index)} errors={len(errors)}",
+        )
+
+    def _apply_home_summary_refresh(self, payload: dict[str, object]) -> None:
+        perf_start = time.perf_counter()
+        refreshed = dict(payload.get("home_summaries") or {})
+        if not refreshed:
+            return
+        self.home_sheet_summaries.update(refreshed)
+        self._refresh_home_sheet_list()
+        self._refresh_home_metrics()
+        self.refresh_payouts_tab()
+        self._update_home_sheet_tabs()
+        errors = list(payload.get("errors") or [])
+        if errors:
+            self.status_var.set(f"Home summaries refreshed with {len(errors)} issue(s).")
+        else:
+            self.status_var.set(f"Home summaries refreshed in background ({len(refreshed)} sheet(s)).")
+        record_performance_event(
+            "startup.home_summaries.apply",
+            perf_start,
+            f"refreshed={len(refreshed)} worker_elapsed={float(payload.get('perf_elapsed') or 0):.3f}s errors={len(errors)}",
         )
 
     def _refresh_home_sheet_list(self) -> None:
@@ -9948,6 +10966,9 @@ class CardPipelineApp(tk.Tk):
         }
 
     def refresh_payouts_tab(self) -> None:
+        invalidate_mobile_payouts = getattr(self, "_invalidate_mobile_payouts_cache", None)
+        if callable(invalidate_mobile_payouts):
+            invalidate_mobile_payouts()
         perf_start = time.perf_counter()
         if not hasattr(self, "payout_summary_tree"):
             record_performance_event("payouts.refresh", perf_start, "tree=missing")
@@ -9956,18 +10977,30 @@ class CardPipelineApp(tk.Tk):
         self.payout_summary_tree.delete(*self.payout_summary_tree.get_children())
         self.payout_detail_tree.delete(*self.payout_detail_tree.get_children())
         self.payout_summary_people = {}
+        self.payout_summary_item_keys = {}
         self.payout_detail_keys = {}
 
         balances: dict[str, dict[str, float | int]] = {}
         detail_count = 0
         filter_person = self.payout_person_var.get().strip().lower()
+        summary_view = self._payout_summary_view_label()
         for item in self._payout_sheet_items():
             person = item["person"] or "Unassigned"
             if filter_person and filter_person not in person.lower():
                 continue
+            summary_key = person
+            summary_sheet = "All"
+            if summary_view == "Per Sheet":
+                if str(item.get("payout_kind") or "") != "seller_sheet":
+                    summary_sheet = "Team itemized rows"
+                    continue
+                summary_sheet = str(item.get("source_sheet") or item.get("name") or "Unknown sheet").strip() or "Unknown sheet"
+                summary_key = f"{person}\n{summary_sheet.lower()}"
             balance = balances.setdefault(
-                person,
+                summary_key,
                 {
+                    "person": person,
+                    "sheet": summary_sheet,
                     "sheets": 0,
                     "cards": 0,
                     "expenses": 0.0,
@@ -9977,8 +11010,12 @@ class CardPipelineApp(tk.Tk):
                     "unpaid_expenses": 0.0,
                     "unpaid_net_profit": 0.0,
                     "balance": 0.0,
+                    "item_keys": [],
                 },
             )
+            item_keys = balance.setdefault("item_keys", [])
+            if isinstance(item_keys, list):
+                item_keys.append(str(item["key"]))
             balance["sheets"] = int(balance["sheets"]) + 1
             balance["cards"] = int(balance["cards"]) + int(item["row_count"])
             balance["expenses"] = float(balance["expenses"]) + float(item.get("expense_total") or 0.0)
@@ -10007,15 +11044,19 @@ class CardPipelineApp(tk.Tk):
             )
             detail_count += 1
 
-        for index, (person, values) in enumerate(sorted(balances.items(), key=lambda pair: (-float(pair[1]["balance"]), pair[0].lower()))):
+        for index, (_summary_key, values) in enumerate(sorted(balances.items(), key=lambda pair: (-float(pair[1]["balance"]), str(pair[1].get("person") or "").lower(), str(pair[1].get("sheet") or "").lower()))):
             iid = f"payout-summary:{index}"
+            person = str(values.get("person") or "Unassigned")
             self.payout_summary_people[iid] = person
+            item_keys = values.get("item_keys")
+            self.payout_summary_item_keys[iid] = [str(key) for key in item_keys] if isinstance(item_keys, list) else []
             self.payout_summary_tree.insert(
                 "",
                 tk.END,
                 iid=iid,
                 values=(
                     person,
+                    str(values.get("sheet") or "All"),
                     int(values["sheets"]),
                     int(values["cards"]),
                     format_money(float(values["expenses"])),
@@ -10036,29 +11077,61 @@ class CardPipelineApp(tk.Tk):
                 "",
                 tk.END,
                 tags=("total_divider",),
-                values=("------", "------", "------", "------", "------", "------", "------"),
+                values=("------", "------", "------", "------", "------", "------", "------", "------"),
             )
             self.payout_summary_tree.insert(
                 "",
                 tk.END,
                 tags=("total_row",),
-                values=("TOTAL", total_sheets, total_cards, format_money(total_expenses), format_money(total_net_profit), format_money(total_unpaid_net_profit), format_money(total_balance)),
+                values=("TOTAL", "", total_sheets, total_cards, format_money(total_expenses), format_money(total_net_profit), format_money(total_unpaid_net_profit), format_money(total_balance)),
             )
         filter_label = self.payout_person_var.get().strip()
         suffix = f" | Filter: {filter_label}" if filter_label else ""
-        self.payout_status_var.set(f"{detail_count} payout row(s) | Active balance: {format_money(total_balance)}{suffix}")
+        view_suffix = f" | View: {summary_view}"
+        self.payout_status_var.set(f"{detail_count} payout row(s) | Active balance: {format_money(total_balance)}{suffix}{view_suffix}")
         record_performance_event(
             "payouts.refresh",
             perf_start,
             f"details={detail_count} people={len(balances)} total_net={total_net_profit:.2f} unpaid_net={total_unpaid_net_profit:.2f} expenses={total_expenses:.2f} balance={total_balance:.2f}",
         )
 
+    def refresh_payouts_from_disk(self) -> None:
+        self._refresh_payout_state_from_disk()
+        self.refresh_payouts_tab()
+
+    def _apply_payout_marker_balance_state(self, item: dict[str, object]) -> dict[str, object]:
+        key = str(item.get("key") or "")
+        marker = self.home_sheet_markers.get(key, {})
+        total = round(float(item.get("payout_balance") or 0.0), 2)
+        paid_amount = self._money_value(marker.get("paid_amount"))
+        if paid_amount is None:
+            paid_amount = 0.0
+        if marker.get("paid") or item.get("paid"):
+            paid_amount = total
+            open_balance = 0.0
+            paid = True
+        else:
+            open_balance = round(total - float(paid_amount), 2)
+            paid = abs(open_balance) < 0.005
+        adjusted = dict(item)
+        adjusted["payout_total"] = total
+        adjusted["paid_amount"] = round(float(paid_amount), 2)
+        adjusted["payout_balance"] = open_balance
+        adjusted["paid"] = paid
+        if paid:
+            adjusted["status"] = "Paid"
+            adjusted["paid_at"] = str(marker.get("paid_at") or adjusted.get("paid_at") or "")
+        elif paid_amount:
+            adjusted["status"] = "Partial"
+            adjusted["paid_at"] = str(marker.get("paid_at") or adjusted.get("paid_at") or "")
+        return adjusted
+
     def _payout_sheet_items(self) -> list[dict[str, object]]:
         items: list[dict[str, object]] = []
         seller_names = self._seller_terms_seller_names()
         realized_profit_groups = self._realized_profit_groups_by_person_sheet()
         team_profit_records = self._enrich_profit_records_with_people(self._load_profit_ledger())
-        for stage in ("Incoming", "Received"):
+        for stage in ("Working", "Incoming", "Received"):
             for name in self.home_sheet_paths.get(stage, {}):
                 key = self._home_sheet_key(stage, name)
                 marker = self.home_sheet_markers.get(key, {})
@@ -10072,15 +11145,18 @@ class CardPipelineApp(tk.Tk):
                 person = str(marker.get("assigned_person") or "").strip()
                 person_key = person.lower()
                 is_seller_payout = self._sheet_marker_is_seller_payout(marker) or bool(person_key and person_key in seller_names)
-                if not is_seller_payout or stage != "Received":
+                if not is_seller_payout:
                     continue
                 purchase_total = float(summary.get("purchase_total") or 0.0)
                 estimated_payout_total = float(summary.get("estimated_payout_total") or 0.0)
                 realized_profit_total = float(realized_profit_groups.get((person.lower(), Path(name).name.lower()), {}).get("profit") or 0.0)
                 has_live_seller_summary = "seller_payout_total" in summary or "seller_payout_pending" in summary
-                seller_payable = bool(summary.get("seller_payout_payable")) if has_live_seller_summary else True
+                seller_payable = stage == "Received" and (bool(summary.get("seller_payout_payable")) if has_live_seller_summary else True)
                 seller_pending = bool(summary.get("seller_payout_pending")) if has_live_seller_summary else False
-                if self._sheet_marker_is_seller_payout(marker) and has_live_seller_summary:
+                if stage != "Received":
+                    payout_balance = 0.0
+                    payout_basis = "Seller payout becomes payable after receive"
+                elif self._sheet_marker_is_seller_payout(marker) and has_live_seller_summary:
                     payout_balance = round(float(summary.get("seller_payout_total") or 0.0), 2)
                     value_label = str(summary.get("seller_payout_value_label") or "seller terms")
                     payout_basis = f"Seller terms from {value_label}"
@@ -10097,7 +11173,8 @@ class CardPipelineApp(tk.Tk):
                     )
                     seller_payable = True
                 items.append(
-                    {
+                    self._apply_payout_marker_balance_state(
+                        {
                         "key": key,
                         "stage": stage,
                         "name": name,
@@ -10115,7 +11192,10 @@ class CardPipelineApp(tk.Tk):
                         "payout_basis": payout_basis,
                         "payable": seller_payable,
                         "status": status,
-                    }
+                        "source_sheet": name,
+                        "payout_kind": "seller_sheet",
+                        }
+                    )
                 )
         for record in sorted(team_profit_records, key=self._team_payout_record_sort_key):
             if str(record.get("record_type") or "").strip().lower() == "expense":
@@ -10192,7 +11272,7 @@ class CardPipelineApp(tk.Tk):
         card_title = str(record.get("card_title") or "").strip() or cert_or_item or "Sold Card"
         if cert_or_item and cert_or_item not in card_title:
             card_title = f"{card_title} [{cert_or_item}]"
-        return {
+        return self._apply_payout_marker_balance_state({
             "key": key,
             "stage": "Sold Card",
             "name": card_title,
@@ -10213,7 +11293,8 @@ class CardPipelineApp(tk.Tk):
             "status": "Paid" if paid else "Sold",
             "source_sheet": source_sheet,
             "ledger_key": str(record.get("ledger_key") or ""),
-        }
+            "payout_kind": "team_card",
+        })
 
     def _team_expense_payout_item(self, record: dict[str, object], seller_names: set[str]) -> dict[str, object] | None:
         person = str(record.get("assigned_person") or "").strip() or "Unassigned"
@@ -10231,7 +11312,7 @@ class CardPipelineApp(tk.Tk):
         payout_balance = min(0.0, round(float(profit) * balance_share, 2))
         expense_amount = abs(float(profit))
         name = str(record.get("card_title") or record.get("notes") or record.get("expense_type") or "Expense").strip()
-        return {
+        return self._apply_payout_marker_balance_state({
             "key": key,
             "stage": "Expense",
             "name": name,
@@ -10252,7 +11333,8 @@ class CardPipelineApp(tk.Tk):
             "status": "Paid" if paid else "Expenses",
             "source_sheet": source_sheet,
             "ledger_key": str(record.get("ledger_key") or ""),
-        }
+            "payout_kind": "team_expense",
+        })
 
     def _realized_profit_totals_by_person_sheet(self) -> dict[tuple[str, str], float]:
         return {
@@ -10414,6 +11496,22 @@ class CardPipelineApp(tk.Tk):
             and str(term.get("sheet_type") or "").strip()
             and (term.get("rate") is not None or term.get("deduction") is not None)
         }
+
+    def _team_balance_share_people(self) -> set[str]:
+        return {
+            str(term.get("seller") or "").strip().lower()
+            for term in self._load_seller_terms()
+            if str(term.get("seller") or "").strip()
+            and term.get("balance_share") is not None
+        }
+
+    def _profit_filter_people(self, people: list[str]) -> list[str]:
+        if self._is_personal_lucas():
+            return list(people)
+        balance_people = self._team_balance_share_people()
+        if not balance_people:
+            return list(people)
+        return [person for person in people if str(person or "").strip().lower() in balance_people]
 
     def _team_balance_share_for_person(self, person: str) -> float:
         person_key = str(person or "").strip().lower()
@@ -10813,14 +11911,14 @@ class CardPipelineApp(tk.Tk):
         if hasattr(self, "home_person_combo"):
             self.home_person_combo["values"] = people
         if hasattr(self, "profit_person_combo"):
-            self.profit_person_combo["values"] = people
+            self.profit_person_combo["values"] = self._profit_person_options(people, filter_text)
         if hasattr(self, "inventory_person_combo"):
             self.inventory_person_combo["values"] = people
         if hasattr(self, "seller_terms_seller_combo"):
             self.seller_terms_seller_combo["values"] = people
 
     def _bind_person_autocomplete(self, combo: ttk.Combobox, refresh_callback=None) -> None:
-        combo["values"] = self._known_people()
+        combo["values"] = self._person_combo_options(combo, self._known_people(), "")
         combo.configure(postcommand=lambda widget=combo: self._refresh_person_combo_widget(widget))
         combo.bind("<FocusIn>", lambda _event, widget=combo: self._refresh_person_combo_widget(widget), add="+")
         combo.bind("<KeyRelease>", lambda event, widget=combo: self._filter_person_combo(widget, event, refresh_callback=refresh_callback), add="+")
@@ -10830,7 +11928,21 @@ class CardPipelineApp(tk.Tk):
         people = self._known_people()
         if typed:
             people = [person for person in people if typed in person.lower()]
-        combo["values"] = people
+        combo["values"] = self._person_combo_options(combo, people, typed)
+
+    def _person_combo_options(self, combo: ttk.Combobox, people: list[str], filter_text: str = "") -> list[str]:
+        if hasattr(self, "profit_person_combo") and combo is self.profit_person_combo:
+            return self._profit_person_options(people, filter_text)
+        return people
+
+    def _profit_person_options(self, people: list[str], filter_text: str = "") -> list[str]:
+        if self._is_personal_lucas():
+            return people
+        needle = str(filter_text or "").strip().lower()
+        options = self._profit_filter_people(people)
+        if not needle or "my profit".startswith(needle) or needle in "my profit":
+            return ["My Profit", *[person for person in options if person.lower() != "my profit"]]
+        return options
 
     def _filter_person_combo(self, combo: ttk.Combobox, event, refresh_callback=None) -> None:
         if event.keysym in {"Up", "Down", "Left", "Right", "Return", "KP_Enter", "Escape", "Tab"}:
@@ -10967,14 +12079,21 @@ class CardPipelineApp(tk.Tk):
                     "expense_total": 0.0,
                     "net_profit_total": 0.0,
                     "payout_balance": 0.0,
+                    "paid_amount": 0.0,
                     "payout_basis": "Total paid balance",
                     "status": "Paid",
                 },
             )
             for field in ("row_count", "received_count"):
                 batch[field] = int(batch.get(field) or 0) + int(item.get(field) or 0)
-            for field in ("purchase_total", "estimated_payout_total", "estimated_profit", "realized_profit_total", "expense_total", "net_profit_total", "payout_balance"):
+            for field in ("purchase_total", "estimated_payout_total", "estimated_profit", "realized_profit_total", "expense_total", "net_profit_total"):
                 batch[field] = round(float(batch.get(field) or 0.0) + float(item.get(field) or 0.0), 2)
+            batch["paid_amount"] = round(
+                float(batch.get("paid_amount") or 0.0)
+                + float(item.get("paid_amount") or item.get("payout_total") or item.get("payout_balance") or 0.0),
+                2,
+            )
+            batch["payout_balance"] = batch["paid_amount"]
         for key, marker in self.home_sheet_markers.items():
             if key in source_keys:
                 continue
@@ -11007,11 +12126,17 @@ class CardPipelineApp(tk.Tk):
                     "expense_total": 0.0,
                     "net_profit_total": 0.0,
                     "payout_balance": 0.0,
+                    "paid_amount": 0.0,
                     "payout_basis": "Total paid balance",
                     "status": "Paid",
                 },
             )
             batch["payout_balance"] = round(float(batch.get("payout_balance") or 0.0) + amount, 2)
+            batch["paid_amount"] = round(float(batch.get("paid_amount") or 0.0) + amount, 2)
+        for batch in paid_batches.values():
+            paid_amount = float(batch.get("paid_amount") or batch.get("payout_balance") or 0.0)
+            batch["name"] = f"Payment {format_money(paid_amount)}"
+            batch["payout_basis"] = "Paid payout batch"
         return [
             *sorted(paid_batches.values(), key=lambda item: str(item.get("paid_at") or item.get("name") or ""), reverse=True),
             *sorted(open_items, key=lambda item: (str(item.get("stage") or ""), str(item.get("name") or "").lower())),
@@ -11048,7 +12173,7 @@ class CardPipelineApp(tk.Tk):
         frame.pack(fill=tk.BOTH, expand=True)
         ttk.Label(frame, text=f"Payout History: {person}", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).pack(anchor=tk.W)
         totals = {
-            "paid": sum(float(item.get("payout_balance") or 0.0) for item in items if item.get("paid")),
+            "paid": sum(float(item.get("paid_amount") or 0.0) for item in items),
             "unpaid": sum(float(item.get("payout_balance") or 0.0) for item in items if not item.get("paid")),
         }
         ttk.Label(
@@ -11066,7 +12191,7 @@ class CardPipelineApp(tk.Tk):
                 "cards": "Cards",
                 "expenses": "Expenses",
                 "net_profit": "Net Profit",
-                "balance": "Balance",
+                "balance": "Amount / Balance",
                 "basis": "Basis",
                 "paid_at": "Paid At",
             },
@@ -11079,13 +12204,14 @@ class CardPipelineApp(tk.Tk):
         for index, item in enumerate(items):
             paid = bool(item.get("paid"))
             balance = float(item.get("payout_balance") or 0.0)
+            partial = bool(item.get("paid_amount")) and not paid
             tag = "paid" if paid else ("negative" if balance < 0 else "open")
             tree.insert(
                 "",
                 tk.END,
                 iid=f"history:{index}",
                 values=(
-                    "Paid" if paid else "Open",
+                    "Paid" if paid else ("Partial" if partial else "Open"),
                     item.get("stage") or "",
                     item.get("name") or "",
                     item.get("row_count") or 0,
@@ -11115,10 +12241,12 @@ class CardPipelineApp(tk.Tk):
             return
         if person in {"TOTAL", "━━━━━━"}:
             return
+        selected_item_keys = set(self.payout_summary_item_keys.get(selected[0], [])) if hasattr(self, "payout_summary_item_keys") else set()
         matching_items = [
             item
             for item in self._payout_sheet_items()
             if not item["paid"] and item.get("payable", True) and (item["person"] or "Unassigned") == person
+            and (not selected_item_keys or str(item.get("key") or "") in selected_item_keys)
         ]
         if not matching_items:
             self.payout_status_var.set(f"No unpaid payout rows found for {person}.")
@@ -11134,9 +12262,9 @@ class CardPipelineApp(tk.Tk):
         total_cards: int,
         total_balance: float,
     ) -> None:
-        confirmed_var = tk.BooleanVar(value=False)
+        amount_var = tk.StringVar(value=format_money(total_balance))
         popup = tk.Toplevel(self)
-        popup.title("Mark Payout Paid")
+        popup.title("Record Payout Payment")
         popup.configure(bg="#1f1f1f")
         popup.transient(self)
         popup.grab_set()
@@ -11144,42 +12272,112 @@ class CardPipelineApp(tk.Tk):
 
         frame = ttk.Frame(popup, style="Panel.TFrame", padding=(18, 16))
         frame.pack(fill=tk.BOTH, expand=True)
-        ttk.Label(frame, text="Mark Payout Paid", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
+        ttk.Label(frame, text="Record Payout Payment", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 2))
         ttk.Label(frame, text=person, style="Muted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 14))
         ttk.Label(frame, text="Payout Rows", style="Panel.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 18), pady=(0, 8))
         ttk.Label(frame, text=str(len(matching_items)), style="Panel.TLabel").grid(row=2, column=1, sticky="w", pady=(0, 8))
         ttk.Label(frame, text="Cards", style="Panel.TLabel").grid(row=3, column=0, sticky="w", padx=(0, 18), pady=(0, 8))
         ttk.Label(frame, text=str(total_cards), style="Panel.TLabel").grid(row=3, column=1, sticky="w", pady=(0, 8))
-        ttk.Label(frame, text="Total Balance", style="Panel.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 18), pady=(0, 14))
-        ttk.Label(frame, text=format_money(total_balance), style="Panel.TLabel", font=("Segoe UI Semibold", 11)).grid(row=4, column=1, sticky="w", pady=(0, 14))
+        ttk.Label(frame, text="Open Balance", style="Panel.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 18), pady=(0, 8))
+        ttk.Label(frame, text=format_money(total_balance), style="Panel.TLabel", font=("Segoe UI Semibold", 11)).grid(row=4, column=1, sticky="w", pady=(0, 8))
+        ttk.Label(frame, text="Payment Amount", style="Panel.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 18), pady=(0, 14))
+        amount_entry = ttk.Entry(frame, textvariable=amount_var, width=18)
+        amount_entry.grid(row=5, column=1, sticky="w", pady=(0, 14))
 
         buttons = ttk.Frame(frame, style="Panel.TFrame")
         buttons.grid(row=6, column=0, columnspan=2, sticky="e")
         ttk.Button(buttons, text="Cancel", command=popup.destroy, style="Soft.TButton").pack(side=tk.LEFT, padx=(0, 8))
-        confirm_button = ttk.Button(
+        ttk.Button(
             buttons,
-            text="Confirm Mark Paid",
+            text="Save Payment",
             style="Primary.TButton",
-            state=tk.DISABLED,
-            command=lambda: self._apply_payout_person_paid(person, matching_items, total_balance, popup),
-        )
-        confirm_button.pack(side=tk.LEFT)
-
-        def toggle_confirm() -> None:
-            confirm_button.configure(state=tk.NORMAL if confirmed_var.get() else tk.DISABLED)
-
-        ttk.Checkbutton(
-            frame,
-            text="I confirm this person's full active balance has been paid.",
-            variable=confirmed_var,
-            command=toggle_confirm,
-            style="Panel.TCheckbutton",
-        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 14))
+            command=lambda: self._apply_payout_person_payment(person, matching_items, amount_var.get(), total_balance, popup),
+        ).pack(side=tk.LEFT)
         frame.columnconfigure(1, weight=1)
         popup.update_idletasks()
+        amount_entry.focus_set()
+        amount_entry.selection_range(0, tk.END)
         x = self.winfo_rootx() + max(80, (self.winfo_width() - popup.winfo_width()) // 2)
         y = self.winfo_rooty() + max(80, (self.winfo_height() - popup.winfo_height()) // 2)
         popup.geometry(f"+{x}+{y}")
+
+    def _apply_payout_person_payment(
+        self,
+        person: str,
+        matching_items: list[dict[str, object]],
+        amount_text: str,
+        total_balance: float,
+        popup: tk.Toplevel | None = None,
+    ) -> None:
+        payment = self._parse_money_text(amount_text)
+        total_balance = round(float(total_balance), 2)
+        if payment is None or payment < 0 or (payment == 0 and abs(total_balance) >= 0.005):
+            messagebox.showerror("Invalid payment", "Enter a payment amount greater than $0.")
+            return
+        payment = min(round(float(payment), 2), max(0.0, total_balance))
+        remaining = payment
+        paid_at = datetime.now().isoformat(timespec="seconds")
+        for item in matching_items:
+            if remaining <= 0:
+                break
+            key = str(item["key"])
+            kind, _name = self._split_home_sheet_key(key)
+            marker = dict(self.home_sheet_markers.get(key, {}))
+            summary = self.home_sheet_summaries.get(key, {})
+            open_balance = round(float(item.get("payout_balance") or 0.0), 2)
+            if open_balance <= 0:
+                continue
+            current_paid = self._money_value(marker.get("paid_amount")) or 0.0
+            applied = min(open_balance, remaining)
+            new_paid_amount = round(current_paid + applied, 2)
+            payout_total = round(float(item.get("payout_total") or open_balance + current_paid), 2)
+            marker["assigned_person"] = str(item["person"] or "").strip()
+            marker["paid_amount"] = new_paid_amount
+            marker["paid_at"] = paid_at
+            marker["paid"] = new_paid_amount + 0.005 >= payout_total
+            marker["all_received"] = bool(marker.get("all_received") or summary.get("all_received") or kind == "Received")
+            marker["tracking_number"] = str(marker.get("tracking_number") or "")
+            self.home_sheet_markers[key] = marker
+            remaining = round(remaining - applied, 2)
+        closed_offsets = 0
+        if abs(round(total_balance - payment, 2)) < 0.005:
+            closed_offsets = self._mark_zero_balance_payout_offsets_paid(person, matching_items, paid_at)
+        self._save_sheet_markers()
+        self.refresh_home()
+        if popup is not None:
+            popup.destroy()
+        suffix = f" Closed {closed_offsets} offset row(s)." if closed_offsets else ""
+        self.status_var.set(f"Recorded {format_money(payment)} payment for {person}; remaining open balance reduced.{suffix}")
+
+    def _mark_zero_balance_payout_offsets_paid(self, person: str, matching_items: list[dict[str, object]], paid_at: str) -> int:
+        open_items: list[dict[str, object]] = []
+        open_total = 0.0
+        for item in matching_items:
+            if item.get("paid") or not item.get("payable", True):
+                continue
+            adjusted = self._apply_payout_marker_balance_state(item)
+            open_balance = round(float(adjusted.get("payout_balance") or 0.0), 2)
+            if abs(open_balance) >= 0.005:
+                open_items.append(item)
+                open_total = round(open_total + open_balance, 2)
+        if not open_items or abs(open_total) >= 0.005:
+            return 0
+        closed = 0
+        for item in open_items:
+            key = str(item["key"])
+            kind, _name = self._split_home_sheet_key(key)
+            marker = dict(self.home_sheet_markers.get(key, {}))
+            summary = self.home_sheet_summaries.get(key, {})
+            marker["assigned_person"] = str(item.get("person") or person or "").strip()
+            marker["paid"] = True
+            marker["paid_amount"] = round(float(item.get("payout_total") or item.get("payout_balance") or 0.0), 2)
+            marker["paid_at"] = paid_at
+            marker["all_received"] = bool(marker.get("all_received") or summary.get("all_received") or kind == "Received")
+            marker["tracking_number"] = str(marker.get("tracking_number") or "")
+            marker["closed_by_zero_balance_offset"] = True
+            self.home_sheet_markers[key] = marker
+            closed += 1
+        return closed
 
     def _apply_payout_person_paid(
         self,
@@ -11195,6 +12393,7 @@ class CardPipelineApp(tk.Tk):
             summary = self.home_sheet_summaries.get(key, {})
             marker["assigned_person"] = str(item["person"] or "").strip()
             marker["paid"] = True
+            marker["paid_amount"] = round(float(item.get("payout_total") or item.get("payout_balance") or 0.0), 2)
             marker["paid_at"] = datetime.now().isoformat(timespec="seconds")
             marker["all_received"] = bool(marker.get("all_received") or summary.get("all_received") or kind == "Received")
             marker["tracking_number"] = str(marker.get("tracking_number") or "")
@@ -11301,8 +12500,11 @@ class CardPipelineApp(tk.Tk):
         marker["paid"] = bool(paid)
         if paid:
             marker.setdefault("paid_at", datetime.now().isoformat(timespec="seconds"))
+            if payout_item:
+                marker["paid_amount"] = round(float(payout_item.get("payout_total") or payout_item.get("payout_balance") or 0.0), 2)
         else:
             marker.pop("paid_at", None)
+            marker.pop("paid_amount", None)
         marker["all_received"] = bool(marker.get("all_received") or summary.get("all_received") or kind == "Received")
         marker["tracking_number"] = str(marker.get("tracking_number") or "")
         self.home_sheet_markers[key] = marker
@@ -11542,6 +12744,14 @@ class CardPipelineApp(tk.Tk):
             lock_started = time.perf_counter()
             with shared_lock(CARD_PIPELINE_DIR, "sheet-stage-move", self.lucas_identity):
                 move_phases.append(f"lock_wait={time.perf_counter() - lock_started:.3f}s")
+                if target_stage == "Received":
+                    marker = self.home_sheet_markers.get(self.home_selected_sheet_key, {})
+                    person = str(marker.get("assigned_person") or "").strip() or "Unassigned"
+                    phase_started = time.perf_counter()
+                    added, candidates = self._sync_received_sheet_inventory_to_ledger(source_stage, path, person)
+                    inventory_rows_added += added
+                    inventory_candidate_rows += candidates
+                    move_phases.append(f"pre_inventory_sync={time.perf_counter() - phase_started:.3f}s")
                 phase_started = time.perf_counter()
                 moved_key, cleanup = self._move_home_sheet_to_stage(self.home_selected_sheet_key, target_stage)
                 move_phases.append(f"move={time.perf_counter() - phase_started:.3f}s")
@@ -11550,14 +12760,16 @@ class CardPipelineApp(tk.Tk):
                 if target_stage == "Received" and moved_key:
                     received_stage, received_name = self._split_home_sheet_key(moved_key)
                     marker = self.home_sheet_markers.get(moved_key, {})
-                    person = str(marker.get("assigned_person") or "").strip()
-                    if received_stage == "Received" and received_name and person:
+                    person = str(marker.get("assigned_person") or "").strip() or "Unassigned"
+                    if received_stage == "Received" and received_name:
                         phase_started = time.perf_counter()
-                        inventory_rows_added, inventory_candidate_rows = self._sync_received_sheet_inventory_to_ledger(
+                        added, candidates = self._sync_received_sheet_inventory_to_ledger(
                             received_stage,
                             self._sheet_path_for_stage(received_stage, received_name),
                             person,
                         )
+                        inventory_rows_added += added
+                        inventory_candidate_rows += candidates
                         move_phases.append(f"inventory_sync={time.perf_counter() - phase_started:.3f}s")
                 phase_started = time.perf_counter()
                 self._save_sheet_markers()
@@ -11797,6 +13009,7 @@ class CardPipelineApp(tk.Tk):
             if self._is_personal_lucas()
             else str(marker.get("assigned_person") or "").strip()
         )
+        existing_all_received = bool(existing_marker.get("all_received"))
         if bool(updated_marker.get("seller_terms_applied") or updated_marker.get("seller_sheet_type")):
             sheet_type = str(updated_marker.get("seller_sheet_type") or "").strip()
             assigned_person = str(updated_marker.get("assigned_person") or "").strip()
@@ -11852,11 +13065,18 @@ class CardPipelineApp(tk.Tk):
                 if old_assigned_person != str(marker.get("assigned_person") or "").strip():
                     inventory_rows_reassigned = self._retarget_inventory_rows_for_source(current_name, str(marker.get("assigned_person") or ""))
                     profit_rows_reassigned = self._retarget_profit_rows_for_source(current_name, str(marker.get("assigned_person") or ""))
-                if _current_kind == "Received" and marker["all_received"] and str(marker.get("assigned_person") or "").strip():
+                current_person = str(marker.get("assigned_person") or "").strip()
+                should_sync_received_inventory = (
+                    _current_kind == "Received"
+                    and bool(marker.get("all_received"))
+                    and bool(current_person)
+                    and (moved or not existing_all_received or not old_assigned_person)
+                )
+                if should_sync_received_inventory:
                     inventory_rows_added, inventory_candidate_rows = self._sync_received_sheet_inventory_to_ledger(
                         _current_kind,
                         self._sheet_path_for_stage(_current_kind, current_name),
-                        str(marker.get("assigned_person") or ""),
+                        current_person,
                     )
                 self._save_sheet_markers()
         except Exception as error:
@@ -11864,7 +13084,13 @@ class CardPipelineApp(tk.Tk):
             return
         refresh_marker_save = getattr(self, "_refresh_after_home_marker_save", None)
         if callable(refresh_marker_save):
-            refresh_marker_save(current_name, _current_kind, moved=moved, source_stage=source_kind)
+            current_person = str(marker.get("assigned_person") or "").strip()
+            refresh_payouts = (
+                moved
+                or profit_rows_reassigned > 0
+                or (_current_kind == "Received" and (current_person != old_assigned_person or not existing_all_received))
+            )
+            refresh_marker_save(current_name, _current_kind, moved=moved, source_stage=source_kind, refresh_payouts=refresh_payouts)
         if hasattr(self, "inventory_tree") and (inventory_rows_added or inventory_rows_reassigned):
             self.refresh_inventory_tab()
         if profit_rows_reassigned and hasattr(self, "profit_tree"):
@@ -11883,7 +13109,14 @@ class CardPipelineApp(tk.Tk):
             inventory_note += " Inventory was already up to date."
         self.status_var.set(("Sheet markers saved and moved." if moved else "Sheet markers saved.") + inventory_note)
 
-    def _refresh_after_home_marker_save(self, sheet_name: str, stage: str, moved: bool = False, source_stage: str = "") -> None:
+    def _refresh_after_home_marker_save(
+        self,
+        sheet_name: str,
+        stage: str,
+        moved: bool = False,
+        source_stage: str = "",
+        refresh_payouts: bool = True,
+    ) -> None:
         if moved:
             self._refresh_after_home_stage_move(sheet_name, source_stage, stage)
             return
@@ -11901,7 +13134,8 @@ class CardPipelineApp(tk.Tk):
             )
         self._refresh_home_sheet_list()
         self._refresh_home_metrics()
-        self.refresh_payouts_tab()
+        if refresh_payouts:
+            self.refresh_payouts_tab()
         self._update_home_sheet_tabs()
 
     def _home_sheet_key(self, kind: str, name: str) -> str:
@@ -11976,10 +13210,8 @@ class CardPipelineApp(tk.Tk):
         phase_started = time.perf_counter()
         target_dir.mkdir(parents=True, exist_ok=True)
         record_performance_event("home.stage_move.target_mkdir", phase_started, f"sheet={name} from={source_stage} to={target_stage}")
-        destination = target_dir / source.name
         phase_started = time.perf_counter()
-        if destination.exists():
-            raise FileExistsError(f"{target_stage} sheet already exists: {destination.name}")
+        destination = self._unique_stage_destination(target_dir, source.name)
         record_performance_event("home.stage_move.destination_exists", phase_started, f"sheet={name} from={source_stage} to={target_stage}")
 
         cleanup: dict[str, int] = {}
@@ -12002,6 +13234,20 @@ class CardPipelineApp(tk.Tk):
         record_performance_event("home.stage_move.marker_update", phase_started, f"sheet={name} from={source_stage} to={target_stage}")
         record_performance_event("home.stage_move.move_function", perf_start, f"sheet={name} from={source_stage} to={target_stage}", force=True)
         return new_key, cleanup
+
+    def _unique_stage_destination(self, target_dir: Path, filename: str) -> Path:
+        destination = target_dir / filename
+        if not destination.exists():
+            return destination
+        stem = destination.stem
+        suffix = destination.suffix
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for index in range(100):
+            extra = "" if index == 0 else f"_{index + 1}"
+            candidate = target_dir / f"{stem}_{timestamp}{extra}{suffix}"
+            if not candidate.exists():
+                return candidate
+        raise FileExistsError(f"Could not create a unique destination for {filename}")
 
     def _marker_for_stage(self, marker: dict[str, object], stage: str) -> dict[str, object]:
         normalized = dict(marker)
@@ -12071,6 +13317,9 @@ class CardPipelineApp(tk.Tk):
                 continue
             old_key = self._home_sheet_key(kind, path.name)
             marker = dict(self.home_sheet_markers.get(old_key, {}))
+            person = str(marker.get("assigned_person") or "").strip()
+            if person:
+                self._sync_received_sheet_inventory_to_ledger(kind, path, person)
             marker["all_received"] = True
             marker.setdefault("received_at", datetime.now().isoformat(timespec="seconds"))
             new_key = self._move_sheet_to_received(old_key)
@@ -12199,7 +13448,7 @@ class CardPipelineApp(tk.Tk):
 
     def _build_manual_review_mode(self) -> None:
         self.review_mode_host.columnconfigure(8, weight=1)
-        ttk.Label(self.review_mode_host, text="Double-click cells in the Receive table to enter certs, raw Item IDs, or adjust matched details.", style="Muted.TLabel").grid(row=0, column=0, columnspan=9, sticky="w")
+        ttk.Label(self.review_mode_host, text="Click cells in the Receive table to enter certs, raw Item IDs, or adjust matched details.", style="Muted.TLabel").grid(row=0, column=0, columnspan=9, sticky="w")
 
     def _build_manual_intake_mode(self) -> None:
         self.scanning_station_active = False
@@ -12467,6 +13716,13 @@ class CardPipelineApp(tk.Tk):
         self.photo_paths = []
         self.photo_status.set("No photos selected.")
 
+    def _clear_create_photo_queue_after_sheet_save(self) -> None:
+        if not getattr(self, "photo_paths", None):
+            return
+        self.photo_paths = []
+        if hasattr(self, "photo_status"):
+            self.photo_status.set("No photos selected.")
+
     def _add_photo_paths(self, paths: list[Path]) -> None:
         existing = {path.resolve() for path in self.photo_paths if path.exists()}
         added = 0
@@ -12553,9 +13809,24 @@ class CardPipelineApp(tk.Tk):
         }
 
     def _photo_card_has_inventory(self, card: dict) -> bool:
-        if any(card.get(key) for key in ("cert_number", "player", "year", "set", "card_number", "parallel", "subset", "grade", "label_text")):
+        if scan_to_cert(card.get("cert_number")):
             return True
-        return bool(card.get("is_graded_slab") or card.get("detection_confidence") or card.get("error"))
+        confidence = clean_part(card.get("confidence")).lower()
+        position = clean_part(card.get("position")).lower()
+        if confidence == "low" or "background" in position:
+            return False
+        identity_fields = ("player", "year", "set", "card_number", "parallel", "subset", "attributes", "grade")
+        identity_count = sum(1 for key in identity_fields if clean_part(card.get(key)))
+        company = normalize_grader(card.get("grading_company"))
+        if identity_count >= 2:
+            return True
+        if identity_count >= 1 and company:
+            return True
+        label_text = re.sub(r"\s+", " ", clean_part(card.get("label_text")).upper())
+        generic_fragments = {"AUTO", "AUTOGRAPH", "CARD", "GEM MINT", "MINT", "PRIZM", "REFRACTOR", "ROOKIE", "SILVER"}
+        if label_text and label_text not in generic_fragments and len(label_text) >= 6 and company:
+            return True
+        return False
 
     def _load_photo_env(self) -> None:
         if not load_dotenv:
@@ -12702,9 +13973,11 @@ class CardPipelineApp(tk.Tk):
             if path.is_file() and path.suffix.lower() in allowed
         ]
 
-    def _inventory_photo_files(self, folder: Path) -> list[dict[str, object]]:
+    def _inventory_photo_files(self, folder: Path, paths: list[Path] | None = None) -> list[dict[str, object]]:
         images: list[dict[str, object]] = []
-        if hasattr(self, "_inventory_photo_paths"):
+        if paths is not None:
+            paths = [Path(path) for path in paths if Path(path).exists() and Path(path).is_file()]
+        elif hasattr(self, "_inventory_photo_paths"):
             paths = self._inventory_photo_paths(folder)
         else:
             allowed = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
@@ -12729,6 +14002,158 @@ class CardPipelineApp(tk.Tk):
             except Exception:
                 continue
         return images
+
+    def _inventory_photo_used_path_keys(self, records: list[dict[str, object]] | None = None) -> set[str]:
+        rows = records if records is not None else [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+        used: set[str] = set()
+        for record in rows:
+            for value in record.get("photo_paths") or []:
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                used.add(text)
+                for candidate in self._inventory_photo_path_candidates(text):
+                    used.add(str(candidate))
+                    used.add(candidate.name)
+                    try:
+                        used.add(str(candidate.resolve()))
+                    except Exception:
+                        pass
+        return used
+
+    def _inventory_photo_used_hashes(self, records: list[dict[str, object]] | None = None) -> set[str]:
+        rows = records if records is not None else [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+        used_hashes: set[str] = set()
+        seen_paths: set[str] = set()
+        for record in rows:
+            for value in record.get("photo_paths") or []:
+                for candidate in self._inventory_photo_path_candidates(value):
+                    if not candidate.exists() or not candidate.is_file():
+                        continue
+                    try:
+                        key = str(candidate.resolve())
+                    except Exception:
+                        key = str(candidate)
+                    if key in seen_paths:
+                        continue
+                    seen_paths.add(key)
+                    try:
+                        used_hashes.add(self._inventory_photo_file_hash(candidate))
+                    except Exception:
+                        continue
+        return used_hashes
+
+    def _inventory_photo_state_used_keys(self) -> tuple[set[str], set[str], set[str]]:
+        state = self._load_inventory_photo_state()
+        photos = state.get("photos") if isinstance(state, dict) else {}
+        if not isinstance(photos, dict):
+            return set(), set(), set()
+        used_names: set[str] = set()
+        used_paths: set[str] = set()
+        used_hashes: set[str] = set()
+        used_statuses = {"linked", "missing_from_album", "archived_from_album", "sold_inventory"}
+        for sha, record in photos.items():
+            if not isinstance(record, dict):
+                continue
+            status = str(record.get("status") or "").strip()
+            linked_keys = [str(key).strip() for key in (record.get("linked_keys") or []) if str(key).strip()]
+            if status not in used_statuses and not linked_keys:
+                continue
+            sha_text = str(sha or "").strip()
+            if sha_text:
+                used_hashes.add(sha_text)
+            for value in (record.get("path"), record.get("relative_path"), record.get("filename"), record.get("archived_path"), record.get("original_path")):
+                text = str(value or "").strip()
+                if not text:
+                    continue
+                used_paths.add(text)
+                try:
+                    path = Path(text).expanduser()
+                    used_names.add(path.name)
+                    used_paths.add(str(path))
+                    if path.exists() and path.is_file():
+                        used_hashes.add(self._inventory_photo_file_hash(path))
+                    try:
+                        used_paths.add(str(path.resolve()))
+                    except Exception:
+                        pass
+                except Exception:
+                    used_names.add(Path(text).name)
+        return used_names, used_paths, used_hashes
+
+    def _sold_inventory_cert_numbers(self) -> set[str]:
+        certs: set[str] = set()
+        for record in self._load_profit_ledger():
+            normalized = self._normalize_profit_record(record)
+            cert = scan_to_cert(normalized.get("cert_number"))
+            if cert:
+                certs.add(cert)
+        return certs
+
+    def _sold_inventory_photo_used_keys(self) -> tuple[set[str], set[str]]:
+        sold_rows = [self._normalize_profit_record(record) for record in self._load_profit_ledger()]
+        return self._inventory_photo_used_path_keys(sold_rows), self._inventory_photo_used_hashes(sold_rows)
+
+    def _inventory_photo_state_matches_sold_cert(self, existing: dict[str, object], sold_certs: set[str] | None = None) -> bool:
+        if not existing:
+            return False
+        sold_certs = sold_certs if sold_certs is not None else self._sold_inventory_cert_numbers()
+        if not sold_certs:
+            return False
+        photo_certs = {scan_to_cert(cert) for cert in (existing.get("certs") or []) if scan_to_cert(cert)}
+        return bool(photo_certs & sold_certs)
+
+    def _inventory_unattached_photo_paths(self) -> list[Path]:
+        used = self._inventory_photo_used_path_keys()
+        used_hashes = self._inventory_photo_used_hashes()
+        state_used_names, state_used_paths, state_used_hashes = self._inventory_photo_state_used_keys()
+        sold_certs = self._sold_inventory_cert_numbers()
+        sold_photo_paths, sold_photo_hashes = self._sold_inventory_photo_used_keys()
+        state = self._load_inventory_photo_state()
+        photos = state.get("photos") if isinstance(state, dict) else {}
+        photos = photos if isinstance(photos, dict) else {}
+        paths: list[Path] = []
+        seen: set[str] = set()
+        for folder in (self._inventory_photo_shared_folder(), self._inventory_photo_source_folder()):
+            for path in self._inventory_photo_paths(folder):
+                if path.name in state_used_names:
+                    continue
+                keys = {str(path)}
+                try:
+                    keys.add(str(path.resolve()))
+                except Exception:
+                    pass
+                storage = self._inventory_photo_storage_value(path)
+                if storage:
+                    keys.add(storage)
+                if keys & used or keys & state_used_paths or keys & sold_photo_paths:
+                    continue
+                unique_key = ""
+                try:
+                    unique_key = self._inventory_photo_file_hash(path)
+                except Exception:
+                    unique_key = ""
+                if unique_key and (unique_key in used_hashes or unique_key in state_used_hashes or unique_key in sold_photo_hashes):
+                    continue
+                existing_state = photos.get(unique_key) if unique_key and isinstance(photos.get(unique_key), dict) else {}
+                if existing_state and self._inventory_photo_state_matches_sold_cert(existing_state, sold_certs):
+                    continue
+                if not unique_key:
+                    unique_key = next(iter(keys))
+                    try:
+                        unique_key = str(path.resolve())
+                    except Exception:
+                        pass
+                try:
+                    resolved_key = str(path.resolve())
+                except Exception:
+                    resolved_key = str(path)
+                if unique_key in seen or resolved_key in seen:
+                    continue
+                seen.add(unique_key)
+                seen.add(resolved_key)
+                paths.append(path)
+        return sorted(paths, key=lambda item: str(item).lower())
 
     def _inventory_photo_base64(self, path: Path) -> str:
         if path.suffix.lower() not in {".heic", ".heif"}:
@@ -12958,14 +14383,18 @@ class CardPipelineApp(tk.Tk):
         state = self._load_inventory_photo_state()
         photos = state.setdefault("photos", {})
         try:
-            images = self._inventory_photo_files(folder)
+            prepared_paths = getattr(self, "_prepared_inventory_photo_scan_paths", None)
+            explicit_scan_paths = isinstance(prepared_paths, list)
+            images = self._inventory_photo_files(folder, prepared_paths if explicit_scan_paths else None)
+            self._prepared_inventory_photo_scan_paths = None
             total = len(images)
             self.events.put(("inventory_photo_status", f"Inventory photo scan starting in {folder}: 0/{total} file(s)."))
             current_hashes = {str(image.get("sha256") or "") for image in images}
-            for sha, record in list(photos.items()):
-                if sha and sha not in current_hashes and isinstance(record, dict) and not record.get("removed_at"):
-                    record["status"] = "missing_from_album"
-                    record["removed_at"] = datetime.now().isoformat(timespec="seconds")
+            if not explicit_scan_paths:
+                for sha, record in list(photos.items()):
+                    if sha and sha not in current_hashes and isinstance(record, dict) and not record.get("removed_at"):
+                        record["status"] = "missing_from_album"
+                        record["removed_at"] = datetime.now().isoformat(timespec="seconds")
             rows = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
             keys_by_cert = self._active_inventory_keys_by_cert(rows)
             records_by_key = {str(record.get("inventory_key") or ""): record for record in rows if str(record.get("status") or "").lower() == "active"}
@@ -13637,6 +15066,36 @@ class CardPipelineApp(tk.Tk):
         normalized_ref = (row_ref[0].strip().lower(), row_ref[1].strip().lower(), int(row_ref[2]))
         return normalized_ref in marked_row_refs
 
+    def _hydrate_marked_receive_rows_from_cert_refs(
+        self,
+        rows: list[WorkbookRow],
+        row_ref_certs: dict[tuple[str, str, int], str],
+    ) -> int:
+        if not rows or not row_ref_certs:
+            return 0
+        normalized_certs = {
+            (str(sheet_file).strip().lower(), str(sheet_name).strip().lower(), int(row_index)): scan_to_cert(cert)
+            for (sheet_file, sheet_name, row_index), cert in row_ref_certs.items()
+            if scan_to_cert(cert)
+        }
+        hydrated = 0
+        for row in rows:
+            if scan_to_cert(row.cert_number):
+                continue
+            row_ref = self._receive_row_ref(row)
+            if not row_ref:
+                continue
+            cert = normalized_certs.get((row_ref[0].strip().lower(), row_ref[1].strip().lower(), int(row_ref[2])))
+            if not cert:
+                continue
+            row.cert_number = cert
+            row.item_id = ""
+            row.status = "Received"
+            if row.notes in {"Missing cert", "Missing cert or grader"}:
+                row.notes = ""
+            hydrated += 1
+        return hydrated
+
     def _match_all_review_rows(self) -> None:
         for row in self.review_rows:
             match = self._incoming_match(row.cert_number) if scan_to_cert(row.cert_number) else self._incoming_raw_match(
@@ -13785,6 +15244,10 @@ class CardPipelineApp(tk.Tk):
                 files_updated = int(result.get("files_updated") or 0)
                 marked_certs = set(result.get("certs_marked") or set())
                 marked_row_refs = set(result.get("row_refs_marked") or set())
+                row_ref_certs = dict(result.get("row_ref_certs") or {})
+                hydrated_certs = self._hydrate_marked_receive_rows_from_cert_refs(self.review_rows, row_ref_certs)
+                if hydrated_certs:
+                    marked_certs = {scan_to_cert(row.cert_number) for row in self.review_rows if scan_to_cert(row.cert_number)} | marked_certs
                 certs_marked = len(marked_certs)
                 raw_rows_marked = len(marked_row_refs)
                 company_rows_added = 0
@@ -14446,6 +15909,7 @@ class CardPipelineApp(tk.Tk):
         self.status_var.set(f"Saved current comp rows back to {stage_label}{path.name}.{suffix}")
 
     def save_working_sheet(self) -> None:
+        self._commit_cell_edit()
         if getattr(self, "working_sheet_save_active", False):
             self.status_var.set("Working sheet save is already in progress.")
             return
@@ -14463,38 +15927,37 @@ class CardPipelineApp(tk.Tk):
         if self._network_mode_enabled() and hasattr(self, "seller_terms_seller_var"):
             seller = self.seller_terms_seller_var.get().strip()
             seller_sheet_type = self.seller_terms_sheet_type_var.get().strip() if hasattr(self, "seller_terms_sheet_type_var") else ""
-            if seller or seller_sheet_type:
-                if not seller or not seller_sheet_type:
-                    messagebox.showinfo(
-                        "Seller terms required",
-                        "Network Mode person buys need both Person and Sheet Type. Leave both blank for a normal Open Team sheet.",
+            if not seller or not seller_sheet_type:
+                messagebox.showinfo(
+                    "Seller terms required",
+                    "Network Mode sheets need both Person and Sheet Type so the sheet is automatically assigned for payouts.",
+                )
+                return
+            seller_term = self._seller_terms_match(seller, seller_sheet_type)
+            if not seller_term:
+                messagebox.showinfo(
+                    "Seller terms not found",
+                    f"No People Rules were found for {seller} / {seller_sheet_type}. Open People Rules or turn Network Mode off for a normal Open Team sheet.",
+                )
+                return
+            rate = self._money_value(seller_term.get("rate"))
+            deduction = self._money_value(seller_term.get("deduction"))
+            applicable_rows = 0
+            for row in self.intake_rows:
+                row_term, _decision = self._seller_terms_match_for_row(seller, seller_sheet_type, row)
+                seller_price = (
+                    self._seller_terms_company_price(row, seller_sheet_type, term=row_term)
+                    if row_term is not None
+                    else (
+                        self._seller_terms_company_price(row, seller_sheet_type, deduction=deduction)
+                        if deduction is not None
+                        else self._seller_terms_company_price(row, seller_sheet_type, rate=rate)
                     )
-                    return
-                seller_term = self._seller_terms_match(seller, seller_sheet_type)
-                if not seller_term:
-                    messagebox.showinfo(
-                        "Seller terms not found",
-                        f"No People Rules were found for {seller} / {seller_sheet_type}. Open People Rules or leave both fields blank.",
-                    )
-                    return
-                rate = self._money_value(seller_term.get("rate"))
-                deduction = self._money_value(seller_term.get("deduction"))
-                applicable_rows = 0
-                for row in self.intake_rows:
-                    row_term, _decision = self._seller_terms_match_for_row(seller, seller_sheet_type, row)
-                    seller_price = (
-                        self._seller_terms_company_price(row, seller_sheet_type, term=row_term)
-                        if row_term is not None
-                        else (
-                            self._seller_terms_company_price(row, seller_sheet_type, deduction=deduction)
-                            if deduction is not None
-                            else self._seller_terms_company_price(row, seller_sheet_type, rate=rate)
-                        )
-                    )
-                    if seller_price is not None:
-                        applicable_rows += 1
-                if applicable_rows <= 0:
-                    self.status_var.set(self._seller_terms_no_match_message(self.intake_rows, seller_sheet_type, deduction))
+                )
+                if seller_price is not None:
+                    applicable_rows += 1
+            if applicable_rows <= 0:
+                self.status_var.set(self._seller_terms_no_match_message(self.intake_rows, seller_sheet_type, deduction))
         self.apply_create_seller_terms(show_status=False)
         path = working_sheet_path(WORKING_SHEETS_DIR, title)
         saved_row_ids = {id(row) for row in self.intake_rows}
@@ -14584,6 +16047,7 @@ class CardPipelineApp(tk.Tk):
         retained_rows = {row.excel_row for row in self.intake_rows}
         self.intake_sources = {row_number: source for row_number, source in self.intake_sources.items() if row_number in retained_rows}
         self.intake_sheet_sources = {row_number: source for row_number, source in self.intake_sheet_sources.items() if row_number in retained_rows}
+        self._clear_create_photo_queue_after_sheet_save()
         self.working_sheet_title.set("")
         self._refresh_table()
         refresh_start = time.perf_counter()
@@ -15813,6 +17277,8 @@ class CardPipelineApp(tk.Tk):
         return None
 
     def _begin_editable_table_click(self, event: tk.Event) -> str | None:
+        if self.cell_editor is not None and self.cell_edit is not None:
+            self._commit_cell_edit()
         if self._handle_table_click(event) == "break":
             return "break"
         self._begin_cell_edit(event)
@@ -15881,17 +17347,25 @@ class CardPipelineApp(tk.Tk):
         editor.focus_set()
         self.cell_editor = editor
         self.cell_edit = (tree, row_id, column)
+        if is_receive_card_autocomplete:
+            editor.icursor(tk.END)
+            editor.selection_clear()
+            editor.bind("<KeyRelease>", lambda event, widget=editor: self._on_receive_card_autocomplete_key(event, widget), add="+")
+            editor.bind("<Down>", lambda _event, widget=editor: self._open_receive_card_autocomplete(widget), add="+")
+            editor.bind("<Alt-Down>", lambda _event, widget=editor: self._open_receive_card_autocomplete(widget), add="+")
+            editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
+            editor.after_idle(lambda widget=editor: self._open_receive_card_autocomplete(widget))
         editor.bind("<Return>", lambda _event: self._commit_cell_edit())
         editor.bind("<KP_Enter>", lambda _event: self._commit_cell_edit())
         editor.bind("<Tab>", lambda _event: self._commit_cell_edit_and_move(1))
         editor.bind("<Shift-Tab>", lambda _event: self._commit_cell_edit_and_move(-1))
         editor.bind("<Escape>", lambda _event: self._cancel_cell_edit())
-        editor.bind("<FocusOut>", lambda _event: self._commit_cell_edit())
         if is_receive_card_autocomplete:
-            editor.bind("<KeyRelease>", lambda event, widget=editor: self._on_receive_card_autocomplete_key(event, widget), add="+")
-            editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
-        elif is_best_company_choice:
-            editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
+            editor.bind("<FocusOut>", lambda _event, widget=editor: self._commit_receive_card_autocomplete_focus_out(widget))
+        else:
+            editor.bind("<FocusOut>", lambda _event: self._commit_cell_edit())
+            if is_best_company_choice:
+                editor.bind("<<ComboboxSelected>>", lambda _event: self._commit_cell_edit(), add="+")
 
     def _adjacent_editable_cell(
         self,
@@ -15966,6 +17440,32 @@ class CardPipelineApp(tk.Tk):
             return
         self._refresh_receive_card_autocomplete(editor, editor.get())
 
+    def _open_receive_card_autocomplete(self, editor: ttk.Combobox) -> str:
+        try:
+            self._refresh_receive_card_autocomplete(editor, editor.get())
+            if editor.cget("values"):
+                editor.tk.call("ttk::combobox::Post", editor)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _receive_card_autocomplete_dropdown_visible(self, editor: ttk.Combobox) -> bool:
+        try:
+            popdown = editor.tk.call("ttk::combobox::PopdownWindow", editor)
+            return bool(int(editor.tk.call("winfo", "viewable", popdown)))
+        except (tk.TclError, ValueError):
+            return False
+
+    def _commit_receive_card_autocomplete_focus_out(self, editor: ttk.Combobox) -> None:
+        def commit_if_still_editing(widget: ttk.Combobox = editor) -> None:
+            if self.cell_editor is not widget:
+                return
+            if self._receive_card_autocomplete_dropdown_visible(widget):
+                return
+            self._commit_cell_edit()
+
+        self.after(150, commit_if_still_editing)
+
     def _apply_receive_match_to_existing_row(self, tree: ttk.Treeview, excel_row: int, match: dict[str, object]) -> None:
         if not self._is_review_row_tree(tree) or not match:
             return
@@ -15975,33 +17475,21 @@ class CardPipelineApp(tk.Tk):
                 continue
             self._attach_receive_match_to_row(row, match)
             row.status = "Received"
-            if match.get("item_id"):
-                row.item_id = str(match.get("item_id") or "")
-            if match.get("cert_number"):
-                row.cert_number = str(match.get("cert_number") or "")
-            if match.get("card_title"):
-                row.card_title = str(match.get("card_title") or "")
-            if match.get("grader"):
-                row.grader = str(match.get("grader") or "")
-            if match.get("sport") or match.get("category"):
-                row.category = str(match.get("sport") or match.get("category") or "")
-            if match.get("purchase_price") is not None:
-                row.existing_value = match.get("purchase_price")
-            if match.get("card_ladder_value") is not None:
-                row.card_ladder_value = match.get("card_ladder_value")
-            if match.get("card_ladder_comps_average") is not None:
-                row.card_ladder_comps_average = match.get("card_ladder_comps_average")
-            if match.get("cy_value") is not None:
-                row.cy_value = match.get("cy_value")
-            if match.get("cy_confidence") is not None:
-                row.cy_confidence = match.get("cy_confidence")
-            if match.get("card_ladder_comps"):
-                row.card_ladder_comps = str(match.get("card_ladder_comps") or "")
-            if match.get("best_company"):
-                row.best_company = str(match.get("best_company") or "")
-            if match.get("estimated_payout") is not None:
-                row.estimated_payout = match.get("estimated_payout")
-            self._ensure_receive_row_assignment(row)
+            row.item_id = str(match.get("item_id") or "")
+            row.cert_number = str(match.get("cert_number") or "")
+            row.card_title = str(match.get("card_title") or "")
+            row.grader = str(match.get("grader") or "")
+            row.category = str(match.get("sport") or match.get("category") or "")
+            row.existing_value = match.get("purchase_price")
+            row.card_ladder_value = match.get("card_ladder_value")
+            row.card_ladder_comps_average = match.get("card_ladder_comps_average")
+            row.cy_value = match.get("cy_value")
+            row.cy_confidence = match.get("cy_confidence")
+            row.card_ladder_comps = str(match.get("card_ladder_comps") or "")
+            row.best_company = str(match.get("best_company") or "")
+            row.estimated_payout = match.get("estimated_payout")
+            if row.cert_number and not row.best_company and row.estimated_payout is None:
+                self._ensure_receive_row_assignment(row)
             self.review_status.set(f"Matched receive row to {match.get('sheet') or 'incoming sheet'}.")
             return
 
@@ -16086,12 +17574,14 @@ class CardPipelineApp(tk.Tk):
                     person = getattr(self, "_assignment_person_for_row", lambda _row: "")(row)
                     decision = self._specific_company_decision(row, person, clean_value)
                     row.estimated_payout = round(decision.payout, 2) if decision and decision.accepted and decision.payout is not None else None
+            elif column == "estimated_payout":
+                row.estimated_payout = self._parse_money_text(clean_value)
             if column != "best_company":
                 row.status = "Ready" if (row.cert_number and row.grader) or row.item_id else "Needs setup"
             if tree is self.intake_tree:
                 if column == "purchase_price":
                     setattr(row, "_seller_terms_base_purchase", row.existing_value)
-                if column in {"purchase_price", "card_ladder_value", "card_ladder_comps_average", "cy_value"}:
+                if column in {"purchase_price", "card_ladder_value", "card_ladder_comps_average", "cy_value", "estimated_payout"}:
                     self.apply_create_seller_terms(show_status=False)
             if self._is_review_row_tree(tree) and (
                 (column == "cert_number" and scan_to_cert(row.cert_number) != previous_cert)
@@ -16178,6 +17668,8 @@ class CardPipelineApp(tk.Tk):
                         self.status_var.set(str(payload))
                     elif kind == "startup_refresh":
                         self._apply_startup_refresh(payload)
+                    elif kind == "home_summary_refresh":
+                        self._apply_home_summary_refresh(payload)
                     elif kind == "save_working_sheet_done":
                         self._finish_save_working_sheet(payload)
                     elif kind == "save_working_sheet_error":
