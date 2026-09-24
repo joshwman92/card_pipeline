@@ -8455,6 +8455,168 @@ class AppSharedWorkflowLogicTests(unittest.TestCase):
             finally:
                 app.INVENTORY_LEDGER_PATH = old_inventory
 
+    def test_inventory_sold_guard_only_checks_matching_identity_candidates(self) -> None:
+        class InventoryGuardDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _profit_record_date = app.CardPipelineApp._profit_record_date
+            _profit_record_blocks_inventory_row = app.CardPipelineApp._profit_record_blocks_inventory_row
+            _active_inventory_rows_excluding_sold_profit = app.CardPipelineApp._active_inventory_rows_excluding_sold_profit
+
+            def __init__(self):
+                self.comparisons = 0
+
+            def _load_profit_ledger(self):
+                return [
+                    {
+                        "sale_price": 10,
+                        "cert_number": str(100000 + index),
+                        "source_sheet": f"Unrelated {index}.xlsx",
+                        "date_added": "2026-09-01",
+                    }
+                    for index in range(100)
+                ] + [
+                    {
+                        "sale_price": 25,
+                        "cert_number": "MATCH-1",
+                        "source_sheet": "Matching Lot.xlsx",
+                        "date_added": "2026-09-02",
+                    }
+                ]
+
+            def _profit_record_blocks_inventory_row(self, inventory_record, profit_record):
+                self.comparisons += 1
+                return app.CardPipelineApp._profit_record_blocks_inventory_row(self, inventory_record, profit_record)
+
+        dummy = InventoryGuardDummy()
+        rows = [
+            {
+                "status": "Active",
+                "cert_number": "MATCH-1",
+                "source_sheet": "Matching Lot.xlsx",
+                "date_added": "2026-09-01",
+            },
+            {
+                "status": "Active",
+                "cert_number": "KEEP-1",
+                "source_sheet": "Keep Lot.xlsx",
+                "date_added": "2026-09-01",
+            },
+        ]
+
+        kept, removed = dummy._active_inventory_rows_excluding_sold_profit(rows)
+
+        self.assertEqual([row["cert_number"] for row in kept], ["KEEP-1"])
+        self.assertEqual([row["cert_number"] for row in removed], ["MATCH-1"])
+        self.assertEqual(dummy.comparisons, 1)
+
+    def test_unchanged_inventory_update_does_not_save_ledger(self) -> None:
+        class InventoryEditDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _update_inventory_record_by_key = app.CardPipelineApp._update_inventory_record_by_key
+
+            def __init__(self, record):
+                self.record = record
+                self.save_count = 0
+                self.lucas_identity = {"display_name": "Tester", "machine": "Test"}
+
+            def _load_inventory_ledger(self):
+                return [dict(self.record)]
+
+            def _save_inventory_ledger(self, rows):
+                self.save_count += 1
+                self.record = dict(rows[0])
+
+        with TemporaryDirectory() as tmp:
+            old_pipeline = app.CARD_PIPELINE_DIR
+            app.CARD_PIPELINE_DIR = Path(tmp)
+            try:
+                seed = {
+                    "date_added": "2026-09-01",
+                    "assigned_person": "Mikey",
+                    "cert_number": "12345",
+                    "source_sheet": "Lot.xlsx",
+                    "purchase_price": 25,
+                    "status": "Active",
+                }
+                dummy = InventoryEditDummy(seed)
+                dummy.record = dummy._normalize_inventory_record(seed)
+                key = str(dummy.record["inventory_key"])
+
+                self.assertEqual(dummy._update_inventory_record_by_key(key, {"purchase_price": 25.0}), 0)
+                self.assertEqual(dummy.save_count, 0)
+                self.assertEqual(dummy._update_inventory_record_by_key(key, {"purchase_price": 30}), 1)
+                self.assertEqual(dummy.save_count, 1)
+            finally:
+                app.CARD_PIPELINE_DIR = old_pipeline
+
+    def test_unchanged_bulk_edit_skips_ledger_update_before_loading_rows(self) -> None:
+        class FakeEditor:
+            def get(self):
+                return "25"
+
+        class InventoryBulkDummy:
+            _money_value = app.CardPipelineApp._money_value
+            _inventory_record_key = app.CardPipelineApp._inventory_record_key
+            _normalize_inventory_record = app.CardPipelineApp._normalize_inventory_record
+            _commit_inventory_bulk_edit = app.CardPipelineApp._commit_inventory_bulk_edit
+
+            def _destroy_inventory_cell_editor(self):
+                self.inventory_cell_editor = None
+                self.inventory_cell_edit = None
+
+            def _inventory_bulk_updates_for_cell(self, _column, _raw):
+                return {"purchase_price": 25.0}
+
+            def _update_inventory_record_by_key(self, _key, _updates):
+                raise AssertionError("unchanged UI edits must not load or save the ledger")
+
+            def _move_inventory_bulk_cell(self, row_delta, column_delta, reopen=False):
+                self.move = (row_delta, column_delta, reopen)
+                return "break"
+
+        dummy = InventoryBulkDummy()
+        record = dummy._normalize_inventory_record(
+            {
+                "date_added": "2026-09-01",
+                "assigned_person": "Mikey",
+                "cert_number": "12345",
+                "source_sheet": "Lot.xlsx",
+                "purchase_price": 25,
+                "status": "Active",
+            }
+        )
+        dummy.inventory_cell_editor = FakeEditor()
+        dummy.inventory_cell_edit = ("row-1", "purchase")
+        dummy.inventory_tree_records = {"row-1": record}
+        dummy.inventory_bulk_cell = None
+
+        self.assertEqual(dummy._commit_inventory_bulk_edit(0, 1, reopen=True), "break")
+        self.assertEqual(dummy.move, (0, 1, True))
+
+    def test_cached_inventory_filter_refresh_does_not_reload_ledger(self) -> None:
+        class InventoryFilterDummy:
+            refresh_inventory_tab = app.CardPipelineApp.refresh_inventory_tab
+
+            def __init__(self):
+                self.inventory_filter_after_id = None
+                self.inventory_rows = [{"status": "Active", "cert_number": "123"}]
+                self.inventory_rows_loaded = True
+                self.filtered_inventory_rows = []
+
+            def _load_inventory_ledger(self):
+                raise AssertionError("cached filter refresh should not reload the ledger")
+
+            def _filtered_inventory_records(self, rows):
+                return list(rows)
+
+        dummy = InventoryFilterDummy()
+        with patch("app.record_performance_event"):
+            dummy.refresh_inventory_tab(use_cached_rows=True)
+
+        self.assertEqual(dummy.filtered_inventory_rows, dummy.inventory_rows)
+
     def test_inventory_table_values_can_be_copied_without_editing(self) -> None:
         class FakeTree:
             def item(self, _row_id, _option):

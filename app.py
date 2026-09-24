@@ -975,6 +975,7 @@ class CardPipelineApp(tk.Tk):
         self.inventory_missing_photos_var = tk.BooleanVar(value=False)
         self.inventory_bulk_edit_var = tk.BooleanVar(value=False)
         self.inventory_rows: list[dict[str, object]] = []
+        self.inventory_rows_loaded = False
         self.filtered_inventory_rows: list[dict[str, object]] = []
         self.inventory_tree_records: dict[str, dict[str, object]] = {}
         self.inventory_recomp_context: dict[str, object] | None = None
@@ -2183,8 +2184,8 @@ class CardPipelineApp(tk.Tk):
         self.inventory_person_combo = ttk.Combobox(controls, textvariable=self.inventory_person_var, width=22)
         if not self._is_personal_lucas():
             self.inventory_person_combo.grid(row=1, column=1, sticky="w", padx=(8, 14), pady=(10, 0))
-        self._bind_person_autocomplete(self.inventory_person_combo, refresh_callback=self.refresh_inventory_tab)
-        self.inventory_person_combo.bind("<<ComboboxSelected>>", lambda _event: self.refresh_inventory_tab(), add="+")
+        self._bind_person_autocomplete(self.inventory_person_combo, refresh_callback=self._refresh_inventory_filters_from_cache)
+        self.inventory_person_combo.bind("<<ComboboxSelected>>", lambda _event: self._refresh_inventory_filters_from_cache(), add="+")
         search_label_column = 0 if self._is_personal_lucas() else 2
         search_entry_column = 1 if self._is_personal_lucas() else 3
         ttk.Label(controls, text="Search ID/Cert/Card", style="Muted.TLabel").grid(row=1, column=search_label_column, sticky="e", padx=(0, 6), pady=(10, 0))
@@ -2674,7 +2675,7 @@ class CardPipelineApp(tk.Tk):
         actions.columnconfigure(1, weight=1)
         ttk.Button(actions, text="Clear Filters", command=self.clear_inventory_filters, style="Soft.TButton").grid(row=0, column=0, sticky="w")
         ttk.Button(actions, text="Close", command=popup.destroy, style="Soft.TButton").grid(row=0, column=2, sticky="e", padx=(0, 8))
-        ttk.Button(actions, text="Apply Filters", command=self.refresh_inventory_tab, style="Primary.TButton").grid(row=0, column=3, sticky="e")
+        ttk.Button(actions, text="Apply Filters", command=self._refresh_inventory_filters_from_cache, style="Primary.TButton").grid(row=0, column=3, sticky="e")
         frame.columnconfigure(3, weight=1)
 
     def _inventory_date_picker(self, parent: tk.Widget, variable: tk.StringVar) -> ttk.Frame:
@@ -2778,7 +2779,7 @@ class CardPipelineApp(tk.Tk):
         if hasattr(self, "inventory_missing_cl_var"):
             self.inventory_missing_cl_var.set(False)
         self.inventory_missing_photos_var.set(False)
-        self.refresh_inventory_tab()
+        self._refresh_inventory_filters_from_cache()
 
     def _show_inventory_settings_menu(self, anchor: tk.Widget) -> None:
         menu = tk.Menu(self, tearoff=False, bg="#1f1f1f", fg="#ffffff", activebackground="#1ed760", activeforeground="#000000")
@@ -3110,16 +3111,51 @@ class CardPipelineApp(tk.Tk):
         profit_loader = getattr(self, "_load_profit_ledger", None)
         if not callable(profit_loader):
             return rows, []
-        sold_records = [record for record in profit_loader() if isinstance(record, dict)]
+        sold_records = [
+            record
+            for record in profit_loader()
+            if isinstance(record, dict)
+            and str(record.get("record_type") or "").strip().lower() != "expense"
+            and self._money_value(record.get("sale_price")) is not None
+        ]
         if not sold_records:
             return rows, []
+        sold_by_inventory_key: dict[str, list[dict[str, object]]] = defaultdict(list)
+        sold_by_item_id: dict[str, list[dict[str, object]]] = defaultdict(list)
+        sold_by_cert: dict[str, list[dict[str, object]]] = defaultdict(list)
+        for sold_record in sold_records:
+            inventory_key = str(sold_record.get("inventory_key") or "").strip().lower()
+            item_id = str(sold_record.get("item_id") or "").strip().lower()
+            cert = scan_to_cert(sold_record.get("cert_number"))
+            if inventory_key:
+                sold_by_inventory_key[inventory_key].append(sold_record)
+            if item_id:
+                sold_by_item_id[item_id].append(sold_record)
+            if cert:
+                sold_by_cert[cert].append(sold_record)
         kept: list[dict[str, object]] = []
         removed: list[dict[str, object]] = []
         for record in rows:
             if str(record.get("status") or "Active").strip().lower() != "active":
                 kept.append(record)
                 continue
-            if any(self._profit_record_blocks_inventory_row(record, sold_record) for sold_record in sold_records):
+            inventory_key = str(record.get("inventory_key") or "").strip().lower()
+            item_id = str(record.get("item_id") or "").strip().lower()
+            cert = scan_to_cert(record.get("cert_number"))
+            candidates: list[dict[str, object]] = []
+            seen_candidates: set[int] = set()
+            for candidate_group in (
+                sold_by_inventory_key.get(inventory_key, ()),
+                sold_by_item_id.get(item_id, ()),
+                sold_by_cert.get(cert, ()),
+            ):
+                for sold_record in candidate_group:
+                    candidate_id = id(sold_record)
+                    if candidate_id in seen_candidates:
+                        continue
+                    seen_candidates.add(candidate_id)
+                    candidates.append(sold_record)
+            if any(self._profit_record_blocks_inventory_row(record, sold_record) for sold_record in candidates):
                 removed.append(record)
             else:
                 kept.append(record)
@@ -6337,10 +6373,32 @@ class CardPipelineApp(tk.Tk):
         updates = self._inventory_edit_row_dialog(record)
         if not updates:
             return
+        merged = dict(record)
+        merged.update(updates)
+        merged.pop("inventory_key", None)
+        normalized = self._normalize_inventory_record(merged)
+        if normalized == record:
+            self.status_var.set("Inventory row was unchanged.")
+            return
         key = str(record.get("inventory_key") or "")
         updated = self._update_inventory_record_by_key(key, updates)
-        self.refresh_inventory_tab()
+        if updated:
+            iid = selected[0]
+            self.inventory_tree_records[iid] = normalized
+            refresh_row = getattr(self, "_refresh_inventory_tree_row", None)
+            if callable(refresh_row):
+                refresh_row(iid, normalized)
         self.status_var.set(f"Edited {updated} inventory row(s).")
+
+    def _update_cached_inventory_record(self, key: str, updated_record: dict[str, object]) -> None:
+        for attribute in ("inventory_rows", "filtered_inventory_rows"):
+            rows = getattr(self, attribute, None)
+            if not isinstance(rows, list):
+                continue
+            for index, record in enumerate(rows):
+                if str(record.get("inventory_key") or "") == key:
+                    rows[index] = updated_record
+                    break
 
     def _update_inventory_record_by_key(self, key: str, updates: dict[str, object]) -> int:
         if not key:
@@ -6354,11 +6412,17 @@ class CardPipelineApp(tk.Tk):
                 merged = dict(record)
                 merged.update(updates)
                 merged.pop("inventory_key", None)
-                rows[index] = self._normalize_inventory_record(merged)
+                normalized = self._normalize_inventory_record(merged)
+                if normalized == record:
+                    break
+                rows[index] = normalized
                 updated += 1
                 break
             if updated:
                 self._save_inventory_ledger(rows)
+                update_cache = getattr(self, "_update_cached_inventory_record", None)
+                if callable(update_cache):
+                    update_cache(key, rows[index])
         return updated
 
     def _replace_inventory_record_by_key(self, key: str, replacement: dict[str, object]) -> dict[str, object] | None:
@@ -6556,12 +6620,16 @@ class CardPipelineApp(tk.Tk):
             return "break"
         key = str(record.get("inventory_key") or "")
         before = dict(record)
+        merged = dict(record)
+        merged.update(updates)
+        merged.pop("inventory_key", None)
+        normalized = self._normalize_inventory_record(merged)
+        if normalized == record:
+            self.inventory_bulk_cell = (iid, column)
+            self._move_inventory_bulk_cell(row_delta, column_delta, reopen=reopen)
+            return "break"
         updated = self._update_inventory_record_by_key(key, updates)
         if updated:
-            merged = dict(record)
-            merged.update(updates)
-            merged.pop("inventory_key", None)
-            normalized = self._normalize_inventory_record(merged)
             self.inventory_bulk_undo_stack.append(
                 {
                     "iid": iid,
@@ -7473,7 +7541,13 @@ class CardPipelineApp(tk.Tk):
         if errors:
             self._show_copyable_error("Attach photo warning", "\n".join(errors[:10]))
 
-    def refresh_inventory_tab(self, reconcile: bool = False, enrich: bool = False, filtered_only: bool = False) -> None:
+    def refresh_inventory_tab(
+        self,
+        reconcile: bool = False,
+        enrich: bool = False,
+        filtered_only: bool = False,
+        use_cached_rows: bool = False,
+    ) -> None:
         perf_start = time.perf_counter()
         self._last_inventory_enrich_visible_count = 0
         self._last_inventory_enrich_changed_count = 0
@@ -7490,7 +7564,12 @@ class CardPipelineApp(tk.Tk):
                 self._sync_received_inventory_to_ledger(filtered_only=filtered_only)
             finally:
                 self._inventory_reconcile_running = False
-        stored_rows = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+        cached_rows = getattr(self, "inventory_rows", None)
+        if use_cached_rows and bool(getattr(self, "inventory_rows_loaded", False)) and isinstance(cached_rows, list):
+            stored_rows = list(cached_rows)
+        else:
+            stored_rows = [self._normalize_inventory_record(record) for record in self._load_inventory_ledger()]
+            self.inventory_rows_loaded = True
         active_rows = [record for record in stored_rows if str(record.get("status") or "").lower() == "active"]
         if len(active_rows) != len(stored_rows):
             self._save_inventory_ledger(active_rows)
@@ -7537,7 +7616,8 @@ class CardPipelineApp(tk.Tk):
                 f"rows={len(self.inventory_rows)} filtered={len(self.filtered_inventory_rows)} reconcile={reconcile} enrich={enrich} filtered_only={filtered_only} tree=missing",
             )
             return
-        self._refresh_person_combo_values()
+        if not use_cached_rows:
+            self._refresh_person_combo_values()
         if hasattr(self, "_configure_sortable_tree_headings"):
             self._configure_sortable_tree_headings(self.inventory_tree, INVENTORY_HEADINGS, "inventory")
         self.inventory_tree.delete(*self.inventory_tree.get_children())
@@ -7594,8 +7674,11 @@ class CardPipelineApp(tk.Tk):
         record_performance_event(
             "inventory.refresh",
             perf_start,
-            f"rows={len(self.inventory_rows)} filtered={len(self.filtered_inventory_rows)} reconcile={reconcile} enrich={enrich} filtered_only={filtered_only} changed={self._last_inventory_enrich_changed_count}",
+            f"rows={len(self.inventory_rows)} filtered={len(self.filtered_inventory_rows)} reconcile={reconcile} enrich={enrich} filtered_only={filtered_only} cached={use_cached_rows} changed={self._last_inventory_enrich_changed_count}",
         )
+
+    def _refresh_inventory_filters_from_cache(self) -> None:
+        self.refresh_inventory_tab(use_cached_rows=True)
 
     def _schedule_inventory_filter_refresh(self) -> None:
         if not hasattr(self, "inventory_tree"):
@@ -7605,7 +7688,7 @@ class CardPipelineApp(tk.Tk):
                 self.after_cancel(self.inventory_filter_after_id)
             except tk.TclError:
                 pass
-        self.inventory_filter_after_id = self.after(150, self.refresh_inventory_tab)
+        self.inventory_filter_after_id = self.after(300, self._refresh_inventory_filters_from_cache)
 
     def update_inventory_payouts(self) -> None:
         perf_start = time.perf_counter()
