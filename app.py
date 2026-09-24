@@ -14116,11 +14116,6 @@ class CardPipelineApp(tk.Tk):
         if not self.state.rows:
             messagebox.showinfo("No comp sheet loaded", "Choose and load an incoming or working sheet in the Comp tab first.")
             return
-        extension_warning = self._cardladder_extension_warning()
-        if extension_warning:
-            messagebox.showwarning("Reload Card Ladder extension", extension_warning)
-            self.status_var.set("Reload the Card Ladder Chrome extension before comping.")
-            return
         requery_all = self.comp_scope_label.get() == COMP_SCOPE_ALL
         include_cy = bool(getattr(self, "comp_cy_var", None) and self.comp_cy_var.get() and cy_lookup_enabled())
         eligible = [
@@ -14142,14 +14137,25 @@ class CardPipelineApp(tk.Tk):
             messagebox.showinfo("No eligible rows", message)
             self.status_var.set(message)
             return
+        cardladder_count = sum(requery_all or not row_has_comp_data(row) for row in eligible)
+        if cardladder_count:
+            extension_warning = self._cardladder_extension_warning()
+            if extension_warning:
+                messagebox.showwarning("Reload Card Ladder extension", extension_warning)
+                self.status_var.set("Reload the Card Ladder Chrome extension before comping.")
+                return
         self.state.set_comp_strategy(COMP_STRATEGY_DISPLAY.get(self.comp_strategy_label.get(), COMP_STRATEGY_AVERAGE), self._comp_low_outlier_pct())
         self.pending_comp_assignment_row_ids = {id(row) for row in eligible}
         command_id = self.state.start_all_comps(requery_all=requery_all, allow_deferred_cy=include_cy)
         self.comp_output_saved = False
         self._refresh_table()
-        self.after(12000, lambda queued_command_id=command_id: self._warn_if_extension_not_checked_in(queued_command_id))
-        sources = "Card Ladder + CourtYard" if include_cy else "Card Ladder"
-        self.status_var.set(f"Queued {len(eligible)} {sources} row(s) using {self.comp_scope_label.get()} with {self.comp_strategy_label.get()} as command #{command_id}.")
+        if cardladder_count:
+            self.after(12000, lambda queued_command_id=command_id: self._warn_if_extension_not_checked_in(queued_command_id))
+        cy_only_count = len(eligible) - cardladder_count
+        self.status_var.set(
+            f"Queued {cardladder_count} Card Ladder and {cy_only_count} CourtYard-only row(s) "
+            f"using {self.comp_scope_label.get()} as command #{command_id}."
+        )
 
     def _warn_if_extension_not_checked_in(self, command_id: int) -> None:
         extension_warning = self._cardladder_extension_warning()

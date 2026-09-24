@@ -596,7 +596,38 @@ class SharedStateTests(unittest.TestCase):
         with patch.dict(os.environ, {"LUCAS_CY_APPIUM_ENABLED": "0"}, clear=False):
             self.assertFalse(bridge_server.cy_lookup_enabled("win32"))
 
-    def test_cardladder_queue_includes_rows_missing_requested_cy_data(self) -> None:
+    def test_cy_only_row_waits_for_empty_cardladder_rows(self) -> None:
+        bridge = BridgeState()
+        cy_only = WorkbookRow(
+            excel_row=2,
+            cert_number="12345678",
+            grader="PSA",
+            card_title="Test Card #123 PSA 10",
+            card_ladder_comps_average=25.0,
+        )
+        missing_comps = WorkbookRow(excel_row=3, cert_number="87654321", grader="PSA", card_title="Missing Comps")
+        bridge.set_rows([cy_only, missing_comps])
+
+        with (
+            patch.object(bridge_server, "cy_lookup_enabled", return_value=True),
+            patch.object(bridge_server, "cy_supported_graders", return_value={"PSA"}),
+            patch.object(bridge_server.threading, "Thread") as worker_thread,
+        ):
+            bridge.start_all_comps(allow_deferred_cy=True)
+            self.assertEqual([item["excelRow"] for item in bridge.command["queue"]], [3])
+            self.assertEqual(bridge.cy_lookup_pending, {2})
+            self.assertEqual(cy_only.status, "CY queued")
+            self.assertEqual(cy_only.card_ladder_comps_average, 25.0)
+            worker_thread.assert_not_called()
+
+            bridge.finish_cardladder({})
+
+        self.assertFalse(bridge.cy_lookup_pending)
+        self.assertEqual(bridge.cy_lookup_inflight, {2})
+        worker_thread.assert_called_once()
+        self.assertEqual(missing_comps.status, "Card Ladder not found")
+
+    def test_cy_only_run_starts_without_cardladder_command(self) -> None:
         bridge = BridgeState()
         row = WorkbookRow(
             excel_row=2,
@@ -607,10 +638,18 @@ class SharedStateTests(unittest.TestCase):
         )
         bridge.set_rows([row])
 
-        bridge.start_all_comps(allow_deferred_cy=True)
+        with (
+            patch.object(bridge_server, "cy_lookup_enabled", return_value=True),
+            patch.object(bridge_server, "cy_supported_graders", return_value={"PSA"}),
+            patch.object(bridge_server.threading, "Thread") as worker_thread,
+        ):
+            bridge.start_all_comps(allow_deferred_cy=True)
 
-        self.assertIsNotNone(bridge.command)
-        self.assertEqual(bridge.command["queue"][0]["excelRow"], 2)
+        self.assertIsNone(bridge.command)
+        self.assertFalse(bridge.cardladder_running)
+        self.assertEqual(bridge.cy_lookup_inflight, {2})
+        self.assertEqual(row.status, "CY queued")
+        worker_thread.assert_called_once()
 
     def test_google_sheet_values_import_selected_tab_with_simple_headers(self) -> None:
         rows = read_google_sheet_values(
